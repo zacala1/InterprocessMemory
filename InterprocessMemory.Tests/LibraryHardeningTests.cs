@@ -82,9 +82,20 @@ public class LibraryHardeningTests
 
         Assert.That(buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
 
-        var invalidRelease = new Thread(buffer.ReleaseWriteLock);
+        // An unhandled exception on a raw Thread would take the test host down, so capture it.
+        Exception? releaseError = null;
+        var invalidRelease = new Thread(() =>
+        {
+            try
+            { buffer.ReleaseWriteLock(); }
+            catch (Exception ex) { releaseError = ex; }
+        });
         invalidRelease.Start();
         invalidRelease.Join();
+
+        // The misuse is reported instead of being silently ignored (a silently ignored release is
+        // what turned `await` inside a lock scope into a lock nobody could ever release).
+        Assert.That(releaseError, Is.InstanceOf<SynchronizationLockException>());
 
         var contender = Task.Run(() => buffer.TryAcquireWriteLock(TimeSpan.FromMilliseconds(50)));
         Assert.That(contender.Result, Is.False);
@@ -92,6 +103,110 @@ public class LibraryHardeningTests
         buffer.ReleaseWriteLock();
         Assert.That(buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
         buffer.ReleaseWriteLock();
+    }
+
+    [Test]
+    public void Dispose_WhileThreadWaitsForWriteLock_ReleasesWaiterInsteadOfCrashing()
+    {
+        // Dispose used to unmap the view while a thread was still spinning on the header, which is an
+        // AccessViolationException: the whole process dies and the exception cannot be caught.
+        var buffer = new MemoryRegion(
+            N("DisposeWriteWaiter"),
+            new MemoryRegionOptions { Capacity = 256 });
+
+        Assert.That(buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
+
+        using var started = new ManualResetEventSlim(false);
+        var waiter = Task.Run(() =>
+        {
+            started.Set();
+            return buffer.TryAcquireWriteLock(Timeout.InfiniteTimeSpan);
+        });
+        Assert.That(started.Wait(TimeSpan.FromSeconds(5)), Is.True);
+        Thread.Sleep(100); // let the waiter reach its spin loop
+
+        buffer.Dispose();
+
+        var error = Assert.Throws<AggregateException>(() => waiter.Wait(TimeSpan.FromSeconds(10)));
+        Assert.That(error!.InnerException, Is.InstanceOf<ObjectDisposedException>());
+    }
+
+    [Test]
+    public void Dispose_WhileThreadWaitsForReadLock_ReleasesWaiterInsteadOfCrashing()
+    {
+        var buffer = new MemoryRegion(
+            N("DisposeReadWaiter"),
+            new MemoryRegionOptions { Capacity = 256 });
+
+        Assert.That(buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
+
+        using var started = new ManualResetEventSlim(false);
+        var waiter = Task.Run(() =>
+        {
+            started.Set();
+            return buffer.TryAcquireReadLock(Timeout.InfiniteTimeSpan);
+        });
+        Assert.That(started.Wait(TimeSpan.FromSeconds(5)), Is.True);
+        Thread.Sleep(100);
+
+        buffer.Dispose();
+
+        var error = Assert.Throws<AggregateException>(() => waiter.Wait(TimeSpan.FromSeconds(10)));
+        Assert.That(error!.InnerException, Is.InstanceOf<ObjectDisposedException>());
+    }
+
+    [Test]
+    public void StructuredMemory_WriteLockGuard_DisposedOnAnotherThread_ThrowsAndStaysHeld()
+    {
+        string name = N("WriteGuardThread");
+        using var memory = StructuredMemory<SimpleSchema>.CreateOrOpen(name, new SimpleSchema());
+        using var peer = StructuredMemory<SimpleSchema>.OpenExisting(name, new SimpleSchema());
+
+        // What `await` inside a lock scope does: the guard is disposed on a different thread.
+        var guard = memory.AcquireWriteLock();
+        Exception? error = null;
+        Task.Run(() =>
+        {
+            try
+            { guard.Dispose(); }
+            catch (Exception ex) { error = ex; }
+        }).Wait();
+
+        Assert.That(error, Is.InstanceOf<SynchronizationLockException>());
+
+        // Nothing was released or unbalanced: the lock still belongs to the acquiring thread...
+        Assert.Throws<TimeoutException>(() => peer.AcquireWriteLock(TimeSpan.FromMilliseconds(100)));
+
+        // ...which can still release it properly, after which other holders get in.
+        guard.Dispose();
+        using (peer.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+        }
+    }
+
+    [Test]
+    public void StructuredMemory_ReadLockGuard_DisposedOnAnotherThread_ThrowsAndStaysHeld()
+    {
+        string name = N("ReadGuardThread");
+        using var memory = StructuredMemory<SimpleSchema>.CreateOrOpen(name, new SimpleSchema());
+        using var peer = StructuredMemory<SimpleSchema>.OpenExisting(name, new SimpleSchema());
+
+        var guard = memory.AcquireReadLock();
+        Exception? error = null;
+        Task.Run(() =>
+        {
+            try
+            { guard.Dispose(); }
+            catch (Exception ex) { error = ex; }
+        }).Wait();
+
+        Assert.That(error, Is.InstanceOf<SynchronizationLockException>());
+        Assert.Throws<TimeoutException>(() => peer.AcquireWriteLock(TimeSpan.FromMilliseconds(100)));
+
+        guard.Dispose();
+        using (peer.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+        }
     }
 
     [Test]

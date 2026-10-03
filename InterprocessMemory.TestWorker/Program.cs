@@ -18,6 +18,7 @@ using InterprocessMemory;
 ///   concurrent_producer &lt;name&gt; &lt;producerId&gt; — enqueue 1000 unique integers
 ///   try_write_lock &lt;name&gt; — try the cross-process write lock for 250 ms
 ///   orphan_write_lock &lt;name&gt; — acquire a write lock and exit without releasing it
+///   hold_write_lock &lt;name&gt; — acquire a write lock, print "holding", and keep it until killed
 /// </summary>
 if (args.Length < 2)
 {
@@ -43,6 +44,7 @@ return role switch
         args.Length >= 3 ? int.Parse(args[2]) : 0),
     "try_write_lock" => TryWriteLock(bufferName),
     "orphan_write_lock" => OrphanWriteLock(bufferName),
+    "hold_write_lock" => HoldWriteLock(bufferName),
     _               => Error($"Unknown role: {role}")
 };
 
@@ -195,6 +197,20 @@ static int OrphanWriteLock(string name)
         return Error("failed to acquire orphan test lock");
     Console.WriteLine("orphan_locked");
     return 0; // Deliberately skip Dispose/Release; process teardown closes only the mapping handle.
+}
+
+static int HoldWriteLock(string name)
+{
+    using var region = MemoryRegion.OpenExisting(name);
+    if (!region.TryAcquireWriteLock(TimeSpan.FromSeconds(5)))
+        return Error("failed to acquire held test lock");
+
+    // The parent reads this line, probes the lock while we are alive, and then kills us
+    // to simulate a crash while the lock is held.
+    Console.WriteLine("holding");
+    Console.Out.Flush();
+    Thread.Sleep(Timeout.Infinite);
+    return 0;
 }
 
 static int Error(string msg)

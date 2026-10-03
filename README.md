@@ -59,7 +59,14 @@ if (memory.TryAcquireWriteLock(TimeSpan.FromSeconds(1)))
 ```
 
 Lock ownership includes the process ID, managed thread ID, and process start time. A process
-waiting for a write lock can recover a lock left behind by a terminated process.
+waiting for a write lock keeps checking whether the owner is still alive (also when it waits
+with `Timeout.InfiniteTimeSpan`) and recovers a lock left behind by a terminated process.
+
+The write lock belongs to the thread that acquired it. Release it on that same thread; releasing
+from another thread throws `SynchronizationLockException` and leaves the lock held. In particular,
+do not `await` between acquiring and releasing a lock, because the continuation may resume on a
+different thread. Disposing a region while another thread is waiting for one of its locks releases
+that thread with an `ObjectDisposedException`.
 
 ## Choosing a data structure
 
@@ -203,6 +210,10 @@ using (memory.AcquireWriteLock())
 `StructuredMemory<TSchema>` automatically locks values wider than eight bytes, strings, blobs,
 UTF-8 strings, and arrays to prevent torn reads and writes. Use an explicit lock when several
 fields form one transaction.
+
+The lock guards returned by `AcquireWriteLock()` and `AcquireReadLock()` must be disposed on the
+thread that acquired them. Keep the guarded scope synchronous: an `await` inside it lets the guard
+be disposed on another thread, which throws `SynchronizationLockException`.
 
 ## Shared arrays
 

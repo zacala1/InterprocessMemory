@@ -720,6 +720,11 @@ namespace InterprocessMemory
         /// <param name="timeout">Lock acquisition timeout</param>
         /// <returns>A disposable lock guard that releases the lock on dispose</returns>
         /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
+        /// <remarks>
+        /// The lock is owned by the calling thread. Dispose the guard on that same thread; do not
+        /// <c>await</c> inside the guarded scope, or <see cref="WriteLock.Dispose"/> throws
+        /// <see cref="SynchronizationLockException"/>.
+        /// </remarks>
         public WriteLock AcquireWriteLock(TimeSpan timeout)
         {
             ThrowIfDisposed();
@@ -759,6 +764,10 @@ namespace InterprocessMemory
         /// <param name="timeout">Lock acquisition timeout</param>
         /// <returns>A disposable lock guard that releases the lock on dispose</returns>
         /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
+        /// <remarks>
+        /// Dispose the guard on the thread that acquired it; do not <c>await</c> inside the guarded
+        /// scope, or <see cref="ReadLock.Dispose"/> throws <see cref="SynchronizationLockException"/>.
+        /// </remarks>
         public ReadLock AcquireReadLock(TimeSpan timeout)
         {
             ThrowIfDisposed();
@@ -1152,24 +1161,46 @@ namespace InterprocessMemory
         {
             private IMemoryRegion? _buffer;
             private Action? _onDispose;
+            private readonly int _ownerThreadId;
 
             internal WriteLock(IMemoryRegion? buffer, Action? onDispose = null)
             {
                 _buffer = buffer;
                 _onDispose = onDispose;
+                _ownerThreadId = Environment.CurrentManagedThreadId;
             }
 
             /// <summary>
-            /// Releases the write lock if not already released
+            /// Releases the write lock if not already released.
             /// </summary>
+            /// <exception cref="SynchronizationLockException">
+            /// Called on a different thread than the one that acquired the lock, which is what happens
+            /// when the guarded scope contains an <c>await</c>. Nothing is released in that case.
+            /// </exception>
             public void Dispose()
             {
+                if (_onDispose == null)
+                    return;
+
+                // The lock and its reentrancy depth belong to the acquiring thread. Releasing from
+                // another thread would leave that thread believing it still holds the lock.
+                if (Environment.CurrentManagedThreadId != _ownerThreadId)
+                    throw new SynchronizationLockException(
+                        "A write lock guard must be disposed on the thread that acquired it. " +
+                        "Do not await inside a lock scope.");
+
                 var onDispose = Interlocked.Exchange(ref _onDispose, null);
                 if (onDispose != null)
                 {
-                    _buffer?.ReleaseWriteLock();
-                    _buffer = null;
-                    onDispose.Invoke();
+                    try
+                    {
+                        _buffer?.ReleaseWriteLock();
+                    }
+                    finally
+                    {
+                        _buffer = null;
+                        onDispose.Invoke();
+                    }
                 }
             }
         }
@@ -1186,24 +1217,44 @@ namespace InterprocessMemory
         {
             private IMemoryRegion? _buffer;
             private Action? _onDispose;
+            private readonly int _ownerThreadId;
 
             internal ReadLock(IMemoryRegion? buffer, Action? onDispose = null)
             {
                 _buffer = buffer;
                 _onDispose = onDispose;
+                _ownerThreadId = Environment.CurrentManagedThreadId;
             }
 
             /// <summary>
-            /// Releases the read lock if not already released
+            /// Releases the read lock if not already released.
             /// </summary>
+            /// <exception cref="SynchronizationLockException">
+            /// Called on a different thread than the one that acquired the lock. Nothing is released
+            /// in that case. See <see cref="WriteLock.Dispose"/>.
+            /// </exception>
             public void Dispose()
             {
+                if (_onDispose == null)
+                    return;
+
+                if (Environment.CurrentManagedThreadId != _ownerThreadId)
+                    throw new SynchronizationLockException(
+                        "A read lock guard must be disposed on the thread that acquired it. " +
+                        "Do not await inside a lock scope.");
+
                 var onDispose = Interlocked.Exchange(ref _onDispose, null);
                 if (onDispose != null)
                 {
-                    _buffer?.ReleaseReadLock();
-                    _buffer = null;
-                    onDispose.Invoke();
+                    try
+                    {
+                        _buffer?.ReleaseReadLock();
+                    }
+                    finally
+                    {
+                        _buffer = null;
+                        onDispose.Invoke();
+                    }
                 }
             }
         }
