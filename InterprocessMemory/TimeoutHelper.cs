@@ -20,12 +20,5 @@ namespace InterprocessMemory
         {
             return timeout != Timeout.InfiniteTimeSpan && stopwatch.Elapsed > timeout;
         }
-
-        public static bool IsNearExpiry(Stopwatch stopwatch, TimeSpan timeout, double fraction)
-        {
-            return timeout != Timeout.InfiniteTimeSpan
-                && timeout > TimeSpan.Zero
-                && stopwatch.Elapsed.TotalMilliseconds >= timeout.TotalMilliseconds * fraction;
-        }
     }
 }

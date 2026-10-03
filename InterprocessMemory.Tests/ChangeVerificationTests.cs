@@ -1041,18 +1041,19 @@ public class ChangeVerificationTests
     // ── AUDIT-5: ReleaseWriteLock CAS-by-owner ───────────────────────────────
 
     [Test]
-    public void Audit5_ReleaseWriteLock_WithoutAcquire_IsNoOp()
+    public void Audit5_ReleaseWriteLock_WithoutAcquire_Throws()
     {
-        // Caller bug: releasing a lock that wasn't acquired by this process. Without the
-        // owner-CAS guard, ReleaseWriteLock would zero ownership metadata and free the lock —
-        // dangerous when another process legitimately holds it. With the fix it's a logged no-op.
+        // Caller bug: releasing a lock that wasn't acquired by this thread. Without the owner
+        // guard, ReleaseWriteLock would zero ownership metadata and free the lock — dangerous
+        // when another process legitimately holds it. The guard leaves the lock state untouched
+        // and reports the misuse instead of hiding it.
         using var buf = new MemoryRegion(N("Audit5_NoAcquire"),
             new MemoryRegionOptions { Capacity = 4096 });
 
-        // No acquire here. Release should be a safe no-op (logs a warning).
-        Assert.DoesNotThrow(() => buf.ReleaseWriteLock());
+        // No acquire here.
+        Assert.Throws<SynchronizationLockException>(() => buf.ReleaseWriteLock());
 
-        // Now actually acquire — must still work normally after the no-op release.
+        // Now actually acquire — must still work normally after the rejected release.
         Assert.That(buf.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
         buf.ReleaseWriteLock();
     }

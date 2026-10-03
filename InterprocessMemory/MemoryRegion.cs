@@ -59,15 +59,37 @@ namespace InterprocessMemory
 
         private volatile int _disposed;
 
+        // Threads currently spinning inside TryAcquireWriteLock/TryAcquireReadLock. Those waits can be
+        // unbounded, so they are the one place where another thread can realistically call Dispose()
+        // while the shared header is being touched; Dispose() waits for this count to drain before it
+        // unmaps the view. Read/Write are not tracked: they are short, and two interlocked operations
+        // per call would cost more than they protect.
+        private int _activeWaiters;
+
+        // How often a lock waiter re-probes whether the owning process is still alive.
+        private const long OrphanCheckIntervalMs = 250;
+
+        // Upper bound on how long Dispose() waits for lock waiters to notice the disposed flag.
+        private static readonly TimeSpan s_waiterDrainTimeout = TimeSpan.FromSeconds(5);
+
         // Cached once per process: stamped into the header at lock acquire so an orphan check
         // can distinguish "same PID, same process" from "same PID, recycled by the OS for an
-        // unrelated process". Process.StartTime can throw under restricted permissions (Linux
-        // containers without /proc, certain Windows ACLs) — in that case we store 0 and the
-        // orphan check silently falls back to PID-only matching.
+        // unrelated process". The start time can be unreadable under restricted permissions
+        // (Linux containers without /proc, certain Windows ACLs) — in that case we store 0 and
+        // the orphan check silently falls back to PID-only matching.
+        //
+        // Windows: Process.StartTime.ToBinary() (the kernel creation time, identical for every observer).
+        // Linux: the kernel start tick count from /proc/<pid>/stat. Process.StartTime must NOT be used
+        // there: every process derives it from its own wall-clock boot-time snapshot, so the value the
+        // owner records and the value another process computes for the same owner differ by
+        // milliseconds and would make every live owner look like an impostor.
         private static readonly long s_processStartTimeBinary = TryCaptureProcessStartTime();
 
         private static long TryCaptureProcessStartTime()
         {
+            if (OperatingSystem.IsLinux())
+                return TryReadLinuxStartTicks(Environment.ProcessId);
+
             try
             {
                 using var p = Process.GetCurrentProcess();
@@ -77,6 +99,53 @@ namespace InterprocessMemory
             {
                 return 0;
             }
+        }
+
+        /// <summary>
+        /// Reads field 22 (starttime, clock ticks since boot) of <c>/proc/&lt;pid&gt;/stat</c>.
+        /// Returns 0 when it cannot be read.
+        /// </summary>
+        private static long TryReadLinuxStartTicks(int pid)
+        {
+            try
+            {
+                string stat = File.ReadAllText("/proc/" + pid + "/stat");
+
+                // The command name (field 2) is parenthesised and may itself contain spaces or
+                // parentheses, so split only what follows the LAST ')'. The first token after it
+                // is field 3, which makes field 22 index 19.
+                int commEnd = stat.LastIndexOf(')');
+                if (commEnd < 0)
+                    return 0;
+
+                string[] fields = stat.Substring(commEnd + 2).Split(' ');
+                return fields.Length > 19 && long.TryParse(fields[19], out long ticks) ? ticks : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// True when the process currently using <paramref name="ownerPid"/> is provably not the one
+        /// that recorded <paramref name="storedStartTime"/> (PID reuse).
+        /// </summary>
+        private static bool IsOwnerStartTimeMismatch(Process process, int ownerPid, long storedStartTime)
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                // 3.0.0 recorded Process.StartTime.ToBinary() here, which is negative for a local
+                // DateTime and not comparable across processes. Tick counts are positive. Treat the
+                // legacy format as "unknown" and keep the PID-only decision.
+                if (storedStartTime < 0)
+                    return false;
+
+                long currentTicks = TryReadLinuxStartTicks(ownerPid);
+                return currentTicks != 0 && currentTicks != storedStartTime;
+            }
+
+            return process.StartTime.ToBinary() != storedStartTime;
         }
 
         /// <summary>
@@ -715,14 +784,30 @@ namespace InterprocessMemory
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
 
+            EnterWait();
+            try
+            {
+                return TryAcquireWriteLockCore(timeout);
+            }
+            finally
+            {
+                ExitWait();
+            }
+        }
+
+        private bool TryAcquireWriteLockCore(TimeSpan timeout)
+        {
             var header = (SharedHeader*)_basePtr;
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
-            bool orphanCheckDone = false;
-            bool orphanCheckNearTimeout = false;
+            long nextOrphanCheckMs = 0;
 
             while (true)
             {
+                // Dispose() unmaps the header while we may still be spinning on it. It waits for
+                // registered waiters (EnterWait) to leave, and we leave as soon as we see the flag.
+                ThrowIfDisposed();
+
                 if (Interlocked.CompareExchange(ref header->WriterLockState, 1, 0) == 0)
                 {
                     bool success = false;
@@ -739,6 +824,8 @@ namespace InterprocessMemory
                         var readerSpinner = new SpinWait();
                         while (Volatile.Read(ref header->ReaderCount) > 0)
                         {
+                            ThrowIfDisposed();
+
                             if (TimeoutHelper.HasExpired(sw, timeout))
                             {
                                 return false; // Will release lock in finally
@@ -768,25 +855,18 @@ namespace InterprocessMemory
                 if (TimeoutHelper.HasExpired(sw, timeout))
                     return false;
 
-                if (_options.EnableOrphanLockDetection)
+                if (_options.EnableOrphanLockDetection && sw.ElapsedMilliseconds >= nextOrphanCheckMs)
                 {
-                    // Check on first CAS failure; re-check when nearing timeout (≥75% elapsed)
-                    // so a lock that becomes orphaned mid-wait is still recovered before giving up.
-                    bool nearTimeout = TimeoutHelper.IsNearExpiry(sw, timeout, 0.75);
+                    // Check on the first CAS failure and then periodically. The owner may die at any
+                    // point while we wait, and a wait with Timeout.InfiniteTimeSpan has no deadline to
+                    // key a one-off re-check on. The probe costs a process lookup, hence the interval.
+                    nextOrphanCheckMs = sw.ElapsedMilliseconds + OrphanCheckIntervalMs;
 
-                    if (!orphanCheckDone || (nearTimeout && !orphanCheckNearTimeout))
+                    if (IsWriteLockOrphaned())
                     {
-                        if (!orphanCheckDone)
-                            orphanCheckDone = true;
-                        else
-                            orphanCheckNearTimeout = true;
-
-                        if (IsWriteLockOrphaned())
-                        {
-                            _logger?.LogWarning("Detected orphan write lock, attempting recovery");
-                            TryForceReleaseWriteLock();
-                            continue;
-                        }
+                        _logger?.LogWarning("Detected orphan write lock, attempting recovery");
+                        TryForceReleaseWriteLock();
+                        continue;
                     }
                 }
 
@@ -805,21 +885,28 @@ namespace InterprocessMemory
             long currentThreadId = Environment.CurrentManagedThreadId;
             int ownerPid = Volatile.Read(ref header->LockOwnerProcessId);
             long ownerThreadId = Volatile.Read(ref header->LockOwnerThreadId);
+            // Releasing a lock this thread does not own must be loud. Silently ignoring it (the
+            // previous behaviour) turned `await` inside a lock scope — the continuation resumes on
+            // another thread — into a write lock that no process could ever release again.
             if (ownerPid != currentPid || ownerThreadId != currentThreadId)
             {
                 _logger?.LogWarning(
-                    "ReleaseWriteLock called from PID {Pid}/thread {ThreadId} but lock owner is PID {OwnerPid}/thread {OwnerThreadId} — ignored",
+                    "ReleaseWriteLock called from PID {Pid}/thread {ThreadId} but lock owner is PID {OwnerPid}/thread {OwnerThreadId}",
                     currentPid, currentThreadId, ownerPid, ownerThreadId);
-                return;
+                throw new SynchronizationLockException(
+                    $"The write lock must be released by the thread that acquired it " +
+                    $"(caller PID {currentPid}/thread {currentThreadId}, lock owner PID {ownerPid}/thread {ownerThreadId}). " +
+                    "Do not await inside a lock scope.");
             }
 
             int prev = Interlocked.CompareExchange(ref header->LockOwnerProcessId, 0, currentPid);
             if (prev != currentPid)
             {
                 _logger?.LogWarning(
-                    "ReleaseWriteLock called from PID {Pid} but lock owner is {OwnerPid} — ignored",
+                    "ReleaseWriteLock called from PID {Pid} but lock owner is {OwnerPid}",
                     currentPid, prev);
-                return;
+                throw new SynchronizationLockException(
+                    "The write lock was taken over (for example by orphan-lock recovery) before it was released.");
             }
 
             header->LockOwnerThreadId = 0;
@@ -838,12 +925,28 @@ namespace InterprocessMemory
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
 
+            EnterWait();
+            try
+            {
+                return TryAcquireReadLockCore(timeout);
+            }
+            finally
+            {
+                ExitWait();
+            }
+        }
+
+        private bool TryAcquireReadLockCore(TimeSpan timeout)
+        {
             var header = (SharedHeader*)_basePtr;
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
 
             while (true)
             {
+                // See TryAcquireWriteLockCore: leave promptly once Dispose() has started.
+                ThrowIfDisposed();
+
                 // Fast path: peek the writer flag without any atomic. If a writer is active,
                 // wait — touching ReaderCount unnecessarily would create cache-line traffic on
                 // the reader-side line and prolong the writer's release-then-drain phase.
@@ -924,14 +1027,13 @@ namespace InterprocessMemory
 
                 // PID-reuse defense: even when a process with this PID exists, it might be an
                 // unrelated process that the OS recycled the PID for after the real owner died.
-                // Compare the captured StartTime; mismatch ⇒ impostor ⇒ orphan.
+                // Compare the captured start time; mismatch ⇒ impostor ⇒ orphan.
                 long storedStartTime = header->LockOwnerProcessStartTime;
                 if (storedStartTime != 0)
                 {
                     try
                     {
-                        long currentStartTime = process.StartTime.ToBinary();
-                        if (currentStartTime != storedStartTime)
+                        if (IsOwnerStartTimeMismatch(process, ownerPid, storedStartTime))
                         {
                             _logger?.LogWarning(
                                 "Lock owner PID {Pid} still exists but its StartTime differs (orphan from PID reuse)",
@@ -1105,7 +1207,26 @@ namespace InterprocessMemory
         }
 
         /// <summary>
-        /// Releases all resources used by this buffer
+        /// Registers the calling thread as a lock waiter. Increment first, then check the flag: with
+        /// the full fences of the two interlocked operations, either this thread sees the disposed
+        /// flag or <see cref="Dispose"/> sees this thread in <see cref="_activeWaiters"/>.
+        /// </summary>
+        private void EnterWait()
+        {
+            Interlocked.Increment(ref _activeWaiters);
+            if (_disposed != 0)
+            {
+                Interlocked.Decrement(ref _activeWaiters);
+                throw new ObjectDisposedException(nameof(MemoryRegion));
+            }
+        }
+
+        private void ExitWait() => Interlocked.Decrement(ref _activeWaiters);
+
+        /// <summary>
+        /// Releases all resources used by this buffer. Threads blocked in
+        /// <see cref="TryAcquireWriteLock"/> or <see cref="TryAcquireReadLock"/> are released with an
+        /// <see cref="ObjectDisposedException"/> before the memory is unmapped.
         /// </summary>
         public void Dispose()
         {
@@ -1113,6 +1234,15 @@ namespace InterprocessMemory
                 return;
 
             _logger?.LogDebug("Disposing shared buffer '{Name}'", _name);
+
+            // Waiters observe _disposed on every spin iteration and leave within a few milliseconds.
+            // Never unmap underneath a thread that is still dereferencing the header: that is an
+            // AccessViolationException, which terminates the process and cannot be caught.
+            var drain = Stopwatch.StartNew();
+            var drainSpinner = new SpinWait();
+            while (Volatile.Read(ref _activeWaiters) > 0 && drain.Elapsed < s_waiterDrainTimeout)
+                drainSpinner.SpinOnce();
+
             Cleanup(disposing: true);
             GC.SuppressFinalize(this);
         }

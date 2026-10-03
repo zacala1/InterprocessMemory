@@ -293,6 +293,125 @@ public class CrossProcessTests
         region.ReleaseWriteLock();
     }
 
+    /// <summary>
+    /// Starts a child that holds the write lock until it is killed, and returns once the child
+    /// has reported that it holds the lock.
+    /// </summary>
+    private static Process StartLockHolder(string bufferName)
+    {
+        Process process = Process.Start(CreateHelperStartInfo("hold_write_lock", bufferName))!;
+        string? line = process.StandardOutput.ReadLine();
+        if (line != "holding")
+        {
+            try
+            { process.Kill(); }
+            catch (InvalidOperationException) { /* already exited */ }
+            process.Dispose();
+            Assert.Fail($"lock holder did not report 'holding' (got '{line}')");
+        }
+
+        return process;
+    }
+
+    /// <summary>Kills the process (a no-op when it has already exited) and waits for it to be gone.</summary>
+    private static void KillAndWait(Process process)
+    {
+        try
+        { process.Kill(); }
+        catch (InvalidOperationException) { /* already exited */ }
+        process.WaitForExit();
+    }
+
+    [Test, Timeout(30000)]
+    public void CrossProcess_LiveWriteLockOwner_IsNotReportedAsOrphan()
+    {
+        // Process.StartTime is derived per observing process from a wall-clock boot-time snapshot on
+        // Linux, so comparing the owner's recorded value with the observer's value reported every
+        // live owner as an impostor and let waiters steal its lock.
+        string name = GetUniqueName("LiveOwner");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        using Process holder = StartLockHolder(name);
+        try
+        {
+            for (int i = 0; i < 50; i++)
+            {
+                Assert.That(region.IsWriteLockOrphaned(), Is.False, $"probe {i}");
+                Thread.Sleep(10);
+            }
+
+            Assert.That(region.TryAcquireWriteLock(TimeSpan.FromMilliseconds(300)), Is.False,
+                "a live owner's lock must not be taken over");
+        }
+        finally
+        {
+            KillAndWait(holder);
+        }
+    }
+
+    [Test, Timeout(30000)]
+    public void CrossProcess_InfiniteWait_RecoversWhenOwnerProcessDies()
+    {
+        string name = GetUniqueName("InfiniteOrphan");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        using Process holder = StartLockHolder(name);
+        try
+        {
+            // Release on the acquiring thread: the write lock is thread-affine.
+            Task<bool> waiter = Task.Run(() =>
+            {
+                bool acquired = region.TryAcquireWriteLock(Timeout.InfiniteTimeSpan);
+                if (acquired)
+                    region.ReleaseWriteLock();
+                return acquired;
+            });
+
+            // Give the waiter time to run its first orphan probe while the owner is still alive.
+            Thread.Sleep(500);
+            Assert.That(waiter.IsCompleted, Is.False, "the owner is alive, so the waiter must still be waiting");
+
+            KillAndWait(holder);
+
+            Assert.That(waiter.Wait(TimeSpan.FromSeconds(10)), Is.True,
+                "an infinite wait must keep probing the owner and recover once it has died");
+            Assert.That(waiter.Result, Is.True);
+        }
+        finally
+        {
+            KillAndWait(holder);
+        }
+    }
+
+    [Test, Timeout(40000)]
+    public void CrossProcess_FiniteWait_RecoversPromptlyWhenOwnerDies()
+    {
+        // The orphan probe used to run only at the start of the wait and at 75% of the timeout, so
+        // with a 30 s timeout an owner that died after one second was noticed after ~22 s.
+        string name = GetUniqueName("FiniteOrphan");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        using Process holder = StartLockHolder(name);
+        try
+        {
+            Task<bool> waiter = Task.Run(() =>
+            {
+                bool acquired = region.TryAcquireWriteLock(TimeSpan.FromSeconds(30));
+                if (acquired)
+                    region.ReleaseWriteLock();
+                return acquired;
+            });
+
+            Thread.Sleep(500);
+            KillAndWait(holder);
+
+            Assert.That(waiter.Wait(TimeSpan.FromSeconds(5)), Is.True,
+                "recovery must not wait for most of the lock timeout");
+            Assert.That(waiter.Result, Is.True);
+        }
+        finally
+        {
+            KillAndWait(holder);
+        }
+    }
+
     // ── Schema ───────────────────────────────────────────────────────────────
 
     public struct IpcTestSchema : IMemorySchema

@@ -131,13 +131,21 @@ namespace InterprocessMemory
         Memory<byte> GetMemory(long offset, int length);
 
         /// <summary>
-        /// Tries to acquire an exclusive write lock with timeout
+        /// Tries to acquire an exclusive write lock with timeout.
+        /// The wait is released with <see cref="ObjectDisposedException"/> if the region is disposed
+        /// by another thread while waiting.
         /// </summary>
         bool TryAcquireWriteLock(TimeSpan timeout);
 
         /// <summary>
-        /// Releases the write lock
+        /// Releases the write lock. The lock is owned by the acquiring thread of the acquiring
+        /// process, so it must be released on that same thread: do not <c>await</c> between
+        /// acquiring and releasing it.
         /// </summary>
+        /// <exception cref="SynchronizationLockException">
+        /// The calling thread does not own the write lock, or the lock was taken over (for example by
+        /// orphan-lock recovery) before it was released.
+        /// </exception>
         void ReleaseWriteLock();
 
         /// <summary>
