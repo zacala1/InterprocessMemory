@@ -294,12 +294,12 @@ public class CrossProcessTests
     }
 
     /// <summary>
-    /// Starts a child that holds the write lock until it is killed, and returns once the child
-    /// has reported that it holds the lock.
+    /// Starts a child that holds a lock until it is killed, and returns once the child has reported
+    /// that it holds the lock. <paramref name="role"/> is <c>hold_write_lock</c> or <c>hold_read_lock</c>.
     /// </summary>
-    private static Process StartLockHolder(string bufferName)
+    private static Process StartLockHolder(string bufferName, string role = "hold_write_lock")
     {
-        Process process = Process.Start(CreateHelperStartInfo("hold_write_lock", bufferName))!;
+        Process process = Process.Start(CreateHelperStartInfo(role, bufferName))!;
         string? line = process.StandardOutput.ReadLine();
         if (line != "holding")
         {
@@ -410,6 +410,28 @@ public class CrossProcessTests
         {
             KillAndWait(holder);
         }
+    }
+
+    [Test, Timeout(30000)]
+    public void CrossProcess_DeadReaderProcess_NeedsForceResetLocks()
+    {
+        // Read locks are not attributed to an owner, so a reader that dies leaves the shared count
+        // above zero and nothing can tell that it is stale. ForceResetLocks is the operator's way out.
+        string name = GetUniqueName("DeadReader");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        using Process holder = StartLockHolder(name, "hold_read_lock");
+        Assert.That(region.GetLockOwnerInfo().ReaderCount, Is.EqualTo(1));
+        KillAndWait(holder);
+
+        Assert.That(region.TryAcquireWriteLock(TimeSpan.FromMilliseconds(500)), Is.False,
+            "the dead reader's lock is still counted");
+        Assert.That(region.GetLockOwnerInfo().ReaderCount, Is.EqualTo(1));
+
+        region.ForceResetLocks();
+
+        Assert.That(region.GetLockOwnerInfo().ReaderCount, Is.EqualTo(0));
+        Assert.That(region.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
+        region.ReleaseWriteLock();
     }
 
     // ── Schema ───────────────────────────────────────────────────────────────

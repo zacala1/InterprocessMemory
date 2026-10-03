@@ -210,6 +210,136 @@ public class LibraryHardeningTests
     }
 
     [Test]
+    public void OrphanLockTimeout_IsDisabledByDefault()
+    {
+        // A time limit takes the lock away from a healthy owner that merely holds it for long
+        // (a long transaction, a paused debugger), so it is opt-in. Dead owners are still recovered.
+        var options = new MemoryRegionOptions();
+
+        Assert.That(options.OrphanLockTimeout, Is.EqualTo(TimeSpan.Zero));
+        Assert.That(options.EnableOrphanLockDetection, Is.True);
+    }
+
+    [Test]
+    public void ForceResetLocks_ClearsReadersAndHeldWriteLock()
+    {
+        using var buffer = new MemoryRegion(
+            N("ForceReset"),
+            new MemoryRegionOptions { Capacity = 256 });
+
+        Assert.That(buffer.TryAcquireReadLock(TimeSpan.FromSeconds(1)), Is.True);
+        Assert.That(buffer.GetLockOwnerInfo().ReaderCount, Is.EqualTo(1));
+        Assert.That(buffer.TryAcquireWriteLock(TimeSpan.FromMilliseconds(100)), Is.False);
+
+        buffer.ForceResetLocks();
+
+        Assert.That(buffer.GetLockOwnerInfo().ReaderCount, Is.EqualTo(0));
+        Assert.That(buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
+
+        // Resetting also frees a write lock that is still "held"; its holder learns that on release.
+        buffer.ForceResetLocks();
+        Assert.Throws<SynchronizationLockException>(() => buffer.ReleaseWriteLock());
+
+        Assert.That(buffer.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
+        buffer.ReleaseWriteLock();
+    }
+
+    [Test]
+    public void StructuredMemory_ForceResetLocks_UnblocksWriter()
+    {
+        string name = N("StructuredReset");
+        using var memory = StructuredMemory<SimpleSchema>.CreateOrOpen(name, new SimpleSchema());
+        using var peer = StructuredMemory<SimpleSchema>.OpenExisting(name, new SimpleSchema());
+
+        // A reader that never comes back, as after a crash.
+        var staleReader = peer.AcquireReadLock();
+        Assert.Throws<TimeoutException>(() => memory.AcquireWriteLock(TimeSpan.FromMilliseconds(100)));
+
+        memory.ForceResetLocks();
+
+        using (memory.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+        }
+
+        staleReader.Dispose();
+    }
+
+    [Test]
+    public void Remove_DeletesLinuxRegion_SoItCanBeRecreatedWithDifferentCapacity()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("Only Linux keeps regions in /dev/shm after their last user is gone.");
+
+        string name = N("Remove");
+        using (MemoryRegion.CreateOrOpen(name, 256))
+        {
+        }
+
+        // The region outlives its users, so a different capacity is rejected...
+        Assert.Throws<InvalidOperationException>(() => MemoryRegion.CreateOrOpen(name, 512));
+
+        // ...until it is removed.
+        Assert.That(MemoryRegion.Remove(name), Is.True);
+        Assert.That(MemoryRegion.Remove(name), Is.False);
+
+        using var fresh = MemoryRegion.CreateOrOpen(name, 512);
+        Assert.That(fresh.IsOwner, Is.True);
+        Assert.That(fresh.Capacity, Is.EqualTo(512));
+    }
+
+    [Test]
+    public void Remove_ClearsRegionLeftInitializingByCrashedCreator()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("Only Linux keeps regions in /dev/shm after their last user is gone.");
+
+        // "IPMI": the creator died after claiming initialization and before publishing the header,
+        // which makes every opener wait and then time out.
+        string name = N("StuckInit");
+        using (var file = new FileStream("/dev/shm/" + name, FileMode.CreateNew))
+        {
+            file.SetLength(128 + 256);
+            file.Write(BitConverter.GetBytes(0x494D5049u));
+        }
+
+        Assert.That(MemoryRegion.Remove(name), Is.True);
+
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        Assert.That(region.IsOwner, Is.True);
+    }
+
+    [Test]
+    public void Remove_FileBackedRegion_DeletesTheFile()
+    {
+        string name = N("RemoveFile");
+        string path = Path.Combine(Path.GetTempPath(), name + ".bin");
+        var options = new MemoryRegionOptions { FilePath = path };
+        try
+        {
+            using (MemoryRegion.CreateOrOpen(name, 256, options))
+            {
+            }
+
+            Assert.That(File.Exists(path), Is.True);
+            Assert.That(MemoryRegion.Remove(name, options), Is.True);
+            Assert.That(File.Exists(path), Is.False);
+            Assert.That(MemoryRegion.Remove(name, options), Is.False);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Test]
+    public void Remove_UnknownRegion_ReturnsFalse_AndBadNamesAreRejected()
+    {
+        Assert.That(MemoryRegion.Remove(N("Nothing")), Is.False);
+        Assert.Throws<ArgumentException>(() => MemoryRegion.Remove("a/b"));
+        Assert.Throws<ArgumentException>(() => MemoryRegion.Remove(""));
+    }
+
+    [Test]
     public void ReadLock_DoubleRelease_DoesNotBreakWriterExclusion()
     {
         using var buffer = new MemoryRegion(

@@ -62,6 +62,10 @@ Lock ownership includes the process ID, managed thread ID, and process start tim
 waiting for a write lock keeps checking whether the owner is still alive (also when it waits
 with `Timeout.InfiniteTimeSpan`) and recovers a lock left behind by a terminated process.
 
+Recovery is based on the owner process being gone. A write lock held by a process that is still
+alive is never taken over unless you opt in with `MemoryRegionOptions.OrphanLockTimeout`, which
+trades mutual exclusion for liveness when a critical section may run longer than the timeout.
+
 The write lock belongs to the thread that acquired it. Release it on that same thread; releasing
 from another thread throws `SynchronizationLockException` and leaves the lock held. In particular,
 do not `await` between acquiring and releasing a lock, because the continuation may resume on a
@@ -236,6 +240,21 @@ modifying the existing bytes.
 
 Version 3 does not migrate live 2.x regions. Stop every 2.x process, remove the named/file-backed
 region, and recreate it with version 3. See [MIGRATION.md](MIGRATION.md).
+
+## Recovering after a crash
+
+Windows named sections disappear when their last handle closes. On Linux a region is a file in
+`/dev/shm` that outlives its users, so a crash can leave state behind:
+
+- A process that dies while holding a **read lock** leaves the shared reader count above zero and
+  every writer times out. Read locks have no owner, so this cannot be detected automatically.
+  `GetLockOwnerInfo().ReaderCount` shows the stale count; once no process is inside a critical
+  section, call `MemoryRegion.ForceResetLocks()` (or `StructuredMemory<T>.ForceResetLocks()`).
+- A creator that dies during initialization makes every opener time out. A region with a different
+  capacity or element type than the one you now want is rejected as well. In both cases stop all
+  users and call `MemoryRegion.Remove(name)` (pass the same `MemoryRegionOptions` for file-backed
+  regions); the next `CreateOrOpen` starts from scratch. It works for every data structure because
+  they are all addressed by the same name.
 
 ## Build and test
 

@@ -788,6 +788,19 @@ namespace InterprocessMemory
         }
 
         /// <summary>
+        /// Unconditionally clears the cross-process write lock and read-lock count of this region.
+        /// A process that dies while holding a read lock leaves the shared reader count above zero
+        /// forever, which makes every later writer time out and, on Linux, survives reopening the region.
+        /// Call this only when no process is inside a critical section of the region.
+        /// See <see cref="MemoryRegion.ForceResetLocks"/>.
+        /// </summary>
+        public void ForceResetLocks()
+        {
+            ThrowIfDisposed();
+            ((MemoryRegion)_buffer).ForceResetLocks();
+        }
+
+        /// <summary>
         /// Checks if a field exists in the schema
         /// </summary>
         public bool HasField(string fieldName)

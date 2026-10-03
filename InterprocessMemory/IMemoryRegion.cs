@@ -74,6 +74,13 @@ namespace InterprocessMemory
         /// Gets whether the lock is orphaned (owner process died)
         /// </summary>
         public bool IsOrphan { get; init; }
+
+        /// <summary>
+        /// Gets the number of read locks currently held across all processes. Read locks are not
+        /// attributed to an owner, so a process that dies while holding one leaves this count
+        /// permanently above zero (writers then time out); see <see cref="MemoryRegion.ForceResetLocks"/>.
+        /// </summary>
+        public int ReaderCount { get; init; }
     }
 
     /// <summary>
