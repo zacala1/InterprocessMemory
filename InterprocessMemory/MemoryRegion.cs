@@ -247,6 +247,54 @@ namespace InterprocessMemory
             RegionKind regionKind) =>
             new(name, capacityBytes: null, options, createOrOpen: false, regionKind);
 
+        /// <summary>
+        /// Deletes the backing storage of a named region so that the next
+        /// <see cref="CreateOrOpen(string, long, MemoryRegionOptions?)"/> starts from scratch.
+        /// Use it to get rid of a region that a crash left unusable, for example one whose creator died
+        /// during initialization, or to change the capacity or element type of an existing region.
+        /// <para>
+        /// Linux keeps the region as a file in <c>/dev/shm</c> that outlives its users, so it has to be
+        /// removed explicitly. Windows named sections are reference counted by the kernel and vanish when
+        /// the last handle closes; for them (without <see cref="MemoryRegionOptions.FilePath"/>) this
+        /// returns <c>false</c>.
+        /// </para>
+        /// <para>
+        /// Stop every process that uses the region first. Processes that still have it mapped keep
+        /// working on the removed storage, while later openers get a new, independent region.
+        /// This applies to every region kind (typed queues, arrays, structured memory), all of which are
+        /// addressed by the same name.
+        /// </para>
+        /// </summary>
+        /// <param name="name">The region name that was passed to <c>CreateOrOpen</c>.</param>
+        /// <param name="options">
+        /// Pass the same options (in particular <see cref="MemoryRegionOptions.FilePath"/>) that the region
+        /// was created with when it is file backed.
+        /// </param>
+        /// <returns><c>true</c> when backing storage was deleted; <c>false</c> when there was nothing to delete.</returns>
+        public static bool Remove(string name, MemoryRegionOptions? options = null)
+        {
+            ValidateFlatName(name);
+
+            string? path = options?.FilePath;
+            if (string.IsNullOrEmpty(path))
+            {
+                if (OperatingSystem.IsWindows())
+                    return false;
+
+                if (!OperatingSystem.IsLinux())
+                    throw new PlatformNotSupportedException(
+                        "MemoryRegion requires Windows or Linux unless MemoryRegionOptions.FilePath is used.");
+
+                path = "/dev/shm/" + name;
+            }
+
+            if (!File.Exists(path))
+                return false;
+
+            File.Delete(path);
+            return true;
+        }
+
         internal MemoryRegion(string name, MemoryRegionOptions? options = null)
             : this(
                 name,
@@ -535,7 +583,9 @@ namespace InterprocessMemory
                 }
                 if (sw.Elapsed > TimeSpan.FromSeconds(5))
                     throw new TimeoutException(
-                        "Timed out waiting for shared memory to be initialized by another process");
+                        "Timed out waiting for shared memory to be initialized by another process. " +
+                        "If that process crashed during initialization, stop every user of the region " +
+                        "and call MemoryRegion.Remove(name).");
                 Thread.SpinWait(100);
             }
 
@@ -1127,6 +1177,40 @@ namespace InterprocessMemory
             return true;
         }
 
+        /// <summary>
+        /// Unconditionally clears the shared write lock and the read-lock count.
+        /// <para>
+        /// This is the recovery tool for a lock state that cannot be recovered automatically. Read
+        /// locks are not attributed to an owner, so when a process dies while holding one the
+        /// shared reader count stays above zero forever (see <see cref="LockOwnerInfo.ReaderCount"/>)
+        /// and every writer times out, including after the region is reopened on Linux, where the
+        /// backing file outlives its users.
+        /// </para>
+        /// <para>
+        /// Call it only when no process is inside a critical section of this region; resetting locks
+        /// that are legitimately held lets a writer run concurrently with them. A thread that held
+        /// a lock when it was reset gets <see cref="SynchronizationLockException"/> from its release.
+        /// </para>
+        /// </summary>
+        public void ForceResetLocks()
+        {
+            ThrowIfDisposed();
+
+            var header = (SharedHeader*)_basePtr;
+
+            _logger?.LogWarning(
+                "Force resetting locks of '{Name}' (writer state {WriterState}, readers {Readers})",
+                _name, Volatile.Read(ref header->WriterLockState), Volatile.Read(ref header->ReaderCount));
+
+            Volatile.Write(ref header->LockOwnerProcessId, 0);
+            header->LockOwnerThreadId = 0;
+            header->LockOwnerProcessStartTime = 0;
+            header->LockAcquiredTimestamp = 0;
+            Thread.MemoryBarrier();
+            Volatile.Write(ref header->WriterLockState, 0);
+            Interlocked.Exchange(ref header->ReaderCount, 0);
+        }
+
         /// <inheritdoc/>
         public LockOwnerInfo GetLockOwnerInfo()
         {
@@ -1139,7 +1223,8 @@ namespace InterprocessMemory
                 ProcessId = header->LockOwnerProcessId,
                 ThreadId = header->LockOwnerThreadId,
                 AcquiredTimestamp = header->LockAcquiredTimestamp,
-                IsOrphan = IsWriteLockOrphaned()
+                IsOrphan = IsWriteLockOrphaned(),
+                ReaderCount = Volatile.Read(ref header->ReaderCount)
             };
         }
 

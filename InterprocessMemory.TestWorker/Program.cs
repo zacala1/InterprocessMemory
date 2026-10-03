@@ -19,6 +19,7 @@ using InterprocessMemory;
 ///   try_write_lock &lt;name&gt; — try the cross-process write lock for 250 ms
 ///   orphan_write_lock &lt;name&gt; — acquire a write lock and exit without releasing it
 ///   hold_write_lock &lt;name&gt; — acquire a write lock, print "holding", and keep it until killed
+///   hold_read_lock &lt;name&gt; — acquire a read lock, print "holding", and keep it until killed
 /// </summary>
 if (args.Length < 2)
 {
@@ -45,6 +46,7 @@ return role switch
     "try_write_lock" => TryWriteLock(bufferName),
     "orphan_write_lock" => OrphanWriteLock(bufferName),
     "hold_write_lock" => HoldWriteLock(bufferName),
+    "hold_read_lock" => HoldReadLock(bufferName),
     _               => Error($"Unknown role: {role}")
 };
 
@@ -207,6 +209,18 @@ static int HoldWriteLock(string name)
 
     // The parent reads this line, probes the lock while we are alive, and then kills us
     // to simulate a crash while the lock is held.
+    Console.WriteLine("holding");
+    Console.Out.Flush();
+    Thread.Sleep(Timeout.Infinite);
+    return 0;
+}
+
+static int HoldReadLock(string name)
+{
+    using var region = MemoryRegion.OpenExisting(name);
+    if (!region.TryAcquireReadLock(TimeSpan.FromSeconds(5)))
+        return Error("failed to acquire held test read lock");
+
     Console.WriteLine("holding");
     Console.Out.Flush();
     Thread.Sleep(Timeout.Infinite);
