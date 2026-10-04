@@ -370,8 +370,11 @@ public class ConcurrentMessageQueueTests
         var producersDone = 0;
         var errors = new ConcurrentBag<string>();
 
+        // The producers and consumers spin, so each gets a dedicated thread. On the shared thread pool
+        // the four spinning producers occupy every worker of a small machine, the consumers cannot start
+        // for seconds (the pool adds threads slowly), and the producers give up on the full queue.
         // Producers
-        var producers = Enumerable.Range(0, producerCount).Select(producerId => Task.Run(() =>
+        var producers = Enumerable.Range(0, producerCount).Select(producerId => Task.Factory.StartNew(() =>
         {
             try
             {
@@ -397,36 +400,40 @@ public class ConcurrentMessageQueueTests
             {
                 Interlocked.Increment(ref producersDone);
             }
-        })).ToArray();
+        }, TaskCreationOptions.LongRunning)).ToArray();
 
         // Consumers
-        var consumers = Enumerable.Range(0, consumerCount).Select(consumerId => Task.Run(() =>
+        var consumers = Enumerable.Range(0, consumerCount).Select(consumerId => Task.Factory.StartNew(() =>
         {
             var readBuffer = new byte[64];
-            int emptyReads = 0;
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
 
-            while (received.Count < totalExpected && emptyReads < 1000)
+            // Wait for the full count instead of giving up after a number of empty polls: in a fresh
+            // process the consumers can burn through any such budget before the producers have sent
+            // anything (JIT, scheduling), and the producers then block forever on a full queue.
+            while (received.Count < totalExpected)
             {
+                if (deadline.Elapsed > TimeSpan.FromSeconds(30))
+                {
+                    errors.Add($"Consumer {consumerId} timed out with {received.Count}/{totalExpected} received");
+                    return;
+                }
+
                 var bytesRead = buffer.TryRead(readBuffer);
                 if (bytesRead >= 4)
                 {
                     received.Add(BitConverter.ToInt32(readBuffer, 0));
-                    emptyReads = 0;
+                }
+                else if (Volatile.Read(ref producersDone) == producerCount && buffer.ApproximateCount == 0)
+                {
+                    Thread.Sleep(1);
                 }
                 else
                 {
-                    emptyReads++;
-                    if (producersDone == producerCount && buffer.ApproximateCount == 0)
-                    {
-                        Thread.Sleep(1);
-                    }
-                    else
-                    {
-                        Thread.SpinWait(10);
-                    }
+                    Thread.SpinWait(10);
                 }
             }
-        })).ToArray();
+        }, TaskCreationOptions.LongRunning)).ToArray();
 
         await Task.WhenAll(producers.Concat(consumers));
 
