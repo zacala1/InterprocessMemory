@@ -302,20 +302,8 @@ namespace InterprocessMemory
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
+            // No finalizer: if Dispose is never called, the MemoryRegion's own finalizer unmaps the memory.
             _buffer?.Dispose();
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Releases unmanaged resources if Dispose was not called. Does NOT proactively dispose
-        /// the inner <see cref="MemoryRegion"/> — that has its own finalizer and
-        /// touching it from here risks running against an already-finalized peer (finalizer
-        /// order is undefined). The peer's finalizer reclaims its unmanaged handles directly.
-        /// </summary>
-        ~SharedArray()
-        {
-            // Just mark disposed so a racing manual Dispose is a no-op. No managed work here.
-            Interlocked.Exchange(ref _disposed, 1);
         }
     }
 }
