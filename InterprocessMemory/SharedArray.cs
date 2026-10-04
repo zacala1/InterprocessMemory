@@ -64,23 +64,38 @@ namespace InterprocessMemory
                 _buffer = MemoryRegion.CreateOrOpen(
                     name,
                     checked(ArrayHeaderSize + dataSize),
-                    options: null,
+                    CreateRegionOptions(),
                     RegionKind.SharedArray);
-
-                if (_buffer.IsOwner)
-                    InitializeHeader();
-                else
-                    ValidateAndLoadHeader(expectedLength: _length);
             }
             else
             {
                 _buffer = MemoryRegion.OpenExisting(
                     name,
-                    options: null,
+                    CreateRegionOptions(),
                     RegionKind.SharedArray);
-                ValidateAndLoadHeader(expectedLength: null);
+            }
+
+            // The region is already mapped here. Opening an array of another element type or length
+            // throws from the header check, and without this the mapping and (on Linux) its file
+            // descriptor would stay open until the finalizer runs.
+            try
+            {
+                if (createOrOpen && _buffer.IsOwner)
+                    InitializeHeader();
+                else
+                    ValidateAndLoadHeader(expectedLength: createOrOpen ? _length : null);
+            }
+            catch
+            {
+                _buffer.Dispose();
+                throw;
             }
         }
+
+        // The array exposes no statistics, so the region's per-call counters would only cost an
+        // interlocked operation on every element access.
+        private static MemoryRegionOptions CreateRegionOptions() =>
+            new() { EnableStatistics = false };
 
         private void InitializeHeader()
         {

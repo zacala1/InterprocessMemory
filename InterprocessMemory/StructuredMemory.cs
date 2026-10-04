@@ -40,6 +40,11 @@ namespace InterprocessMemory
         private readonly ThreadLocal<int> _writeLockDepth = new(() => 0);
         private readonly ThreadLocal<int> _readLockDepth = new(() => 0);
 
+        // A method group is converted to a new delegate on every use, which allocated on each
+        // automatically locked read or write. Convert once per instance instead.
+        private readonly Action _decrementWriteLockDepth;
+        private readonly Action _decrementReadLockDepth;
+
         /// <summary>
         /// Gets the schema instance defining the memory layout
         /// </summary>
@@ -94,6 +99,8 @@ namespace InterprocessMemory
 
             _schema = schema;
             _compatibility = compatibility;
+            _decrementWriteLockDepth = DecrementWriteLockDepth;
+            _decrementReadLockDepth = DecrementReadLockDepth;
             _fields = BuildFieldMetadata(schema);
 
             if (_fields.Count == 0)
@@ -107,15 +114,18 @@ namespace InterprocessMemory
 
             long totalSize = SchemaHeaderSize + CalculateTotalSize(_fields);
 
+            // No statistics are exposed here, so skip the region's per-call counters.
+            var regionOptions = new MemoryRegionOptions { EnableStatistics = false };
+
             if (create)
             {
                 _buffer = MemoryRegion.CreateOrOpen(
-                    name, totalSize, options: null, RegionKind.StructuredMemory);
+                    name, totalSize, regionOptions, RegionKind.StructuredMemory);
             }
             else
             {
                 _buffer = MemoryRegion.OpenExisting(
-                    name, options: null, RegionKind.StructuredMemory);
+                    name, regionOptions, RegionKind.StructuredMemory);
                 if (_buffer.Capacity != totalSize)
                 {
                     _buffer.Dispose();
@@ -734,14 +744,14 @@ namespace InterprocessMemory
             if (_writeLockDepth.Value > 0)
             {
                 IncrementWriteLockDepth();
-                return new WriteLock(null, DecrementWriteLockDepth);
+                return new WriteLock(null, _decrementWriteLockDepth);
             }
 
             if (!_buffer.TryAcquireWriteLock(timeout))
                 throw new TimeoutException($"Failed to acquire write lock within {timeout}");
 
             IncrementWriteLockDepth();
-            return new WriteLock(_buffer, DecrementWriteLockDepth);
+            return new WriteLock(_buffer, _decrementWriteLockDepth);
         }
 
         /// <summary>
@@ -777,14 +787,14 @@ namespace InterprocessMemory
             if (_readLockDepth.Value > 0 || _writeLockDepth.Value > 0)
             {
                 IncrementReadLockDepth();
-                return new ReadLock(null, DecrementReadLockDepth);
+                return new ReadLock(null, _decrementReadLockDepth);
             }
 
             if (!_buffer.TryAcquireReadLock(timeout))
                 throw new TimeoutException($"Failed to acquire read lock within {timeout}");
 
             IncrementReadLockDepth();
-            return new ReadLock(_buffer, DecrementReadLockDepth);
+            return new ReadLock(_buffer, _decrementReadLockDepth);
         }
 
         /// <summary>

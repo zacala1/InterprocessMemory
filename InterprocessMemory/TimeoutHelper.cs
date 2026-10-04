@@ -20,5 +20,14 @@ namespace InterprocessMemory
         {
             return timeout != Timeout.InfiniteTimeSpan && stopwatch.Elapsed > timeout;
         }
+
+        /// <summary>
+        /// Same check against a <see cref="Stopwatch.GetTimestamp"/> start value. Unlike a
+        /// <see cref="Stopwatch"/> instance this does not allocate, which matters on paths that run per call.
+        /// </summary>
+        public static bool HasExpired(long startTimestamp, TimeSpan timeout)
+        {
+            return timeout != Timeout.InfiniteTimeSpan && Stopwatch.GetElapsedTime(startTimestamp) > timeout;
+        }
     }
 }
