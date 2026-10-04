@@ -1147,17 +1147,6 @@ namespace InterprocessMemory
             _buffer?.Dispose();
             _writeLockDepth.Dispose();
             _readLockDepth.Dispose();
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Releases unmanaged resources if Dispose was not called
-        /// </summary>
-        ~StructuredMemory()
-        {
-            Interlocked.Exchange(ref _disposed, 1);
-            // MemoryRegion owns its unmanaged finalizer path. Avoid invoking
-            // managed Dispose logic from this finalizer.
         }
 
         private static void EnsureScalarField(FieldMetadata metadata)

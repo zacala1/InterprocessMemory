@@ -633,24 +633,10 @@ namespace InterprocessMemory
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
+            // The MemoryHandle wraps an unmanaged pointer and owns nothing, so there is no finalizer
+            // here: if Dispose is never called, the MemoryRegion's own finalizer unmaps the memory.
             _memoryHandle.Dispose();
-            // See SingleProducerByteStream: only dispose the managed _buffer on the deterministic
-            // path. The finalizer below skips it to avoid touching peer objects whose own
-            // finalizers may have already run.
             _buffer?.Dispose();
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Releases unmanaged resources if Dispose was not called.
-        /// </summary>
-        ~ConcurrentMessageQueue()
-        {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
-                return;
-            try
-            { _memoryHandle.Dispose(); }
-            catch { /* best-effort */ }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

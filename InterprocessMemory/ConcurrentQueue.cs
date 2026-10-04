@@ -343,7 +343,6 @@ namespace InterprocessMemory
                 return;
             _memoryHandle.Dispose();
             _region.Dispose();
-            GC.SuppressFinalize(this);
         }
     }
 }
