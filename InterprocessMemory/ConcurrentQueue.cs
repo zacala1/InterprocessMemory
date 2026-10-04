@@ -99,7 +99,7 @@ namespace InterprocessMemory
 
             if (createOrOpen)
             {
-                _capacity = RoundUpToPowerOf2(capacity!.Value);
+                _capacity = PowerOfTwo.RoundUp(capacity!.Value, "capacity");
                 _capacityMask = _capacity - 1;
                 _slotStride = RoundUpToMultiple(checked(SlotHeaderSize + _elementSize), 8);
                 long regionCapacity = checked(HeaderSize + (long)_capacity * _slotStride);
@@ -179,10 +179,13 @@ namespace InterprocessMemory
                 _header->FingerprintHigh != _fingerprint.High)
                 throw new InvalidDataException("The queue has a different format or element type.");
 
-            if (requestedCapacity.HasValue &&
-                RoundUpToPowerOf2(requestedCapacity.Value) != storedCapacity)
-                throw new InvalidOperationException(
-                    $"Capacity mismatch: expected {RoundUpToPowerOf2(requestedCapacity.Value)}, found {storedCapacity}.");
+            if (requestedCapacity.HasValue)
+            {
+                int expectedCapacity = PowerOfTwo.RoundUp(requestedCapacity.Value, "capacity");
+                if (expectedCapacity != storedCapacity)
+                    throw new InvalidOperationException(
+                        $"Capacity mismatch: expected {expectedCapacity}, found {storedCapacity}.");
+            }
 
             long expectedRegionSize = checked(HeaderSize + (long)storedCapacity * storedStride);
             if (_region.Capacity != expectedRegionSize)
@@ -312,19 +315,6 @@ namespace InterprocessMemory
                 Volatile.Read(ref _header->TotalDequeues),
                 Volatile.Read(ref _header->FailedEnqueues),
                 Volatile.Read(ref _header->FailedDequeues));
-        }
-
-        private static int RoundUpToPowerOf2(int value)
-        {
-            if (value > 1 << 30)
-                throw new ArgumentOutOfRangeException(nameof(value));
-            value--;
-            value |= value >> 1;
-            value |= value >> 2;
-            value |= value >> 4;
-            value |= value >> 8;
-            value |= value >> 16;
-            return value + 1;
         }
 
         private static int RoundUpToMultiple(int value, int multiple) =>
