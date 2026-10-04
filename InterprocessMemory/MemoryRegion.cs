@@ -72,6 +72,36 @@ namespace InterprocessMemory
         // Upper bound on how long Dispose() waits for lock waiters to notice the disposed flag.
         private static readonly TimeSpan s_waiterDrainTimeout = TimeSpan.FromSeconds(5);
 
+        // Ticks. See DisposeGracePeriod.
+        private static long s_disposeGraceTicks = TimeSpan.FromMilliseconds(10).Ticks;
+
+        /// <summary>
+        /// How long <see cref="Dispose"/> keeps the memory mapped after the region has been marked
+        /// disposed, so that operations on other threads that are already past their disposed check can
+        /// finish before the view is unmapped (default: 10 ms; <see cref="TimeSpan.Zero"/> disables it).
+        /// This is a process-wide setting.
+        /// <para>
+        /// It is a best-effort mitigation, not a guarantee. The lock-free members (<c>Read</c>,
+        /// <c>Write</c>, the typed queues, <c>SharedArray</c>) deliberately do no per-call bookkeeping, so
+        /// <see cref="Dispose"/> cannot know whether another thread is still inside one. A thread that is
+        /// descheduled for longer than this period at exactly that moment would touch unmapped memory,
+        /// which terminates the process with an <see cref="AccessViolationException"/>. The only complete
+        /// protection is to stop and join every thread that uses an instance before disposing it.
+        /// </para>
+        /// </summary>
+        /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
+        public static TimeSpan DisposeGracePeriod
+        {
+            get => TimeSpan.FromTicks(Interlocked.Read(ref s_disposeGraceTicks));
+            set
+            {
+                if (value < TimeSpan.Zero)
+                    throw new ArgumentOutOfRangeException(nameof(value), "DisposeGracePeriod must not be negative.");
+
+                Interlocked.Exchange(ref s_disposeGraceTicks, value.Ticks);
+            }
+        }
+
         // Cached once per process: stamped into the header at lock acquire so an orphan check
         // can distinguish "same PID, same process" from "same PID, recycled by the OS for an
         // unrelated process". The start time can be unreadable under restricted permissions
@@ -1312,6 +1342,12 @@ namespace InterprocessMemory
         /// Releases all resources used by this buffer. Threads blocked in
         /// <see cref="TryAcquireWriteLock"/> or <see cref="TryAcquireReadLock"/> are released with an
         /// <see cref="ObjectDisposedException"/> before the memory is unmapped.
+        /// <para>
+        /// Stop and join every thread that uses this instance before disposing it. Other members check
+        /// the disposed flag but are not tracked, so a thread that is inside one of them while the
+        /// memory is unmapped crashes the process; <see cref="DisposeGracePeriod"/> narrows that window
+        /// but does not close it.
+        /// </para>
         /// </summary>
         public void Dispose()
         {
@@ -1327,6 +1363,14 @@ namespace InterprocessMemory
             var drainSpinner = new SpinWait();
             while (Volatile.Read(ref _activeWaiters) > 0 && drain.Elapsed < s_waiterDrainTimeout)
                 drainSpinner.SpinOnce();
+
+            // Calls that passed their disposed check just before the flag was set are still running
+            // against the mapping and are not tracked (that would cost every call two interlocked
+            // operations; measured at roughly 9x on a queue round trip). New calls fail fast with
+            // ObjectDisposedException, so a short pause lets those in-flight calls complete.
+            long graceTicks = Interlocked.Read(ref s_disposeGraceTicks);
+            if (graceTicks > 0)
+                Thread.Sleep(TimeSpan.FromTicks(graceTicks));
 
             Cleanup(disposing: true);
             GC.SuppressFinalize(this);
