@@ -283,6 +283,70 @@ public class LibraryHardeningTests
         }
     }
 
+    private static int CountOpenFilesMatching(string name)
+    {
+        return Directory.GetFiles("/proc/self/fd").Count(path =>
+        {
+            try
+            { return new FileInfo(path).LinkTarget?.Contains(name) == true; }
+            catch (IOException) { return false; }
+        });
+    }
+
+    [Test]
+    public void SharedArray_FailedOpen_ReleasesTheMappingImmediately()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("Counts the process's open file descriptors through /proc.");
+
+        // Opening with another element type fails the header check after the region is mapped.
+        // Without an explicit dispose the file descriptor stayed open until the finalizer ran.
+        string name = N("ArrayLeak");
+        using var owner = SharedArray<int>.CreateOrOpen(name, 4);
+        int before = CountOpenFilesMatching(name);
+
+        Assert.Throws<InvalidDataException>(() => SharedArray<long>.OpenExisting(name));
+
+        Assert.That(CountOpenFilesMatching(name), Is.EqualTo(before));
+    }
+
+    public struct WideSchema : IMemorySchema
+    {
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Scalar<Guid>("Id");
+            yield return FieldDefinition.String("Name", 8);
+        }
+    }
+
+    [Test]
+    public void StructuredMemory_AutoLockedAccess_DoesNotAllocatePerCall()
+    {
+        // Values wider than eight bytes and strings take the region lock automatically. Each of those
+        // calls used to allocate a delegate (about 104 bytes) for the lock guard.
+        using var memory = StructuredMemory<WideSchema>.CreateOrOpen(N("NoAlloc"), new WideSchema());
+        Guid id = Guid.NewGuid();
+
+        for (int i = 0; i < 2000; i++)
+        {
+            memory.Write("Id", id);
+            memory.Read<Guid>("Id");
+            memory.WriteString("Name", "ab");
+        }
+
+        const int Rounds = 10_000;
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < Rounds; i++)
+        {
+            memory.Write("Id", id);
+            memory.Read<Guid>("Id");
+            memory.WriteString("Name", "ab");
+        }
+        long bytesPerCall = (GC.GetAllocatedBytesForCurrentThread() - before) / (Rounds * 3);
+
+        Assert.That(bytesPerCall, Is.LessThan(8));
+    }
+
     [Test]
     public void OrphanLockTimeout_IsDisabledByDefault()
     {

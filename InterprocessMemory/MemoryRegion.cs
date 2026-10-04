@@ -878,7 +878,7 @@ namespace InterprocessMemory
         private bool TryAcquireWriteLockCore(TimeSpan timeout)
         {
             var header = (SharedHeader*)_basePtr;
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp(); // not a Stopwatch instance: that would allocate on every lock
             var spinner = new SpinWait();
             long nextOrphanCheckMs = 0;
 
@@ -906,7 +906,7 @@ namespace InterprocessMemory
                         {
                             ThrowIfDisposed();
 
-                            if (TimeoutHelper.HasExpired(sw, timeout))
+                            if (TimeoutHelper.HasExpired(start, timeout))
                             {
                                 return false; // Will release lock in finally
                             }
@@ -932,15 +932,15 @@ namespace InterprocessMemory
                     }
                 }
 
-                if (TimeoutHelper.HasExpired(sw, timeout))
+                if (TimeoutHelper.HasExpired(start, timeout))
                     return false;
 
-                if (_options.EnableOrphanLockDetection && sw.ElapsedMilliseconds >= nextOrphanCheckMs)
+                if (_options.EnableOrphanLockDetection && ElapsedMilliseconds(start) >= nextOrphanCheckMs)
                 {
                     // Check on the first CAS failure and then periodically. The owner may die at any
                     // point while we wait, and a wait with Timeout.InfiniteTimeSpan has no deadline to
                     // key a one-off re-check on. The probe costs a process lookup, hence the interval.
-                    nextOrphanCheckMs = sw.ElapsedMilliseconds + OrphanCheckIntervalMs;
+                    nextOrphanCheckMs = ElapsedMilliseconds(start) + OrphanCheckIntervalMs;
 
                     if (IsWriteLockOrphaned())
                     {
@@ -1019,7 +1019,7 @@ namespace InterprocessMemory
         private bool TryAcquireReadLockCore(TimeSpan timeout)
         {
             var header = (SharedHeader*)_basePtr;
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
 
             while (true)
@@ -1033,7 +1033,7 @@ namespace InterprocessMemory
                 int writerState = Volatile.Read(ref header->WriterLockState);
                 if (writerState != 0)
                 {
-                    if (TimeoutHelper.HasExpired(sw, timeout))
+                    if (TimeoutHelper.HasExpired(start, timeout))
                         return false;
                     spinner.SpinOnce();
                     continue;
@@ -1055,7 +1055,7 @@ namespace InterprocessMemory
                 // twice extra — same penalty as the previous design's CAS-rollback path.
                 Interlocked.Decrement(ref header->ReaderCount);
 
-                if (TimeoutHelper.HasExpired(sw, timeout))
+                if (TimeoutHelper.HasExpired(start, timeout))
                     return false;
 
                 spinner.SpinOnce();
@@ -1337,6 +1337,9 @@ namespace InterprocessMemory
         }
 
         private void ExitWait() => Interlocked.Decrement(ref _activeWaiters);
+
+        private static long ElapsedMilliseconds(long startTimestamp) =>
+            (long)Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
 
         /// <summary>
         /// Releases all resources used by this buffer. Threads blocked in
