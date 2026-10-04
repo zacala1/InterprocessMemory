@@ -241,6 +241,25 @@ modifying the existing bytes.
 Version 3 does not migrate live 2.x regions. Stop every 2.x process, remove the named/file-backed
 region, and recreate it with version 3. See [MIGRATION.md](MIGRATION.md).
 
+## Disposing while other threads are running
+
+Stop and join every thread that uses an instance before you dispose it. The lock-free members
+(`Read`, `Write`, the typed queues, `SharedArray`) read and write through a raw pointer and do no
+per-call bookkeeping, because tracking calls costs every one of them two interlocked operations
+(roughly 9 times slower for a queue round trip, and about 17 times slower for two threads
+exchanging items). A call that is still running when the memory is unmapped terminates the process
+with an `AccessViolationException`, which cannot be caught.
+
+What the library does to reduce the risk:
+
+- Calls made after `Dispose()` started fail with `ObjectDisposedException`.
+- Threads waiting for a lock are released with `ObjectDisposedException`, and `Dispose()` waits for
+  them before it unmaps anything.
+- `Dispose()` keeps the memory mapped for `MemoryRegion.DisposeGracePeriod` (10 ms by default,
+  process-wide, `TimeSpan.Zero` disables it) so that calls already in flight can finish. This is
+  best effort: a thread that is descheduled for longer than that at exactly the wrong moment still
+  hits unmapped memory.
+
 ## Recovering after a crash
 
 Windows named sections disappear when their last handle closes. On Linux a region is a file in
