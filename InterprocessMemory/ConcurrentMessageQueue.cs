@@ -194,7 +194,7 @@ namespace InterprocessMemory
 
             if (createOrOpen)
             {
-                _slotCount = RoundUpToPowerOf2(capacity!.Value);
+                _slotCount = PowerOfTwo.RoundUp(capacity!.Value, "capacity");
                 _maxMessageSize = maxMessageSize!.Value;
                 _slotTotalSize = RoundUpToMultiple(
                     checked(SlotHeaderSize + _maxMessageSize), 8);
@@ -309,10 +309,13 @@ namespace InterprocessMemory
                 storedMaxMessageSize <= 0 || storedSlotStride != expectedSlotStride)
                 throw new InvalidDataException("The message queue header contains invalid sizing metadata.");
 
-            if (requestedCapacity.HasValue &&
-                RoundUpToPowerOf2(requestedCapacity.Value) != storedSlotCount)
-                throw new InvalidOperationException(
-                    $"Capacity mismatch: expected {RoundUpToPowerOf2(requestedCapacity.Value)}, found {storedSlotCount}");
+            if (requestedCapacity.HasValue)
+            {
+                int expectedCapacity = PowerOfTwo.RoundUp(requestedCapacity.Value, "capacity");
+                if (expectedCapacity != storedSlotCount)
+                    throw new InvalidOperationException(
+                        $"Capacity mismatch: expected {expectedCapacity}, found {storedSlotCount}");
+            }
             if (requestedMaxMessageSize.HasValue &&
                 requestedMaxMessageSize.Value != storedMaxMessageSize)
                 throw new InvalidOperationException(
@@ -637,18 +640,6 @@ namespace InterprocessMemory
             // here: if Dispose is never called, the MemoryRegion's own finalizer unmaps the memory.
             _memoryHandle.Dispose();
             _buffer?.Dispose();
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int RoundUpToPowerOf2(int value)
-        {
-            value--;
-            value |= value >> 1;
-            value |= value >> 2;
-            value |= value >> 4;
-            value |= value >> 8;
-            value |= value >> 16;
-            return value + 1;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
