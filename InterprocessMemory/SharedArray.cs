@@ -107,6 +107,10 @@ namespace InterprocessMemory
             BinaryPrimitives.WriteUInt64LittleEndian(header.Slice(16), _fingerprint.Low);
             BinaryPrimitives.WriteUInt64LittleEndian(header.Slice(24), _fingerprint.High);
             _buffer.Write(header, 0);
+
+            // Publish the magic last. Region.Write does no fencing, so on a weakly ordered CPU another
+            // process could otherwise see the magic before the fields it announces.
+            Thread.MemoryBarrier();
             BinaryPrimitives.WriteUInt32LittleEndian(header, ArrayMagic);
             _buffer.Write(header.Slice(0, sizeof(uint)), 0);
         }
@@ -114,16 +118,22 @@ namespace InterprocessMemory
         private void ValidateAndLoadHeader(int? expectedLength)
         {
             Span<byte> header = stackalloc byte[ArrayHeaderSize];
+            Span<byte> magic = stackalloc byte[sizeof(uint)];
             var sw = Stopwatch.StartNew();
             while (true)
             {
-                _buffer.Read(header, 0);
-                if (BinaryPrimitives.ReadUInt32LittleEndian(header) == ArrayMagic)
+                _buffer.Read(magic, 0);
+                if (BinaryPrimitives.ReadUInt32LittleEndian(magic) == ArrayMagic)
                     break;
                 if (sw.Elapsed > TimeSpan.FromSeconds(5))
                     throw new InvalidDataException("Timed out waiting for the shared-array header.");
                 Thread.SpinWait(100);
             }
+
+            // Read the fields only after the magic has been seen, never in the same copy: a single
+            // copy gives no ordering between the magic and the bytes that follow it.
+            Thread.MemoryBarrier();
+            _buffer.Read(header, 0);
 
             int version = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(4));
             int storedLength = BinaryPrimitives.ReadInt32LittleEndian(header.Slice(8));

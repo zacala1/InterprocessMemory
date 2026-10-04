@@ -839,6 +839,9 @@ namespace InterprocessMemory
             BitConverter.TryWriteBytes(header.Slice(12), _schemaHash);
 
             _buffer.Write(header, 0);
+
+            // Publish the magic last (see SharedArray.InitializeHeader).
+            Thread.MemoryBarrier();
             BitConverter.TryWriteBytes(header, SchemaMagic);
             _buffer.Write(header.Slice(0, sizeof(uint)), 0);
         }
@@ -846,17 +849,22 @@ namespace InterprocessMemory
         private void ValidateSchemaCompatibility()
         {
             Span<byte> header = stackalloc byte[SchemaHeaderSize];
+            Span<byte> magic = stackalloc byte[sizeof(uint)];
             var sw = Stopwatch.StartNew();
             while (true)
             {
-                _buffer.Read(header, 0);
-                if (BitConverter.ToUInt32(header) == SchemaMagic)
+                _buffer.Read(magic, 0);
+                if (BitConverter.ToUInt32(magic) == SchemaMagic)
                     break;
                 if (sw.Elapsed > TimeSpan.FromSeconds(5))
                     throw new InvalidDataException(
                         "Timed out waiting for the version 3 structured-memory schema header.");
                 Thread.SpinWait(100);
             }
+
+            // Read the fields only after the magic has been seen (see SharedArray.ValidateAndLoadHeader).
+            Thread.MemoryBarrier();
+            _buffer.Read(header, 0);
 
             StoredSchemaVersion = BitConverter.ToInt32(header.Slice(4));
             int storedFieldCount = BitConverter.ToInt32(header.Slice(8));
