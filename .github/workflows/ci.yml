@@ -77,6 +77,7 @@ jobs:
       # Tests whose outcome depends on the core count and the scheduler. They still run and show up
       # in the log and the artifact, but a failure here does not fail the job.
       - name: Test (timing sensitive, informational)
+        if: ${{ !cancelled() }}
         continue-on-error: true
         run: >
           dotnet test InterprocessMemory.Tests/InterprocessMemory.Tests.csproj
