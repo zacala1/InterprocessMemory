@@ -37,6 +37,7 @@ public class ExtremeStressTests
     [Test]
     [Timeout(180000)]
     [Explicit("Long-running stress test")]
+    [Category("LongRunning")]
     public async Task MPMC_16Producers_16Consumers_1MillionMessages()
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("MPMC_16x16"), slotCount: 4096, slotSize: 128);
@@ -691,6 +692,7 @@ public class ExtremeStressTests
     [Test]
     [Timeout(150000)] // 2 minutes plus teardown/assertion headroom
     [Explicit("Long-running test")]
+    [Category("LongRunning")]
     public async Task Stability_MPMC_2Minutes_Continuous()
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("Stability_2min"), slotCount: 2048, slotSize: 128);

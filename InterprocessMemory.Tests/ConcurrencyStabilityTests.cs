@@ -285,6 +285,7 @@ public class ConcurrencyStabilityTests
     [Test]
     [Timeout(150000)]
     [Explicit("Long-running test — 2 min sustained SPSC")]
+    [Category("LongRunning")]
     public async Task Stability_SPSC_2Minutes_OrderPreserved()
     {
         // The existing Stability_MPMC_2Minutes_Continuous covers MPMC. SPSC has different
@@ -350,6 +351,7 @@ public class ConcurrencyStabilityTests
     [Test]
     [Timeout(150000)]
     [Explicit("Long-running test — 2 min sustained Strict mixed access")]
+    [Category("LongRunning")]
     public async Task Stability_Strict_2Minutes_MixedAccessNoLockLeak()
     {
         // Strict's reentrant lock + auto-lock on >8-byte types is intricate. A long run with
@@ -493,7 +495,10 @@ public class ConcurrencyStabilityTests
 
     // ── MPMC producer fairness ───────────────────────────────────────────────
 
+    // The ratio depends on the core count and the scheduler (eight spinning producers share the
+    // thread pool), so CI runs this separately and does not fail the build on it.
     [Test]
+    [Category("TimingSensitive")]
     [Timeout(30000)]
     public async Task Fairness_Mpmc_ProducersGetReasonableShare()
     {
