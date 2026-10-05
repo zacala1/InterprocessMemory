@@ -120,7 +120,12 @@ public class ConcurrencyStabilityTests
         var writeSuccess = new int[writerCount];
         var readSuccess = 0L;
 
-        var writers = Enumerable.Range(0, writerCount).Select(w => Task.Run(() =>
+        // Every loop spins until the token is cancelled, so each one gets its own thread
+        // (LongRunning). On the thread pool, 68 spinning tasks occupy every worker on a machine
+        // with few cores, the pool adds a thread only every ~500 ms, and the writers queued behind
+        // the readers start late or the cancellation timer callback itself waits behind them (the
+        // test then fails with a starved writer or runs into its timeout).
+        var writers = Enumerable.Range(0, writerCount).Select(w => Task.Factory.StartNew(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -132,9 +137,9 @@ public class ConcurrencyStabilityTests
                 // Brief pause so we're not pegging the lock continuously
                 Thread.SpinWait(50);
             }
-        })).ToArray();
+        }, TaskCreationOptions.LongRunning)).ToArray();
 
-        var readers = Enumerable.Range(0, readerCount).Select(_ => Task.Run(() =>
+        var readers = Enumerable.Range(0, readerCount).Select(_ => Task.Factory.StartNew(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -144,7 +149,7 @@ public class ConcurrencyStabilityTests
                     finally { buf.ReleaseReadLock(); }
                 }
             }
-        })).ToArray();
+        }, TaskCreationOptions.LongRunning)).ToArray();
 
         await Task.WhenAll(writers.Concat(readers));
 
