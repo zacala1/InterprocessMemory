@@ -232,6 +232,39 @@ Console.WriteLine(reader[0]);
 
 The array header validates the element type fingerprint and restores its length for openers.
 
+Elements that are 1, 2, 4 or 8 bytes wide are copied with a single aligned move, so another process
+never sees half of one, and they are read and written without any lock. Every other element size
+(a `Guid`, a `Vector3`, a 64-byte struct, ...) could be read torn while another process writes it,
+so `SharedArray<T>` takes the shared region lock for those types in the indexer, `CopyTo`, `CopyFrom`
+and `Fill` (the whole range of a `Fill` under one lock). That is correct but slower per access; for
+many elements take the lock once yourself.
+
+Use the explicit locks when several elements must be read or changed together. This applies to
+any element type, because two atomic elements can still be seen from different updates:
+
+```csharp
+using (array.AcquireWriteLock())
+{
+    array[0] = x;
+    array[1] = y;      // other processes see both changes or neither
+}
+
+using (reader.AcquireReadLock())
+{
+    long first = reader[0];
+    long second = reader[1];   // a consistent pair
+}
+```
+
+The locks are shared by every process and thread that uses a lock, reentrant for the calling thread
+(the indexer inside a lock does not take it again), and time out with `TimeoutException`. Taking the
+write lock while the thread holds only a read lock throws `InvalidOperationException`. The guards are
+`ref struct`s, because a lock belongs to one thread and must never be held across an `await`: the
+compiler rejects a guard as a `using` resource in an `async` method (error CS9104), so do the locked
+work in a small synchronous method and call that. `array.ForceResetLocks()` clears a lock state left
+behind by a crash (see below). Processes still running a version without
+this locking do not take part in it.
+
 ## Version 3 format
 
 Every region has a version 3 magic value, format version, and data-structure kind. Opening a
@@ -268,7 +301,7 @@ Windows named sections disappear when their last handle closes. On Linux a regio
 - A process that dies while holding a **read lock** leaves the shared reader count above zero and
   every writer times out. Read locks have no owner, so this cannot be detected automatically.
   `GetLockOwnerInfo().ReaderCount` shows the stale count; once no process is inside a critical
-  section, call `MemoryRegion.ForceResetLocks()` (or `StructuredMemory<T>.ForceResetLocks()`).
+  section, call `MemoryRegion.ForceResetLocks()` (or the same method on `StructuredMemory<T>` or `SharedArray<T>`).
 - A creator that dies during initialization makes every opener time out. A region with a different
   capacity or element type than the one you now want is rejected as well. In both cases stop all
   users and call `MemoryRegion.Remove(name)` (pass the same `MemoryRegionOptions` for file-backed

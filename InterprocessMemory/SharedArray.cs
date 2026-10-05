@@ -13,6 +13,18 @@ namespace InterprocessMemory
     /// High-performance generic shared array with type safety and zero-allocation indexer.
     /// Provides array-like access to shared memory with compile-time type checking.
     /// Cross-platform: backed by <see cref="MemoryRegion"/> which supports Windows and Linux.
+    /// <para>
+    /// <b>Atomicity.</b> Elements whose size is 1, 2, 4 or 8 bytes are copied with a single aligned
+    /// move, so another process never observes half of one, and they are accessed without any lock.
+    /// Every other element size (a 16-byte <see cref="Guid"/>, a 64-byte struct, ...) could be read
+    /// torn while another process writes it, so the indexer, <see cref="CopyTo"/>,
+    /// <see cref="CopyFrom"/> and <see cref="Fill"/> take the shared region lock for those types.
+    /// </para>
+    /// <para>
+    /// Use <see cref="AcquireReadLock()"/> / <see cref="AcquireWriteLock()"/> when several elements
+    /// must be observed or changed together, for any element type. The guards belong to the calling
+    /// thread, may be nested, and cannot be held across an <c>await</c> (they are ref structs).
+    /// </para>
     /// </summary>
     /// <typeparam name="T">Unmanaged value type</typeparam>
     public sealed class SharedArray<T> : IDisposable where T : unmanaged
@@ -26,6 +38,14 @@ namespace InterprocessMemory
         private readonly int _elementSize;
         private readonly TypeLayoutFingerprint _fingerprint;
         private volatile int _disposed;
+
+        // True for element sizes that one aligned move cannot copy atomically. Per-T constant, so the
+        // JIT removes the locking branch from the hot path of 1/2/4/8-byte element types.
+        private static readonly bool s_needsLock = !(Unsafe.SizeOf<T>() is 1 or 2 or 4 or 8);
+
+        // Reentrancy bookkeeping, per thread: a thread that holds the lock must not take it again.
+        private readonly ThreadLocal<int> _writeLockDepth = new(() => 0);
+        private readonly ThreadLocal<int> _readLockDepth = new(() => 0);
 
         /// <summary>
         /// Gets the number of elements in the array
@@ -160,8 +180,13 @@ namespace InterprocessMemory
 
         /// <summary>
         /// Gets or sets the element at the specified index.
-        /// Zero-allocation accessor using direct memory access.
+        /// Zero-allocation accessor using direct memory access. Element types other than 1, 2, 4 or 8
+        /// bytes wide are read and written under the shared region lock (see the class remarks).
         /// </summary>
+        /// <exception cref="TimeoutException">The automatic lock could not be taken within 5 seconds.</exception>
+        /// <exception cref="InvalidOperationException">
+        /// A wide element is written while this thread holds only a read lock.
+        /// </exception>
         public T this[int index]
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -171,9 +196,7 @@ namespace InterprocessMemory
                 if ((uint)index >= (uint)_length)
                     throw new IndexOutOfRangeException();
 
-                Span<byte> buffer = stackalloc byte[_elementSize];
-                _buffer.Read(buffer, ArrayHeaderSize + (long)index * _elementSize);
-                return MemoryMarshal.Read<T>(buffer);
+                return s_needsLock && !IsHoldingAnyLock() ? ReadElementLocked(index) : ReadElement(index);
             }
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             set
@@ -182,14 +205,57 @@ namespace InterprocessMemory
                 if ((uint)index >= (uint)_length)
                     throw new IndexOutOfRangeException();
 
-                ReadOnlySpan<byte> buffer = MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref value, 1));
-                _buffer.Write(buffer, ArrayHeaderSize + (long)index * _elementSize);
+                if (s_needsLock && !IsHoldingWriteLock())
+                    WriteElementLocked(index, value);
+                else
+                    WriteElement(index, value);
+            }
+        }
+
+        private T ReadElement(int index)
+        {
+            T value = default;
+            _buffer.Read(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref value, 1)),
+                ArrayHeaderSize + (long)index * _elementSize);
+            return value;
+        }
+
+        private void WriteElement(int index, T value)
+        {
+            _buffer.Write(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref value, 1)),
+                ArrayHeaderSize + (long)index * _elementSize);
+        }
+
+        private T ReadElementLocked(int index)
+        {
+            bool tookRegionLock = EnterRead(MemoryRegionOptions.DefaultLockTimeout);
+            try
+            {
+                return ReadElement(index);
+            }
+            finally
+            {
+                ExitRead(tookRegionLock);
+            }
+        }
+
+        private void WriteElementLocked(int index, T value)
+        {
+            bool tookRegionLock = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
+            try
+            {
+                WriteElement(index, value);
+            }
+            finally
+            {
+                ExitWrite(tookRegionLock);
             }
         }
 
         /// <summary>
         /// Copies a range of elements to a span.
-        /// High-performance batch operation with SIMD optimization.
+        /// High-performance batch operation with SIMD optimization. For element types other than
+        /// 1, 2, 4 or 8 bytes wide the range is read under the shared region lock.
         /// </summary>
         /// <param name="startIndex">Starting index in the array</param>
         /// <param name="destination">Destination span to copy elements to</param>
@@ -205,13 +271,30 @@ namespace InterprocessMemory
             if (startIndex < 0 || (long)startIndex + destination.Length > _length)
                 throw new ArgumentOutOfRangeException(nameof(startIndex));
 
-            var byteSpan = MemoryMarshal.AsBytes(destination);
-            _buffer.Read(byteSpan, ArrayHeaderSize + (long)startIndex * _elementSize);
+            if (!s_needsLock || IsHoldingAnyLock())
+            {
+                CopyToCore(startIndex, destination);
+                return;
+            }
+
+            bool tookRegionLock = EnterRead(MemoryRegionOptions.DefaultLockTimeout);
+            try
+            {
+                CopyToCore(startIndex, destination);
+            }
+            finally
+            {
+                ExitRead(tookRegionLock);
+            }
         }
+
+        private void CopyToCore(int startIndex, Span<T> destination) =>
+            _buffer.Read(MemoryMarshal.AsBytes(destination), ArrayHeaderSize + (long)startIndex * _elementSize);
 
         /// <summary>
         /// Copies a span of elements to the array.
-        /// High-performance batch operation with SIMD optimization.
+        /// High-performance batch operation with SIMD optimization. For element types other than
+        /// 1, 2, 4 or 8 bytes wide the range is written under the shared region lock.
         /// </summary>
         /// <param name="startIndex">Starting index in the array</param>
         /// <param name="source">Source span to copy elements from</param>
@@ -224,13 +307,30 @@ namespace InterprocessMemory
             if (startIndex < 0 || (long)startIndex + source.Length > _length)
                 throw new ArgumentOutOfRangeException(nameof(startIndex));
 
-            var byteSpan = MemoryMarshal.AsBytes(source);
-            _buffer.Write(byteSpan, ArrayHeaderSize + (long)startIndex * _elementSize);
+            if (!s_needsLock || IsHoldingWriteLock())
+            {
+                CopyFromCore(startIndex, source);
+                return;
+            }
+
+            bool tookRegionLock = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
+            try
+            {
+                CopyFromCore(startIndex, source);
+            }
+            finally
+            {
+                ExitWrite(tookRegionLock);
+            }
         }
+
+        private void CopyFromCore(int startIndex, ReadOnlySpan<T> source) =>
+            _buffer.Write(MemoryMarshal.AsBytes(source), ArrayHeaderSize + (long)startIndex * _elementSize);
 
         /// <summary>
         /// Fills a range with a value.
-        /// Optimized for large ranges using vectorization.
+        /// Optimized for large ranges using vectorization. For element types other than 1, 2, 4 or
+        /// 8 bytes wide the whole range is written under one shared region lock.
         /// </summary>
         /// <param name="value">Value to fill with</param>
         /// <param name="startIndex">Starting index (default: 0)</param>
@@ -247,6 +347,25 @@ namespace InterprocessMemory
             if (startIndex < 0 || count < 0 || (long)startIndex + count > _length)
                 throw new ArgumentOutOfRangeException();
 
+            if (!s_needsLock || IsHoldingWriteLock())
+            {
+                FillCore(value, startIndex, count);
+                return;
+            }
+
+            bool tookRegionLock = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
+            try
+            {
+                FillCore(value, startIndex, count);
+            }
+            finally
+            {
+                ExitWrite(tookRegionLock);
+            }
+        }
+
+        private void FillCore(T value, int startIndex, int count)
+        {
             // Batch fill: create a filled buffer and write in chunks
             int batchCount = Math.Min(count, 4096);
             int batchBytes = batchCount * _elementSize;
@@ -292,8 +411,182 @@ namespace InterprocessMemory
             while (offset < count)
             {
                 int batchSize = Math.Min(batch.Length, count - offset);
-                CopyFrom(startIndex + offset, batch.Slice(0, batchSize));
+                CopyFromCore(startIndex + offset, batch.Slice(0, batchSize));
                 offset += batchSize;
+            }
+        }
+
+        /// <summary>
+        /// Acquires the shared write lock (all processes) with the default timeout of 5 seconds.
+        /// See <see cref="AcquireWriteLock(TimeSpan)"/>.
+        /// </summary>
+        public WriteLock AcquireWriteLock() => AcquireWriteLock(MemoryRegionOptions.DefaultLockTimeout);
+
+        /// <summary>
+        /// Acquires the shared write lock, which excludes every other reader and writer that uses a lock,
+        /// in all processes, until the returned guard is disposed. Use it to change several elements as one
+        /// unit. The lock is reentrant for the calling thread; the indexer and the range operations inside
+        /// the scope do not take it again.
+        /// </summary>
+        /// <param name="timeout">How long to wait; <see cref="Timeout.InfiniteTimeSpan"/> waits indefinitely.</param>
+        /// <exception cref="TimeoutException">The lock could not be acquired within the timeout.</exception>
+        /// <exception cref="InvalidOperationException">
+        /// The calling thread holds only a read lock; upgrading it would deadlock the thread against itself.
+        /// </exception>
+        public WriteLock AcquireWriteLock(TimeSpan timeout) => new(this, EnterWrite(timeout));
+
+        /// <summary>
+        /// Acquires the shared read lock (all processes) with the default timeout of 5 seconds.
+        /// See <see cref="AcquireReadLock(TimeSpan)"/>.
+        /// </summary>
+        public ReadLock AcquireReadLock() => AcquireReadLock(MemoryRegionOptions.DefaultLockTimeout);
+
+        /// <summary>
+        /// Acquires the shared read lock, which excludes writers but not other readers, in all processes,
+        /// until the returned guard is disposed. Use it to observe several elements as one consistent
+        /// snapshot. It is reentrant for the calling thread, also inside a write lock.
+        /// </summary>
+        /// <param name="timeout">How long to wait; <see cref="Timeout.InfiniteTimeSpan"/> waits indefinitely.</param>
+        /// <exception cref="TimeoutException">The lock could not be acquired within the timeout.</exception>
+        public ReadLock AcquireReadLock(TimeSpan timeout) => new(this, EnterRead(timeout));
+
+        /// <summary>
+        /// Unconditionally clears the cross-process write lock and read-lock count of this array's region.
+        /// A process that dies while holding a lock can leave the reader count above zero forever. Call this
+        /// only when no process is inside a critical section of the array. See
+        /// <see cref="MemoryRegion.ForceResetLocks"/>.
+        /// </summary>
+        public void ForceResetLocks()
+        {
+            ThrowIfDisposed();
+            ((MemoryRegion)_buffer).ForceResetLocks();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool IsHoldingAnyLock() => _writeLockDepth.Value > 0 || _readLockDepth.Value > 0;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool IsHoldingWriteLock() => _writeLockDepth.Value > 0;
+
+        /// <summary>Returns true when the region lock was taken, false for a reentrant acquisition.</summary>
+        private bool EnterWrite(TimeSpan timeout)
+        {
+            ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
+
+            if (_writeLockDepth.Value == 0 && _readLockDepth.Value > 0)
+                throw new InvalidOperationException(
+                    "Cannot take the write lock while holding only a read lock. Release the read lock first, " +
+                    "or take the write lock before reading and writing together.");
+
+            bool tookRegionLock = false;
+            if (_writeLockDepth.Value == 0)
+            {
+                if (!_buffer.TryAcquireWriteLock(timeout))
+                    throw new TimeoutException($"Failed to acquire write lock within {timeout}");
+                tookRegionLock = true;
+            }
+
+            _writeLockDepth.Value++;
+            return tookRegionLock;
+        }
+
+        private void ExitWrite(bool tookRegionLock)
+        {
+            try
+            {
+                if (tookRegionLock)
+                    _buffer.ReleaseWriteLock();
+            }
+            finally
+            {
+                _writeLockDepth.Value--;
+            }
+        }
+
+        /// <summary>Returns true when the region lock was taken, false for a reentrant acquisition.</summary>
+        private bool EnterRead(TimeSpan timeout)
+        {
+            ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
+
+            bool tookRegionLock = false;
+            if (_readLockDepth.Value == 0 && _writeLockDepth.Value == 0)
+            {
+                if (!_buffer.TryAcquireReadLock(timeout))
+                    throw new TimeoutException($"Failed to acquire read lock within {timeout}");
+                tookRegionLock = true;
+            }
+
+            _readLockDepth.Value++;
+            return tookRegionLock;
+        }
+
+        private void ExitRead(bool tookRegionLock)
+        {
+            try
+            {
+                if (tookRegionLock)
+                    _buffer.ReleaseReadLock();
+            }
+            finally
+            {
+                _readLockDepth.Value--;
+            }
+        }
+
+        /// <summary>
+        /// Guard returned by <see cref="AcquireWriteLock()"/>; disposing it releases the lock. It is a ref
+        /// struct on purpose: the lock belongs to one thread, and the compiler therefore rejects holding the
+        /// guard across an <c>await</c> or handing it to another thread.
+        /// </summary>
+        public ref struct WriteLock
+        {
+            private SharedArray<T>? _owner;
+            private readonly bool _tookRegionLock;
+
+            internal WriteLock(SharedArray<T> owner, bool tookRegionLock)
+            {
+                _owner = owner;
+                _tookRegionLock = tookRegionLock;
+            }
+
+            /// <summary>Releases the write lock; disposing more than once has no further effect.</summary>
+            public void Dispose()
+            {
+                SharedArray<T>? owner = _owner;
+                if (owner is null)
+                    return;
+
+                _owner = null;
+                owner.ExitWrite(_tookRegionLock);
+            }
+        }
+
+        /// <summary>
+        /// Guard returned by <see cref="AcquireReadLock()"/>; disposing it releases the lock. A ref struct
+        /// for the same reason as <see cref="WriteLock"/>.
+        /// </summary>
+        public ref struct ReadLock
+        {
+            private SharedArray<T>? _owner;
+            private readonly bool _tookRegionLock;
+
+            internal ReadLock(SharedArray<T> owner, bool tookRegionLock)
+            {
+                _owner = owner;
+                _tookRegionLock = tookRegionLock;
+            }
+
+            /// <summary>Releases the read lock; disposing more than once has no further effect.</summary>
+            public void Dispose()
+            {
+                SharedArray<T>? owner = _owner;
+                if (owner is null)
+                    return;
+
+                _owner = null;
+                owner.ExitRead(_tookRegionLock);
             }
         }
 
@@ -314,6 +607,8 @@ namespace InterprocessMemory
 
             // No finalizer: if Dispose is never called, the MemoryRegion's own finalizer unmaps the memory.
             _buffer?.Dispose();
+            _writeLockDepth.Dispose();
+            _readLockDepth.Dispose();
         }
     }
 }

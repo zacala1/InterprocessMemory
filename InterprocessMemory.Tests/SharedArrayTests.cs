@@ -272,4 +272,281 @@ public class SharedArrayTests
         public int X;
         public int Y;
     }
+
+    // ── Cross-process locking ────────────────────────────────────────────────
+
+    public struct Wide64 { public long A, B, C, D, E, F, G, H; }
+
+    // Three bytes: not a power of two, so a single aligned move cannot copy it atomically.
+    public struct Odd3 { public byte X, Y, Z; }
+
+    private static string LockName(string tag) => $"SharedArrayLock_{tag}_{Guid.NewGuid():N}";
+
+    private static Wide64 Wide(long v) => new() { A = v, B = v, C = v, D = v, E = v, F = v, G = v, H = v };
+
+    private static bool IsWhole(Wide64 w) =>
+        w.A == w.B && w.B == w.C && w.C == w.D && w.D == w.E && w.E == w.F && w.F == w.G && w.G == w.H;
+
+    [Test, Timeout(60000)]
+    public void WideElements_AreNeverObservedTorn_AcrossInstances()
+    {
+        // Without the automatic lock about 1% of reads of a 64-byte element were torn in this setup.
+        string name = LockName("Torn");
+        using var writerArray = SharedArray<Wide64>.CreateOrOpen(name, 4);
+        using var readerArray = SharedArray<Wide64>.OpenExisting(name);
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(1.5));
+        long reads = 0;
+        long torn = 0;
+
+        var writer = Task.Factory.StartNew(() =>
+        {
+            long i = 0;
+            while (!stop.IsCancellationRequested)
+                writerArray[0] = Wide(++i);
+        }, TaskCreationOptions.LongRunning);
+
+        var reader = Task.Factory.StartNew(() =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                if (!IsWhole(readerArray[0]))
+                    torn++;
+                reads++;
+            }
+        }, TaskCreationOptions.LongRunning);
+
+        Task.WaitAll(writer, reader);
+
+        Assert.That(reads, Is.GreaterThan(0));
+        Assert.That(torn, Is.EqualTo(0), $"{torn} of {reads} reads were torn");
+    }
+
+    [Test, Timeout(60000)]
+    public void AtomicElements_BypassTheLock_WideElementsDoNot()
+    {
+        string atomicName = LockName("Atomic");
+        using var atomic = SharedArray<long>.CreateOrOpen(atomicName, 4);
+        using var atomicPeer = SharedArray<long>.OpenExisting(atomicName);
+
+        string wideName = LockName("Wide");
+        using var wide = SharedArray<Wide64>.CreateOrOpen(wideName, 4);
+        using var widePeer = SharedArray<Wide64>.OpenExisting(wideName);
+
+        Task<Wide64> blockedRead;
+        using (atomic.AcquireWriteLock())
+        using (wide.AcquireWriteLock())
+        {
+            // A long is copied with one aligned move, so reading it needs no lock and does not wait.
+            Assert.That(Task.Run(() => atomicPeer[0]).Wait(TimeSpan.FromSeconds(2)), Is.True);
+
+            // A 64-byte struct could be torn, so its reader waits for the writer to finish.
+            blockedRead = Task.Run(() => widePeer[0]);
+            Assert.That(blockedRead.Wait(TimeSpan.FromMilliseconds(300)), Is.False);
+        }
+
+        Assert.That(blockedRead.Wait(TimeSpan.FromSeconds(5)), Is.True);
+    }
+
+    [Test, Timeout(30000)]
+    public void ExplicitWriteLock_ExcludesOtherInstances_ForAnyElementType()
+    {
+        string name = LockName("Exclude");
+        using var owner = SharedArray<int>.CreateOrOpen(name, 4);
+        using var other = SharedArray<int>.OpenExisting(name);
+
+        using (owner.AcquireWriteLock())
+        {
+            Assert.Throws<TimeoutException>(() => other.AcquireWriteLock(TimeSpan.FromMilliseconds(100)));
+            Assert.Throws<TimeoutException>(() => other.AcquireReadLock(TimeSpan.FromMilliseconds(100)));
+        }
+
+        using (other.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+        }
+
+        // Readers share the lock.
+        using (owner.AcquireReadLock(TimeSpan.FromSeconds(1)))
+        using (other.AcquireReadLock(TimeSpan.FromSeconds(1)))
+        {
+        }
+    }
+
+    [Test, Timeout(30000)]
+    public void Locks_AreReentrant_AndTheIndexerDoesNotTakeThemAgain()
+    {
+        string name = LockName("Reentrant");
+        using var array = SharedArray<Wide64>.CreateOrOpen(name, 8);
+        using var peer = SharedArray<Wide64>.OpenExisting(name);
+
+        using (array.AcquireWriteLock())
+        {
+            array[0] = Wide(1);
+            Assert.That(IsWhole(array[0]), Is.True);
+            array.CopyFrom(1, new[] { Wide(2), Wide(3) });
+            array.Fill(Wide(9), 3, 2);
+
+            using (array.AcquireWriteLock())
+            using (array.AcquireReadLock())
+            {
+                array[7] = Wide(7);
+                Assert.That(array[7].A, Is.EqualTo(7));
+            }
+
+            // The inner guards released only their own level: the outer lock is still exclusive.
+            Assert.Throws<TimeoutException>(() => peer.AcquireReadLock(TimeSpan.FromMilliseconds(100)));
+        }
+
+        using (peer.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+            Assert.That(peer[7].A, Is.EqualTo(7));
+        }
+    }
+
+    [Test, Timeout(30000)]
+    public void WritingWhileHoldingOnlyAReadLock_Throws()
+    {
+        using var narrow = SharedArray<int>.CreateOrOpen(LockName("Upgrade"), 4);
+        using var wide = SharedArray<Wide64>.CreateOrOpen(LockName("UpgradeWide"), 4);
+
+        using (narrow.AcquireReadLock())
+        {
+            // Upgrading would wait for this very thread to release its read lock.
+            Assert.Throws<InvalidOperationException>(() => narrow.AcquireWriteLock());
+        }
+
+        using (wide.AcquireReadLock())
+        {
+            Assert.Throws<InvalidOperationException>(() => wide[0] = Wide(1));
+            Assert.Throws<InvalidOperationException>(() => wide.CopyFrom(0, new[] { Wide(1) }));
+            Assert.That(IsWhole(wide[0]), Is.True);
+        }
+
+        // Nothing was left behind by the rejected attempts.
+        using (narrow.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+        }
+
+        wide[0] = Wide(5);
+        Assert.That(wide[0].A, Is.EqualTo(5));
+    }
+
+    [Test, Timeout(60000)]
+    public void ExplicitLocks_GiveConsistentSnapshotsOfSeveralElements()
+    {
+        // Two longs are each atomic, but a reader can still see one of them from before and the other
+        // from after an update. The explicit locks make the pair one unit.
+        string name = LockName("Snapshot");
+        using var writerArray = SharedArray<long>.CreateOrOpen(name, 2);
+        using var readerArray = SharedArray<long>.OpenExisting(name);
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(1.5));
+        long snapshots = 0;
+        long mismatches = 0;
+
+        var writer = Task.Factory.StartNew(() =>
+        {
+            long i = 0;
+            while (!stop.IsCancellationRequested)
+            {
+                i++;
+                using var guard = writerArray.AcquireWriteLock();
+                writerArray[0] = i;
+                writerArray[1] = i;
+            }
+        }, TaskCreationOptions.LongRunning);
+
+        var reader = Task.Factory.StartNew(() =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                long first;
+                long second;
+                using (readerArray.AcquireReadLock())
+                {
+                    first = readerArray[0];
+                    second = readerArray[1];
+                }
+
+                if (first != second)
+                    mismatches++;
+                snapshots++;
+            }
+        }, TaskCreationOptions.LongRunning);
+
+        Task.WaitAll(writer, reader);
+
+        Assert.That(snapshots, Is.GreaterThan(0));
+        Assert.That(mismatches, Is.EqualTo(0), $"{mismatches} of {snapshots} snapshots were inconsistent");
+    }
+
+    [Test]
+    public void Guards_AreHarmlessWhenDisposedTwice()
+    {
+        string name = LockName("DoubleDispose");
+        using var array = SharedArray<int>.CreateOrOpen(name, 4);
+        using var peer = SharedArray<int>.OpenExisting(name);
+
+        var guard = array.AcquireWriteLock();
+        guard.Dispose();
+        guard.Dispose();
+        default(SharedArray<int>.WriteLock).Dispose();
+        default(SharedArray<int>.ReadLock).Dispose();
+
+        // A second release must not have freed anything it did not hold or unbalanced the bookkeeping.
+        using (peer.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+        }
+
+        using (array.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+            array[0] = 1;
+        }
+    }
+
+    [Test]
+    public void ForceResetLocks_UnblocksWritersAfterALostReader()
+    {
+        string name = LockName("Reset");
+        using var array = SharedArray<int>.CreateOrOpen(name, 4);
+        using var peer = SharedArray<int>.OpenExisting(name);
+
+        // A reader that never comes back, as after a crash.
+        var lostReader = peer.AcquireReadLock();
+        Assert.Throws<TimeoutException>(() => array.AcquireWriteLock(TimeSpan.FromMilliseconds(100)));
+
+        array.ForceResetLocks();
+
+        using (array.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+        }
+
+        lostReader.Dispose();
+    }
+
+    [Test]
+    public void WideAndOddSizedElements_RoundTripThroughEveryAccessPath()
+    {
+        using var wide = SharedArray<Wide64>.CreateOrOpen(LockName("RoundTripWide"), 10);
+        wide[3] = Wide(33);
+        Assert.That(wide[3].H, Is.EqualTo(33));
+
+        wide.CopyFrom(4, new[] { Wide(4), Wide(5) });
+        var copy = new Wide64[2];
+        wide.CopyTo(4, copy);
+        Assert.That(copy[0].A, Is.EqualTo(4));
+        Assert.That(copy[1].A, Is.EqualTo(5));
+
+        wide.Fill(Wide(8), 6, 4);
+        Assert.That(wide[9].A, Is.EqualTo(8));
+        Assert.That(wide[5].A, Is.EqualTo(5), "the range before the fill is untouched");
+        Assert.That(wide[0].A, Is.EqualTo(0), "an element nobody wrote is still zero");
+
+        wide.Clear();
+        Assert.That(wide[3].A, Is.EqualTo(0));
+
+        using var odd = SharedArray<Odd3>.CreateOrOpen(LockName("RoundTripOdd"), 5);
+        odd[2] = new Odd3 { X = 1, Y = 2, Z = 3 };
+        Assert.That(odd[2].Z, Is.EqualTo(3));
+        odd.Fill(new Odd3 { X = 9, Y = 9, Z = 9 }, 0, 5);
+        Assert.That(odd[4].Y, Is.EqualTo(9));
+    }
 }
