@@ -312,9 +312,20 @@ Windows named sections disappear when their last handle closes. On Linux a regio
 
 ```shell
 dotnet restore InterprocessMemory.sln
-dotnet test InterprocessMemory.sln
 dotnet build InterprocessMemory.sln --configuration Release
+dotnet test InterprocessMemory.sln --configuration Release
 ```
 
 The test suite includes real child-process transfer, multi-process typed MPMC delivery,
 cross-process lock exclusion, and orphan-lock recovery.
+
+[GitHub Actions](.github/workflows/ci.yml) builds and tests on Linux and Windows for every pull
+request and every push to `main`. Two groups of tests are kept out of the blocking test step (use
+`--filter` to select or exclude them locally):
+
+- `Category=TimingSensitive`: assertions that depend on thread scheduling, such as a fairness ratio.
+  CI runs them in a separate, non-blocking step because a busy shared runner can fail them.
+- `Category=LongRunning`: the `[Explicit]` soak tests, which NUnit never runs unless asked to. CI does
+  not run them.
+
+Changes since the last release are listed in [CHANGELOG.md](CHANGELOG.md).
