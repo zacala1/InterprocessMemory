@@ -14,6 +14,14 @@ namespace InterprocessMemory
     /// All fields are declared upfront with fixed types, positions, and sizes.
     /// Provides zero-allocation access with full type safety.
     /// Cross-platform via the underlying <see cref="MemoryRegion"/> (Windows + Linux).
+    /// <para>
+    /// Values wider than eight bytes, strings, blobs and arrays are read and written under the shared
+    /// region lock automatically. Use <see cref="AcquireWriteLock()"/> / <see cref="AcquireReadLock()"/>
+    /// to group several fields into one transaction. The guards belong to the calling thread: dispose
+    /// them on the thread that acquired them (do not <c>await</c> inside the guarded scope), otherwise
+    /// <see cref="SynchronizationLockException"/> is thrown. <see cref="ForceResetLocks"/> clears a lock
+    /// state left behind by a crashed process.
+    /// </para>
     /// </summary>
     public sealed class StructuredMemory<TSchema> : IDisposable where TSchema : struct, IMemorySchema
     {
@@ -21,8 +29,8 @@ namespace InterprocessMemory
         private const uint SchemaMagic = 0x53504D49; // "IMPS"
         // x86-64 guarantees atomic load/store for aligned values up to 8 bytes (MOV instruction).
         // Types wider than this threshold require automatic locking to prevent torn reads/writes.
-        // Note: ARM64 supports 16-byte atomics (ldp/stp) but .NET on Windows ARM64 uses TSO
-        // emulation, so 8 bytes is the safe cross-platform limit for this Windows-only library.
+        // Note: ARM64 supports 16-byte atomics (ldp/stp) but not every supported platform guarantees
+        // them (e.g. x64 emulation on Windows ARM64), so 8 bytes is the safe cross-platform limit.
         private const int AtomicThreshold = 8;
         private const int MaxStackAllocBytes = 1024; // Max bytes for stackalloc (prevent stack overflow)
 
@@ -1145,7 +1153,9 @@ namespace InterprocessMemory
         }
 
         /// <summary>
-        /// Releases all resources used by this shared memory region
+        /// Releases the underlying memory region. Stop and join every thread that uses this instance first:
+        /// calls that do not take a lock are not tracked, so one that is still running while the memory is
+        /// unmapped terminates the process (see <see cref="MemoryRegion.DisposeGracePeriod"/>).
         /// </summary>
         public void Dispose()
         {

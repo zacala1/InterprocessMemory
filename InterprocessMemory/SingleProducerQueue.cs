@@ -234,6 +234,11 @@ namespace InterprocessMemory
                 throw new ObjectDisposedException(nameof(SingleProducerQueue<T>));
         }
 
+        /// <summary>
+        /// Releases the underlying memory region. Stop and join every thread that uses this instance first:
+        /// calls that do not take a lock are not tracked, so one that is still running while the memory is
+        /// unmapped terminates the process (see <see cref="MemoryRegion.DisposeGracePeriod"/>).
+        /// </summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)

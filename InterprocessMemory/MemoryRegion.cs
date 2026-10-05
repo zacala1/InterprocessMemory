@@ -20,6 +20,15 @@ namespace InterprocessMemory
     /// <c>/dev/shm</c> (tmpfs) wrapped by <c>MemoryMappedFile.CreateFromFile</c>. Both paths
     /// yield the same raw pointer after construction, so the hot path (Read/Write/locks/SIMD)
     /// is byte-for-byte identical and there is no per-call OS dispatch.</para>
+    ///
+    /// <para><c>Read</c> and <c>Write</c> are lock-free and do not take the region lock; use
+    /// <see cref="TryAcquireWriteLock"/> / <see cref="TryAcquireReadLock"/> when several bytes must be
+    /// observed atomically. The write lock belongs to the acquiring thread and must be released on it.
+    /// A waiter recovers a write lock whose owner process has exited; recovery of read locks left by a
+    /// dead process is manual (<see cref="ForceResetLocks"/>, <see cref="Remove"/>).</para>
+    ///
+    /// <para>Stop and join every thread that uses an instance before disposing it; see
+    /// <see cref="Dispose"/> and <see cref="DisposeGracePeriod"/>.</para>
     /// </summary>
     public sealed unsafe class MemoryRegion : IMemoryRegion
     {
@@ -205,11 +214,13 @@ namespace InterprocessMemory
             [FieldOffset(40)] public long LockAcquiredTimestamp;
             // PID reuse defense: if a lock-holding process dies and the OS recycles its PID for an
             // unrelated process, GetProcessById would find the new process alive and skip orphan
-            // recovery — leaving the lock permanently held. By recording the owner's Process.StartTime
-            // at acquire and comparing on the orphan check, we detect the impostor. Stored as
-            // DateTime.ToBinary() (signed long). Value 0 means "not recorded" — older binaries that
-            // didn't write it, or hosts where StartTime is unreadable (permission denied); in that
-            // case orphan detection falls back to the PID-only check, preserving prior behavior.
+            // recovery — leaving the lock permanently held. The owner records its process start time
+            // at acquire and the orphan check compares it, which exposes the impostor. The encoding is
+            // platform specific (see s_processStartTimeBinary): Windows stores Process.StartTime.ToBinary(),
+            // Linux stores the /proc/<pid>/stat start tick count. Value 0 means "not recorded" (the start
+            // time was unreadable, e.g. no /proc or an ACL denial); a negative value is the 3.0.0 Linux
+            // encoding, which cannot be compared across processes. In both cases the orphan check
+            // falls back to PID-only matching.
             [FieldOffset(48)] public long LockOwnerProcessStartTime;
             // bytes 56–63: implicit padding
 
@@ -561,8 +572,8 @@ namespace InterprocessMemory
             //   Phase 2: Winner writes all header fields, then promotes Magic to MagicNumber
             //            via a release-store. Losers spin until they observe MagicNumber and
             //            only then read the rest of the header, guaranteeing they never see
-            //            partially-initialized state (the previous code could read Magic=
-            //            MagicNumber but Capacity=0, falsely triggering a capacity mismatch).
+            //            partially-initialized state (e.g. Magic=MagicNumber but Capacity=0,
+            //            which would falsely report a capacity mismatch).
             uint prev = _createOrOpen
                 ? Interlocked.CompareExchange(ref header->Magic, SharedHeader.MagicInitializing, 0)
                 : Volatile.Read(ref header->Magic);
@@ -690,8 +701,8 @@ namespace InterprocessMemory
             byte* destPtr = GetDataPtr() + offset;
 
             // Use SIMD when length is at least one vector. On modern x86-64, unaligned SIMD
-            // via ReadUnaligned/WriteUnaligned has essentially no penalty, so gating on alignment
-            // (as the previous IsAligned check did) only hurt small writes by forcing the scalar fallback.
+            // via ReadUnaligned/WriteUnaligned has essentially no penalty, so the copy is not gated
+            // on alignment (that would only force small writes onto the scalar fallback).
             if (_options.EnableSimd && source.Length >= Vector<byte>.Count)
             {
                 WriteSimd(source, destPtr);
@@ -763,8 +774,8 @@ namespace InterprocessMemory
 
             byte* srcPtr = GetDataPtr() + offset;
 
-            // Same rationale as Write — alignment gating was costing performance for small reads
-            // without buying anything on modern hardware that handles unaligned SIMD natively.
+            // Same rationale as Write: no alignment gating, because modern hardware handles
+            // unaligned SIMD natively.
             if (_options.EnableSimd && destination.Length >= Vector<byte>.Count)
             {
                 ReadSimd(destination, srcPtr);
@@ -808,9 +819,9 @@ namespace InterprocessMemory
             }
         }
 
-        // IsAligned helper was removed in favor of unconditional SIMD for length >= Vector<byte>.Count.
-        // _options.Alignment is still validated as a power of 2 for forward compatibility and
-        // for consumers that may use it for their own offset calculations.
+        // SIMD is used unconditionally for length >= Vector<byte>.Count. _options.Alignment is
+        // validated as a power of 2 but does not influence the copy; it exists for consumers that
+        // want to align their own offsets.
 
         /// <inheritdoc/>
         public ValueTask<int> WriteAsync(ReadOnlyMemory<byte> source, long offset,
@@ -965,9 +976,9 @@ namespace InterprocessMemory
             long currentThreadId = Environment.CurrentManagedThreadId;
             int ownerPid = Volatile.Read(ref header->LockOwnerProcessId);
             long ownerThreadId = Volatile.Read(ref header->LockOwnerThreadId);
-            // Releasing a lock this thread does not own must be loud. Silently ignoring it (the
-            // previous behaviour) turned `await` inside a lock scope — the continuation resumes on
-            // another thread — into a write lock that no process could ever release again.
+            // Releasing a lock this thread does not own must be loud. Silently ignoring it would turn
+            // `await` inside a lock scope — the continuation resumes on another thread — into a write
+            // lock that no process could ever release again.
             if (ownerPid != currentPid || ownerThreadId != currentThreadId)
             {
                 _logger?.LogWarning(
@@ -1039,20 +1050,17 @@ namespace InterprocessMemory
                     continue;
                 }
 
-                // Optimistic claim: unconditional Interlocked.Increment instead of the previous
-                // read-CAS-recheck dance. Two wins under reader contention:
-                //   1. No CAS retry loop when N readers race — every one of them succeeds on
-                //      the first atomic (`lock inc` is a single µop on x86 vs cmpxchg).
-                //   2. Cleaner code path. The brief window where we "claim" the reader slot
-                //      before re-checking the writer is identical to the old code's CAS-then-
-                //      recheck window — no new race introduced.
+                // Optimistic claim: an unconditional Interlocked.Increment, then re-check the writer.
+                // There is no CAS retry loop when N readers race — every one of them succeeds on
+                // the first atomic (`lock inc` is a single µop on x86 vs cmpxchg). The only window is
+                // between the claim and the writer re-check, handled by the rollback below.
                 Interlocked.Increment(ref header->ReaderCount);
                 if (Volatile.Read(ref header->WriterLockState) == 0)
                     return true;
 
                 // A writer acquired between our reader check and our increment. Roll back.
                 // The writer's drain loop will briefly see ReaderCount > 0 and spin once or
-                // twice extra — same penalty as the previous design's CAS-rollback path.
+                // twice extra.
                 Interlocked.Decrement(ref header->ReaderCount);
 
                 if (TimeoutHelper.HasExpired(start, timeout))
@@ -1123,9 +1131,9 @@ namespace InterprocessMemory
                     }
                     catch
                     {
-                        // StartTime can throw under restricted permissions (e.g., Linux container
-                        // without /proc, Windows ACL). Fall through to timestamp-based detection
-                        // — degraded but no worse than pre-feature behavior.
+                        // The start time can be unreadable under restricted permissions (e.g., Linux
+                        // container without /proc, Windows ACL). Fall back to the PID-only decision
+                        // (and the optional OrphanLockTimeout check below).
                     }
                 }
             }
@@ -1140,7 +1148,8 @@ namespace InterprocessMemory
                 return true;
             }
 
-            // Check timeout-based orphan detection
+            // The owner process is alive. Only the opt-in time limit (OrphanLockTimeout, disabled
+            // by default) may still declare the lock orphaned.
             if (_options.OrphanLockTimeout > TimeSpan.Zero)
             {
                 long acquiredTimestamp = header->LockAcquiredTimestamp;
