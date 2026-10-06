@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.MemoryMappedFiles;
 using System.Text;
 using System.Threading;
 using NUnit.Framework;
@@ -410,6 +411,92 @@ public class CrossProcessTests
         {
             KillAndWait(holder);
         }
+    }
+
+    [Test, Timeout(40000)]
+    public void CrossProcess_ReadWait_RecoversWhenWriterProcessDies()
+    {
+        // Only a waiting writer used to recover a lock whose owner had died; a reader (a dashboard that
+        // only reads) waited out its whole timeout behind a writer that no longer existed.
+        string name = GetUniqueName("ReaderBehindDeadWriter");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        using Process holder = StartLockHolder(name);
+        try
+        {
+            Task<bool> reader = Task.Run(() =>
+            {
+                bool acquired = region.TryAcquireReadLock(TimeSpan.FromSeconds(30));
+                if (acquired)
+                    region.ReleaseReadLock();
+                return acquired;
+            });
+
+            Thread.Sleep(500);
+            KillAndWait(holder);
+
+            Assert.That(reader.Wait(TimeSpan.FromSeconds(5)), Is.True,
+                "a reader must notice that the writer is gone, not wait for its whole timeout");
+            Assert.That(reader.Result, Is.True);
+        }
+        finally
+        {
+            KillAndWait(holder);
+        }
+    }
+
+    /// <summary>
+    /// Leaves the lock the way a process killed between "state = 1" and "owner = pid" does: held, but
+    /// with no owner recorded. Writes the region header through a second mapping of the /dev/shm file.
+    /// </summary>
+    private static void HoldLockWithNoOwner(string name)
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("Edits the header through the /dev/shm file, which only Linux has.");
+
+        using var file = new FileStream("/dev/shm/" + name, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        using var map = MemoryMappedFile.CreateFromFile(file, null, 0, MemoryMappedFileAccess.ReadWrite,
+            HandleInheritability.None, leaveOpen: true);
+        using var view = map.CreateViewAccessor(0, 128);
+        view.Write(28, 0);      // LockOwnerProcessId
+        view.Write(32, 0L);     // LockOwnerThreadId
+        view.Write(24, 1);      // WriterLockState
+        view.Flush();
+    }
+
+    [Test, Timeout(40000)]
+    public void CrossProcess_LockHeldWithNoOwner_IsReleasedByAWritingWaiter()
+    {
+        // A kill between the CAS that takes the lock and the store of the owner's pid (or between
+        // clearing the owner and clearing the state) leaves WriterLockState = 1 and pid = 0. The owner
+        // checks cannot see that, so the lock stayed held forever.
+        string name = GetUniqueName("NoOwnerWriter");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        HoldLockWithNoOwner(name);
+        Assert.That(region.TryAcquireWriteLock(TimeSpan.FromMilliseconds(300)), Is.False,
+            "the lock is held and the owner check does not recognise it as an orphan");
+
+        var sw = Stopwatch.StartNew();
+        Assert.That(region.TryAcquireWriteLock(TimeSpan.FromSeconds(10)), Is.True);
+        sw.Stop();
+        region.ReleaseWriteLock();
+
+        Assert.That(sw.ElapsedMilliseconds, Is.GreaterThan(1500),
+            "a lock that merely looks ownerless for an instant must not be taken at once");
+    }
+
+    [Test, Timeout(40000)]
+    public void CrossProcess_LockHeldWithNoOwner_IsReleasedByAReadingWaiter()
+    {
+        string name = GetUniqueName("NoOwnerReader");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        HoldLockWithNoOwner(name);
+
+        var sw = Stopwatch.StartNew();
+        Assert.That(region.TryAcquireReadLock(TimeSpan.FromSeconds(10)), Is.True);
+        sw.Stop();
+        region.ReleaseReadLock();
+
+        Assert.That(sw.ElapsedMilliseconds, Is.GreaterThan(1500));
     }
 
     [Test, Timeout(30000)]

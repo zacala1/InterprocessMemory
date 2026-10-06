@@ -78,6 +78,13 @@ namespace InterprocessMemory
         // How often a lock waiter re-probes whether the owning process is still alive.
         private const long OrphanCheckIntervalMs = 250;
 
+        // A held write lock with no owner recorded is normal for a few nanoseconds: the owner sets
+        // WriterLockState first and writes its identity right after, and clears the identity before it
+        // clears the state. A process killed in one of those two windows leaves the lock held with nobody
+        // to attribute it to, which the owner checks cannot see. Waiters clear such a lock after it has
+        // looked like this at every probe for this long.
+        private const long OwnerlessLockGraceMs = 2000;
+
         // Upper bound on how long Dispose() waits for lock waiters to notice the disposed flag.
         private static readonly TimeSpan s_waiterDrainTimeout = TimeSpan.FromSeconds(5);
 
@@ -892,6 +899,7 @@ namespace InterprocessMemory
             long start = Stopwatch.GetTimestamp(); // not a Stopwatch instance: that would allocate on every lock
             var spinner = new SpinWait();
             long nextOrphanCheckMs = 0;
+            long ownerlessSinceMs = -1;
 
             while (true)
             {
@@ -946,20 +954,11 @@ namespace InterprocessMemory
                 if (TimeoutHelper.HasExpired(start, timeout))
                     return false;
 
-                if (_options.EnableOrphanLockDetection && ElapsedMilliseconds(start) >= nextOrphanCheckMs)
-                {
-                    // Check on the first CAS failure and then periodically. The owner may die at any
-                    // point while we wait, and a wait with Timeout.InfiniteTimeSpan has no deadline to
-                    // key a one-off re-check on. The probe costs a process lookup, hence the interval.
-                    nextOrphanCheckMs = ElapsedMilliseconds(start) + OrphanCheckIntervalMs;
-
-                    if (IsWriteLockOrphaned())
-                    {
-                        _logger?.LogWarning("Detected orphan write lock, attempting recovery");
-                        TryForceReleaseWriteLock();
-                        continue;
-                    }
-                }
+                // Check on the first CAS failure and then periodically. The owner may die at any point
+                // while we wait, and a wait with Timeout.InfiniteTimeSpan has no deadline to key a
+                // one-off re-check on. The probe costs a process lookup, hence the interval.
+                if (TryRecoverStaleWriteLock(start, ref nextOrphanCheckMs, ref ownerlessSinceMs))
+                    continue;
 
                 spinner.SpinOnce();
             }
@@ -1032,6 +1031,10 @@ namespace InterprocessMemory
             var header = (SharedHeader*)_basePtr;
             long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
+            // A reader usually waits for a live writer for microseconds, so the first probe comes after a
+            // full interval instead of at once. A writer that died is still noticed within it.
+            long nextOrphanCheckMs = OrphanCheckIntervalMs;
+            long ownerlessSinceMs = -1;
 
             while (true)
             {
@@ -1046,6 +1049,11 @@ namespace InterprocessMemory
                 {
                     if (TimeoutHelper.HasExpired(start, timeout))
                         return false;
+
+                    // A reader must not wait out its whole timeout behind a writer that no longer exists.
+                    if (TryRecoverStaleWriteLock(start, ref nextOrphanCheckMs, ref ownerlessSinceMs))
+                        continue;
+
                     spinner.SpinOnce();
                     continue;
                 }
@@ -1170,6 +1178,92 @@ namespace InterprocessMemory
             return false;
         }
 
+        /// <summary>
+        /// Called by a waiter that finds the write lock held. Every <see cref="OrphanCheckIntervalMs"/>
+        /// it releases the lock when its owner process is gone, or when the lock is held with no owner at
+        /// all (see <see cref="OwnerlessLockGraceMs"/>). Returns true when it released the lock, so that
+        /// the caller retries at once.
+        /// </summary>
+        private bool TryRecoverStaleWriteLock(long start, ref long nextCheckMs, ref long ownerlessSinceMs)
+        {
+            if (!_options.EnableOrphanLockDetection)
+                return false;
+
+            long nowMs = ElapsedMilliseconds(start);
+            if (nowMs < nextCheckMs)
+                return false;
+
+            nextCheckMs = nowMs + OrphanCheckIntervalMs;
+
+            if (IsWriteLockOrphaned())
+            {
+                _logger?.LogWarning("Detected orphan write lock, attempting recovery");
+                TryForceReleaseWriteLock();
+                return true;
+            }
+
+            return TryReleaseOwnerlessWriteLock(nowMs, ref ownerlessSinceMs);
+        }
+
+        private bool TryReleaseOwnerlessWriteLock(long nowMs, ref long ownerlessSinceMs)
+        {
+            var header = (SharedHeader*)_basePtr;
+
+            if (Volatile.Read(ref header->WriterLockState) == 0 ||
+                Volatile.Read(ref header->LockOwnerProcessId) != 0)
+            {
+                ownerlessSinceMs = -1;
+                return false;
+            }
+
+            if (ownerlessSinceMs < 0)
+            {
+                ownerlessSinceMs = nowMs;
+                return false;
+            }
+
+            if (nowMs - ownerlessSinceMs < OwnerlessLockGraceMs)
+                return false;
+
+            // Only the exact state that was observed is cleared: a lock that was released and taken again
+            // meanwhile has an owner recorded within nanoseconds of its CAS and is left alone.
+            if (Volatile.Read(ref header->LockOwnerProcessId) != 0 ||
+                Interlocked.CompareExchange(ref header->WriterLockState, 0, 1) != 1)
+            {
+                ownerlessSinceMs = -1;
+                return false;
+            }
+
+            header->LockOwnerThreadId = 0;
+            header->LockOwnerProcessStartTime = 0;
+            header->LockAcquiredTimestamp = 0;
+            ownerlessSinceMs = -1;
+
+            _logger?.LogWarning(
+                "Released a write lock that was held with no owner recorded for {Grace} ms " +
+                "(its owner was killed while taking or releasing it)", OwnerlessLockGraceMs);
+            RaiseOrphanLockDetected();
+            return true;
+        }
+
+        private void RaiseOrphanLockDetected()
+        {
+            if (!_options.EnableEvents)
+                return;
+
+            try
+            {
+                OnOrphanLockDetected?.Invoke(this, new MemoryRegionEventArgs
+                {
+                    EventType = MemoryRegionEventType.OrphanLockDetected
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Event handler threw an exception during OnOrphanLockDetected");
+            }
+        }
+
         /// <inheritdoc/>
         public bool TryForceReleaseWriteLock()
         {
@@ -1198,21 +1292,7 @@ namespace InterprocessMemory
             Thread.MemoryBarrier();
             Volatile.Write(ref header->WriterLockState, 0);
 
-            if (_options.EnableEvents)
-            {
-                try
-                {
-                    OnOrphanLockDetected?.Invoke(this, new MemoryRegionEventArgs
-                    {
-                        EventType = MemoryRegionEventType.OrphanLockDetected
-                    });
-                }
-                catch (Exception ex)
-                {
-                    _logger?.LogWarning(ex, "Event handler threw an exception during OnOrphanLockDetected");
-                }
-            }
-
+            RaiseOrphanLockDetected();
             return true;
         }
 

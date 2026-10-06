@@ -59,8 +59,10 @@ if (memory.TryAcquireWriteLock(TimeSpan.FromSeconds(1)))
 ```
 
 Lock ownership includes the process ID, managed thread ID, and process start time. A process
-waiting for a write lock keeps checking whether the owner is still alive (also when it waits
-with `Timeout.InfiniteTimeSpan`) and recovers a lock left behind by a terminated process.
+waiting for a write lock or a read lock keeps checking whether the writer that holds the lock is
+still alive (also when it waits with `Timeout.InfiniteTimeSpan`) and recovers a lock left behind by a
+terminated process. A process killed exactly while it takes or releases the lock can leave it held
+with no owner recorded; a waiter clears such a lock once it has looked like that for two seconds.
 
 Recovery is based on the owner process being gone. A write lock held by a process that is still
 alive is never taken over unless you opt in with `MemoryRegionOptions.OrphanLockTimeout`, which
