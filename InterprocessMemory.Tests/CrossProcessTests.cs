@@ -499,6 +499,93 @@ public class CrossProcessTests
         Assert.That(sw.ElapsedMilliseconds, Is.GreaterThan(1500));
     }
 
+    /// <summary>
+    /// Makes the write lock look as if a process with <paramref name="pid"/> in the PID namespace
+    /// <paramref name="pidNamespace"/> held it (the pid must not exist here), by editing the region header
+    /// through a second mapping of the /dev/shm file.
+    /// </summary>
+    private static void HoldLockAs(string name, int pid, long pidNamespace)
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("Edits the header through the /dev/shm file, which only Linux has.");
+        if (MemoryRegion.CurrentPidNamespace == 0)
+            Assert.Ignore("The PID namespace of this process cannot be read (no /proc).");
+
+        using var file = new FileStream("/dev/shm/" + name, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        using var map = MemoryMappedFile.CreateFromFile(file, null, 0, MemoryMappedFileAccess.ReadWrite,
+            HandleInheritability.None, leaveOpen: true);
+        using var view = map.CreateViewAccessor(0, 128);
+        view.Write(88, pidNamespace);   // LockOwnerPidNamespace
+        view.Write(48, 0L);             // LockOwnerProcessStartTime: unknown, so the pid decides
+        view.Write(32, 1L);             // LockOwnerThreadId
+        view.Write(28, pid);            // LockOwnerProcessId
+        view.Write(24, 1);              // WriterLockState
+        view.Flush();
+    }
+
+    private const int PidThatIsNotRunning = 4_000_001;
+
+    [Test, Timeout(30000)]
+    public void CrossProcess_OwnerInAnotherPidNamespace_IsNotTakenOver()
+    {
+        // Two containers that share /dev/shm have different PID namespaces. The owner's pid is looked up
+        // in the waiter's namespace, where it does not exist (or is somebody else), so the waiter used to
+        // decide that a live owner was dead and took its lock.
+        string name = GetUniqueName("OtherPidNamespace");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        HoldLockAs(name, PidThatIsNotRunning, MemoryRegion.CurrentPidNamespace + 1);
+
+        Assert.That(region.IsWriteLockOrphaned(), Is.False);
+        Assert.That(region.GetLockOwnerInfo().IsOrphan, Is.False);
+        Assert.That(region.TryAcquireWriteLock(TimeSpan.FromMilliseconds(1500)), Is.False,
+            "the owner lives in another PID namespace, its lock is not ours to take");
+        Assert.That(region.TryAcquireReadLock(TimeSpan.FromMilliseconds(600)), Is.False);
+    }
+
+    [Test, Timeout(30000)]
+    public void CrossProcess_OwnerInTheSamePidNamespace_IsStillRecovered()
+    {
+        string name = GetUniqueName("SamePidNamespace");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        HoldLockAs(name, PidThatIsNotRunning, MemoryRegion.CurrentPidNamespace);
+
+        Assert.That(region.IsWriteLockOrphaned(), Is.True);
+        Assert.That(region.TryAcquireWriteLock(TimeSpan.FromSeconds(5)), Is.True);
+        region.ReleaseWriteLock();
+    }
+
+    [Test, Timeout(30000)]
+    public void CrossProcess_OwnerWithoutRecordedPidNamespace_IsStillRecovered()
+    {
+        // Locks taken by earlier versions record no namespace; they keep the pid-only decision.
+        string name = GetUniqueName("UnknownPidNamespace");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        HoldLockAs(name, PidThatIsNotRunning, 0);
+
+        Assert.That(region.IsWriteLockOrphaned(), Is.True);
+        Assert.That(region.TryAcquireWriteLock(TimeSpan.FromSeconds(5)), Is.True);
+        region.ReleaseWriteLock();
+    }
+
+    [Test, Timeout(30000)]
+    public void CrossProcess_LiveOwner_RecordsItsPidNamespaceAndClearsItOnRelease()
+    {
+        if (!OperatingSystem.IsLinux() || MemoryRegion.CurrentPidNamespace == 0)
+            Assert.Ignore("Needs the /dev/shm file and a readable /proc/self/ns/pid.");
+
+        string name = GetUniqueName("RecordedNamespace");
+        using var region = MemoryRegion.CreateOrOpen(name, 256);
+        using var file = new FileStream("/dev/shm/" + name, FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+        using var map = MemoryMappedFile.CreateFromFile(file, null, 0, MemoryMappedFileAccess.Read,
+            HandleInheritability.None, leaveOpen: true);
+        using var view = map.CreateViewAccessor(0, 128, MemoryMappedFileAccess.Read);
+
+        Assert.That(region.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
+        Assert.That(view.ReadInt64(88), Is.EqualTo(MemoryRegion.CurrentPidNamespace));
+        region.ReleaseWriteLock();
+        Assert.That(view.ReadInt64(88), Is.EqualTo(0L), "a stale namespace would mislead the next owner's waiters");
+    }
+
     [Test, Timeout(30000)]
     public void CrossProcess_DeadReaderProcess_NeedsForceResetLocks()
     {

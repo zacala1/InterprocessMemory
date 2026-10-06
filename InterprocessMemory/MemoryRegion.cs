@@ -131,6 +131,37 @@ namespace InterprocessMemory
         // milliseconds and would make every live owner look like an impostor.
         private static readonly long s_processStartTimeBinary = TryCaptureProcessStartTime();
 
+        private static readonly long s_pidNamespace = TryReadLinuxPidNamespace();
+
+        /// <summary>Identifier of this process's PID namespace, 0 when it cannot be determined (not Linux).</summary>
+        internal static long CurrentPidNamespace => s_pidNamespace;
+
+        // /proc/self/ns/pid is a symlink whose target looks like "pid:[4026531836]".
+        private static long TryReadLinuxPidNamespace()
+        {
+            if (!OperatingSystem.IsLinux())
+                return 0;
+
+            try
+            {
+                string? target = new FileInfo("/proc/self/ns/pid").LinkTarget;
+                int open = target?.IndexOf('[') ?? -1;
+                int close = target?.IndexOf(']') ?? -1;
+                if (target != null && open >= 0 && close > open &&
+                    long.TryParse(target.AsSpan(open + 1, close - open - 1), out long id))
+                    return id;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+            {
+                // No /proc, or a restricted one: leave it unknown and keep the pid-only behaviour.
+            }
+
+            return 0;
+        }
+
+        private static bool IsOtherPidNamespace(long ownerNamespace) =>
+            ownerNamespace != 0 && s_pidNamespace != 0 && ownerNamespace != s_pidNamespace;
+
         private static long TryCaptureProcessStartTime()
         {
             if (OperatingSystem.IsLinux())
@@ -237,7 +268,12 @@ namespace InterprocessMemory
             [FieldOffset(72)] public long ChecksumOffset;
             [FieldOffset(80)] public int ChecksumLength;
             [FieldOffset(84)] public int RegionKind;
-            // bytes 88–127: reserved
+            // PID namespace (inode of /proc/self/ns/pid) of the process that holds the write lock, 0 when
+            // unknown. A pid only identifies a process inside its own namespace, so waiters in another
+            // namespace (two containers sharing /dev/shm) must not use LockOwnerProcessId to decide that
+            // the owner is gone. It is written before the pid and cleared with the other owner fields.
+            [FieldOffset(88)] public long LockOwnerPidNamespace;
+            // bytes 96–127: reserved
         }
 
         private const long HeaderSize = SharedHeader.Size;
@@ -633,6 +669,7 @@ namespace InterprocessMemory
                 header->LockOwnerProcessId = 0;
                 header->LockOwnerThreadId = 0;
                 header->LockOwnerProcessStartTime = 0;
+                header->LockOwnerPidNamespace = 0;
                 header->LockAcquiredTimestamp = 0;
                 header->DataChecksum = 0;
                 header->ChecksumOffset = 0;
@@ -952,7 +989,8 @@ namespace InterprocessMemory
                     {
                         // Record lock ownership for orphan detection. StartTime defeats PID-reuse
                         // attacks on the orphan check (see IsWriteLockOrphaned).
-                        header->LockOwnerProcessId = Environment.ProcessId;
+                        header->LockOwnerPidNamespace = s_pidNamespace;
+                        Volatile.Write(ref header->LockOwnerProcessId, Environment.ProcessId);
                         header->LockOwnerThreadId = Environment.CurrentManagedThreadId;
                         header->LockOwnerProcessStartTime = s_processStartTimeBinary;
                         header->LockAcquiredTimestamp = Stopwatch.GetTimestamp();
@@ -983,6 +1021,7 @@ namespace InterprocessMemory
                             header->LockOwnerProcessId = 0;
                             header->LockOwnerThreadId = 0;
                             header->LockOwnerProcessStartTime = 0;
+                            header->LockOwnerPidNamespace = 0;
                             header->LockAcquiredTimestamp = 0;
                             Interlocked.Exchange(ref header->WriterLockState, 0);
                         }
@@ -1039,6 +1078,7 @@ namespace InterprocessMemory
 
             header->LockOwnerThreadId = 0;
             header->LockOwnerProcessStartTime = 0;
+            header->LockOwnerPidNamespace = 0;
             header->LockAcquiredTimestamp = 0;
 
             Thread.MemoryBarrier();
@@ -1152,7 +1192,39 @@ namespace InterprocessMemory
             if (ownerPid == 0)
                 return false;
 
-            // Check if process is still alive
+            // A pid recorded in another PID namespace says nothing about whether the owner is alive here.
+            if (!IsOtherPidNamespace(Volatile.Read(ref header->LockOwnerPidNamespace)) &&
+                OwnerProcessIsGone(header, ownerPid))
+                return true;
+
+            // The owner process is alive. Only the opt-in time limit (OrphanLockTimeout, disabled
+            // by default) may still declare the lock orphaned.
+            if (_options.OrphanLockTimeout > TimeSpan.Zero)
+            {
+                long acquiredTimestamp = header->LockAcquiredTimestamp;
+                if (acquiredTimestamp > 0)
+                {
+                    long elapsed = Stopwatch.GetTimestamp() - acquiredTimestamp;
+                    double elapsedMs = elapsed * 1000.0 / Stopwatch.Frequency;
+
+                    if (elapsedMs > _options.OrphanLockTimeout.TotalMilliseconds)
+                    {
+                        _logger?.LogWarning("Lock held for {Elapsed}ms exceeds timeout {Timeout}ms",
+                            elapsedMs, _options.OrphanLockTimeout.TotalMilliseconds);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// True when the process that recorded itself as the lock owner no longer exists: it has exited, or
+        /// its pid now belongs to a process that started later (pid reuse).
+        /// </summary>
+        private bool OwnerProcessIsGone(SharedHeader* header, int ownerPid)
+        {
             try
             {
                 using var process = Process.GetProcessById(ownerPid);
@@ -1192,25 +1264,6 @@ namespace InterprocessMemory
             {
                 // Process has exited
                 return true;
-            }
-
-            // The owner process is alive. Only the opt-in time limit (OrphanLockTimeout, disabled
-            // by default) may still declare the lock orphaned.
-            if (_options.OrphanLockTimeout > TimeSpan.Zero)
-            {
-                long acquiredTimestamp = header->LockAcquiredTimestamp;
-                if (acquiredTimestamp > 0)
-                {
-                    long elapsed = Stopwatch.GetTimestamp() - acquiredTimestamp;
-                    double elapsedMs = elapsed * 1000.0 / Stopwatch.Frequency;
-
-                    if (elapsedMs > _options.OrphanLockTimeout.TotalMilliseconds)
-                    {
-                        _logger?.LogWarning("Lock held for {Elapsed}ms exceeds timeout {Timeout}ms",
-                            elapsedMs, _options.OrphanLockTimeout.TotalMilliseconds);
-                        return true;
-                    }
-                }
             }
 
             return false;
@@ -1274,6 +1327,7 @@ namespace InterprocessMemory
 
             header->LockOwnerThreadId = 0;
             header->LockOwnerProcessStartTime = 0;
+            header->LockOwnerPidNamespace = 0;
             header->LockAcquiredTimestamp = 0;
             ownerlessSinceMs = -1;
 
@@ -1326,6 +1380,7 @@ namespace InterprocessMemory
 
             header->LockOwnerThreadId = 0;
             header->LockOwnerProcessStartTime = 0;
+            header->LockOwnerPidNamespace = 0;
             header->LockAcquiredTimestamp = 0;
             Thread.MemoryBarrier();
             Volatile.Write(ref header->WriterLockState, 0);
@@ -1362,6 +1417,7 @@ namespace InterprocessMemory
             Volatile.Write(ref header->LockOwnerProcessId, 0);
             header->LockOwnerThreadId = 0;
             header->LockOwnerProcessStartTime = 0;
+            header->LockOwnerPidNamespace = 0;
             header->LockAcquiredTimestamp = 0;
             Thread.MemoryBarrier();
             Volatile.Write(ref header->WriterLockState, 0);

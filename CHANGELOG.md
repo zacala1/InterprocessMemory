@@ -29,6 +29,10 @@ Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATIO
 - A write lock whose owner was killed between taking the lock and recording its pid (or between clearing the
   pid and releasing the lock) stayed held forever, because the orphan check needs a pid. A waiter now
   clears a lock that has had no owner for two seconds.
+- Linux: processes in different PID namespaces that share `/dev/shm` (containers) took each other's locks, because a
+  waiter looked the owner's pid up in its own namespace and did not find it. The owner now records its PID
+  namespace (the inode of `/proc/self/ns/pid`, in the reserved part of the header) and a waiter in another
+  namespace no longer declares the owner dead from its pid.
 - A waiting reader now recovers a write lock whose owner process died, like a waiting writer does. It used
   to wait for its whole timeout.
 - Disposing a region while another thread waits for one of its locks no longer crashes the process;

@@ -64,6 +64,10 @@ still alive (also when it waits with `Timeout.InfiniteTimeSpan`) and recovers a 
 terminated process. A process killed exactly while it takes or releases the lock can leave it held
 with no owner recorded; a waiter clears such a lock once it has looked like that for two seconds.
 
+A process id only means something inside its own PID namespace. On Linux the owner records its namespace
+in the region header, and a waiter in a different one (two containers sharing `/dev/shm`) never decides
+from the pid alone that the owner is gone; only the opt-in `OrphanLockTimeout` can take such a lock over.
+
 Recovery is based on the owner process being gone. A write lock held by a process that is still
 alive is never taken over unless you opt in with `MemoryRegionOptions.OrphanLockTimeout`, which
 trades mutual exclusion for liveness when a critical section may run longer than the timeout.
