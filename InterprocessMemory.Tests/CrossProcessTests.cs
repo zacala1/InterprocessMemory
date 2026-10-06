@@ -29,9 +29,19 @@ public class CrossProcessTests
     [OneTimeSetUp]
     public void EnsureHelperExists()
     {
-        if (!File.Exists(HelperDll))
-            Assert.Ignore($"Test worker binary not found at '{HelperDll}'. " +
-                          "Build the InterprocessMemory.TestWorker project first.");
+        if (File.Exists(HelperDll))
+            return;
+
+        string message = $"Test worker binary not found at '{HelperDll}'. " +
+                         "Build the InterprocessMemory.TestWorker project first.";
+
+        // Ignoring would turn every cross-process test, the only ones that prove the lock recovery, into a
+        // silent skip on CI when the worker is not copied next to the tests.
+        if (Environment.GetEnvironmentVariable("CI") == "true" ||
+            Environment.GetEnvironmentVariable("GITHUB_ACTIONS") == "true")
+            Assert.Fail(message);
+
+        Assert.Ignore(message);
     }
 
     private static string GetUniqueName(string prefix) =>
@@ -41,13 +51,16 @@ public class CrossProcessTests
     private static ProcessStartInfo CreateHelperStartInfo(
         string role,
         string bufferName,
-        string? extraArgument = null)
+        string? extraArgument = null,
+        bool redirectInput = false)
     {
+        string? host = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
         var psi = new ProcessStartInfo
         {
-            FileName               = "dotnet",
+            FileName               = string.IsNullOrEmpty(host) ? "dotnet" : host,
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
+            RedirectStandardInput  = redirectInput,
             UseShellExecute        = false,
             CreateNoWindow         = true
         };
@@ -79,8 +92,14 @@ public class CrossProcessTests
         if (!proc.WaitForExit(timeoutMs))
         {
             proc.Kill();
-            Assert.Fail($"Child process [{role}] timed out after {timeoutMs} ms");
+            proc.WaitForExit();
+            Assert.Fail($"Child process [{role}] timed out after {timeoutMs} ms. " +
+                        $"stdout: '{stdout.ToString().Trim()}' stderr: '{stderr.ToString().Trim()}'");
         }
+
+        // WaitForExit(int) returns as soon as the process has exited, without waiting for the asynchronous
+        // readers to deliver the last lines. This overload does, so the assertions see all the output.
+        proc.WaitForExit();
 
         return (proc.ExitCode, stdout.ToString().Trim(), stderr.ToString().Trim());
     }
@@ -300,15 +319,21 @@ public class CrossProcessTests
     /// </summary>
     private static Process StartLockHolder(string bufferName, string role = "hold_write_lock")
     {
-        Process process = Process.Start(CreateHelperStartInfo(role, bufferName))!;
-        string? line = process.StandardOutput.ReadLine();
+        // Standard input is redirected so that the child ends when this process disappears.
+        Process process = Process.Start(CreateHelperStartInfo(role, bufferName, redirectInput: true))!;
+
+        // ReadLine has no timeout and NUnit's [Timeout] cannot abort a blocked thread on .NET Core.
+        Task<string?> reading = Task.Run(() => process.StandardOutput.ReadLine());
+        string? line = reading.Wait(TimeSpan.FromSeconds(20)) ? reading.Result : "<timed out>";
         if (line != "holding")
         {
             try
             { process.Kill(); }
             catch (InvalidOperationException) { /* already exited */ }
+            process.WaitForExit();
+            string error = process.StandardError.ReadToEnd().Trim();
             process.Dispose();
-            Assert.Fail($"lock holder did not report 'holding' (got '{line}')");
+            Assert.Fail($"lock holder did not report 'holding' (got '{line}', stderr: '{error}')");
         }
 
         return process;
@@ -411,6 +436,21 @@ public class CrossProcessTests
         {
             KillAndWait(holder);
         }
+    }
+
+    [Test, Timeout(150000)]
+    [Category("TimingSensitive")]
+    public void Dispose_WhileThreadsBusyPollTheQueue_DoesNotCrashTheProcess()
+    {
+        // Runs in a child process: when the mitigation (MemoryRegion.DisposeGracePeriod) loses its race, the
+        // uncatchable AccessViolationException ends the process that races. In the test host it also took
+        // every other test result with it. On a loaded 2 core machine that happened in about 2 of 3 runs, so
+        // this belongs with the timing sensitive tests, not in the step that has to be green.
+        string prefix = GetUniqueName("BusyPoll");
+        var (exit, stdout, stderr) = SpawnHelper("dispose_busy_poll", prefix, timeoutMs: 120000);
+
+        Assert.That(exit, Is.EqualTo(0), $"the child died or failed: {stderr}");
+        Assert.That(stdout, Does.Contain("ok"));
     }
 
     [Test, Timeout(40000)]

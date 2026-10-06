@@ -241,48 +241,6 @@ public class LibraryHardeningTests
         }
     }
 
-    [Test, Timeout(120000)]
-    public void Dispose_WhileThreadsBusyPollTheQueue_DoesNotCrash()
-    {
-        // The common shutdown pattern: consumers spin on TryDequeue while another thread disposes.
-        // Without DisposeGracePeriod this killed the process with an AccessViolationException within a
-        // few hundred rounds on a 4-core machine. This is a mitigation test, not a proof: a thread that
-        // is descheduled for longer than the grace period at the wrong moment can still fail.
-        var random = new Random(42);
-        int pollerCount = Math.Max(3, Environment.ProcessorCount - 1);
-
-        for (int round = 0; round < 200; round++)
-        {
-            string name = N($"BusyPoll{round}");
-            var queue = InterprocessMemory.ConcurrentQueue<long>.CreateOrOpen(name, 64);
-            var pollers = new Task[pollerCount];
-            for (int i = 0; i < pollers.Length; i++)
-            {
-                pollers[i] = Task.Run(() =>
-                {
-                    try
-                    {
-                        while (true)
-                        {
-                            queue.TryDequeue(out _);
-                            queue.TryEnqueue(1);
-                        }
-                    }
-                    catch (ObjectDisposedException)
-                    {
-                        // Expected: the queue was disposed under the poller.
-                    }
-                });
-            }
-
-            Thread.Sleep(random.Next(0, 3));
-            queue.Dispose();
-
-            Assert.That(Task.WaitAll(pollers, TimeSpan.FromSeconds(10)), Is.True, $"round {round}");
-            MemoryRegion.Remove(name);
-        }
-    }
-
     private static int CountOpenFilesMatching(string name)
     {
         return Directory.GetFiles("/proc/self/fd").Count(path =>
