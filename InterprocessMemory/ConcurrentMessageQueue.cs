@@ -57,6 +57,9 @@ namespace InterprocessMemory
         }
 
         private const int HeaderSize = 384; // 6 cache lines for false-sharing prevention
+
+        // See ConcurrentQueue<T>: with one slot the published and the free sequence are equal.
+        private const int MinimumCapacity = 2;
         private const int SlotHeaderSize = 16;
         private const int FormatVersion = 3;
         private const long HeaderMagic = 0x514D434D504953;
@@ -194,7 +197,7 @@ namespace InterprocessMemory
 
             if (createOrOpen)
             {
-                _slotCount = PowerOfTwo.RoundUp(capacity!.Value, "capacity");
+                _slotCount = PowerOfTwo.RoundUp(capacity!.Value, "capacity", MinimumCapacity);
                 _maxMessageSize = maxMessageSize!.Value;
                 _slotTotalSize = RoundUpToMultiple(
                     checked(SlotHeaderSize + _maxMessageSize), 8);
@@ -305,13 +308,13 @@ namespace InterprocessMemory
                     ex);
             }
 
-            if (storedSlotCount <= 0 || (storedSlotCount & (storedSlotCount - 1)) != 0 ||
+            if (storedSlotCount < MinimumCapacity || (storedSlotCount & (storedSlotCount - 1)) != 0 ||
                 storedMaxMessageSize <= 0 || storedSlotStride != expectedSlotStride)
                 throw new InvalidDataException("The message queue header contains invalid sizing metadata.");
 
             if (requestedCapacity.HasValue)
             {
-                int expectedCapacity = PowerOfTwo.RoundUp(requestedCapacity.Value, "capacity");
+                int expectedCapacity = PowerOfTwo.RoundUp(requestedCapacity.Value, "capacity", MinimumCapacity);
                 if (expectedCapacity != storedSlotCount)
                     throw new InvalidOperationException(
                         $"Capacity mismatch: expected {expectedCapacity}, found {storedSlotCount}");

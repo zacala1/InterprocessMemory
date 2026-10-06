@@ -33,6 +33,10 @@ Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATIO
   to wait for its whole timeout.
 - Disposing a region while another thread waits for one of its locks no longer crashes the process;
   the waiter fails with `ObjectDisposedException`.
+- `ConcurrentQueue<T>` and `ConcurrentMessageQueue` with a capacity of 1 overwrote the stored item when a second
+  one was enqueued and then never delivered anything again. They need two slots, so a requested capacity
+  of 1 is now raised to 2, and an existing region that stored a capacity of 1 is rejected as invalid
+  (remove it with `MemoryRegion.Remove`).
 - Generic unmanaged structs (`ValueTuple`, `KeyValuePair<,>`) work in all typed containers.
   Fingerprints of types that already worked are unchanged, so existing regions stay compatible.
 - Two byte `SharedArray<T>` elements could be read half written by another process (a two byte copy is a

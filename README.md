@@ -129,7 +129,8 @@ if (consumer.TryDequeue(out SensorSample sample))
 }
 ```
 
-Queue capacity is an item count, not bytes, and is rounded up to the next power of two.
+Queue capacity is an item count, not bytes, and is rounded up to the next power of two. The two
+multi-producer queues need at least two slots, so a requested capacity of 1 becomes 2.
 `Capacity` reports the resulting number of slots.
 
 The shared header records `sizeof(T)` and a deterministic fingerprint of the type name,

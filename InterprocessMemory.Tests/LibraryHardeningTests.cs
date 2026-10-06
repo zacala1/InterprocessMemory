@@ -643,6 +643,64 @@ public class LibraryHardeningTests
         }
     }
 
+    [Test, Timeout(30000)]
+    public void ConcurrentQueue_CapacityOne_IsRaisedToTwoAndStillReportsFull()
+    {
+        // With one slot the sequence that marks a slot published (write + 1) equals the one that marks it
+        // free again (read + capacity), so the second enqueue overwrote the first item and the queue then
+        // never produced anything again.
+        using var queue = ConcurrentQueue<int>.CreateOrOpen(N("MpmcCap1"), 1);
+
+        Assert.That(queue.Capacity, Is.EqualTo(2));
+        Assert.That(queue.TryEnqueue(10), Is.True);
+        Assert.That(queue.TryEnqueue(20), Is.True);
+        Assert.That(queue.TryEnqueue(30), Is.False, "the queue is full, it must not overwrite item 10");
+
+        Assert.That(queue.TryDequeue(out int first), Is.True);
+        Assert.That(first, Is.EqualTo(10));
+        Assert.That(queue.TryDequeue(out int second), Is.True);
+        Assert.That(second, Is.EqualTo(20));
+        Assert.That(queue.TryDequeue(out _), Is.False);
+
+        for (int i = 0; i < 10; i++)
+        {
+            Assert.That(queue.TryEnqueue(i), Is.True);
+            Assert.That(queue.TryDequeue(out int value), Is.True);
+            Assert.That(value, Is.EqualTo(i));
+        }
+    }
+
+    [Test, Timeout(30000)]
+    public void ConcurrentMessageQueue_CapacityOne_IsRaisedToTwoAndStillReportsFull()
+    {
+        using var queue = ConcurrentMessageQueue.CreateOrOpen(N("MqCap1"), 1, 16);
+        var a = new byte[] { 1 };
+        var b = new byte[] { 2 };
+        var buffer = new byte[16];
+
+        Assert.That(queue.Capacity, Is.EqualTo(2));
+        Assert.That(queue.TryEnqueue(a), Is.True);
+        Assert.That(queue.TryEnqueue(b), Is.True);
+        Assert.That(queue.TryEnqueue(new byte[] { 3 }), Is.False, "the queue is full, it must not overwrite message 1");
+
+        Assert.That(queue.TryDequeue(buffer, out int length), Is.True);
+        Assert.That(length, Is.EqualTo(1));
+        Assert.That(buffer[0], Is.EqualTo(1));
+        Assert.That(queue.TryDequeue(buffer, out length), Is.True);
+        Assert.That(buffer[0], Is.EqualTo(2));
+        Assert.That(queue.TryDequeue(buffer, out _), Is.False);
+    }
+
+    [Test, Timeout(30000)]
+    public void ConcurrentQueue_ReopenedWithCapacityOne_MatchesTheRaisedCapacity()
+    {
+        string name = N("MpmcCap1Reopen");
+        using var owner = ConcurrentQueue<int>.CreateOrOpen(name, 1);
+        using var reopened = ConcurrentQueue<int>.CreateOrOpen(name, 1);
+
+        Assert.That(reopened.Capacity, Is.EqualTo(2));
+    }
+
     public struct BlobSchema : IMemorySchema
     {
         public const string Data = "Data";

@@ -38,6 +38,11 @@ namespace InterprocessMemory
     public sealed unsafe class ConcurrentQueue<T> : IDisposable where T : unmanaged
     {
         private const int HeaderSize = 320;
+
+        // A slot's sequence is write+1 once it is published and read+capacity once it is free again.
+        // With a single slot those two values are the same, so a full queue looks empty to the next
+        // producer, which overwrites the item and then stalls the queue for good.
+        private const int MinimumCapacity = 2;
         private const int SlotHeaderSize = 8;
         private const int FormatVersion = 3;
         private const long HeaderMagic = 0x5143504D504953;
@@ -99,7 +104,7 @@ namespace InterprocessMemory
 
             if (createOrOpen)
             {
-                _capacity = PowerOfTwo.RoundUp(capacity!.Value, "capacity");
+                _capacity = PowerOfTwo.RoundUp(capacity!.Value, "capacity", MinimumCapacity);
                 _capacityMask = _capacity - 1;
                 _slotStride = RoundUpToMultiple(checked(SlotHeaderSize + _elementSize), 8);
                 long regionCapacity = checked(HeaderSize + (long)_capacity * _slotStride);
@@ -171,7 +176,7 @@ namespace InterprocessMemory
             int storedCapacity = _header->Capacity;
             int storedStride = _header->SlotStride;
             if (_header->Version != FormatVersion ||
-                storedCapacity <= 0 ||
+                storedCapacity < MinimumCapacity ||
                 (storedCapacity & (storedCapacity - 1)) != 0 ||
                 _header->ElementSize != _elementSize ||
                 storedStride < SlotHeaderSize + _elementSize ||
@@ -181,7 +186,7 @@ namespace InterprocessMemory
 
             if (requestedCapacity.HasValue)
             {
-                int expectedCapacity = PowerOfTwo.RoundUp(requestedCapacity.Value, "capacity");
+                int expectedCapacity = PowerOfTwo.RoundUp(requestedCapacity.Value, "capacity", MinimumCapacity);
                 if (expectedCapacity != storedCapacity)
                     throw new InvalidOperationException(
                         $"Capacity mismatch: expected {expectedCapacity}, found {storedCapacity}.");
