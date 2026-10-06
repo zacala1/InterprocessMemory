@@ -364,8 +364,12 @@ namespace InterprocessMemory
         /// Lock-free operation safe for concurrent writers.
         /// </summary>
         /// <returns>True if write succeeded, false if buffer is full</returns>
+        public bool TryEnqueue(ReadOnlySpan<byte> data) => TryEnqueueCore(data, countFailure: true);
+
+        // countFailure is false while a timeout overload polls: the call counts as one failed write when it
+        // gives up, not once per poll.
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        public bool TryEnqueue(ReadOnlySpan<byte> data)
+        private bool TryEnqueueCore(ReadOnlySpan<byte> data, bool countFailure)
         {
             ThrowIfDisposed();
 
@@ -407,7 +411,7 @@ namespace InterprocessMemory
                 else if (diff < 0)
                 {
                     // Buffer is full
-                    if (_statsEnabled)
+                    if (_statsEnabled && countFailure)
                         Interlocked.Increment(ref _header->FailedWrites);
                     return false;
                 }
@@ -439,7 +443,7 @@ namespace InterprocessMemory
         /// left intact so the caller can retry with an adequately sized buffer.
         /// </exception>
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        private int TryDequeueCore(Span<byte> destination)
+        private int TryDequeueCore(Span<byte> destination, bool countFailure = true)
         {
             ThrowIfDisposed();
 
@@ -493,7 +497,7 @@ namespace InterprocessMemory
                 else if (diff < 0)
                 {
                     // Buffer is empty
-                    if (_statsEnabled)
+                    if (_statsEnabled && countFailure)
                         Interlocked.Increment(ref _header->FailedReads);
                     return 0;
                 }
@@ -536,13 +540,17 @@ namespace InterprocessMemory
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
 
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
 
-            while (!TryEnqueue(data))
+            while (!TryEnqueueCore(data, countFailure: false))
             {
-                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(start, timeout))
+                {
+                    if (_statsEnabled)
+                        Interlocked.Increment(ref _header->FailedWrites);
                     return false;
+                }
 
                 spinner.SpinOnce();
             }
@@ -567,14 +575,17 @@ namespace InterprocessMemory
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
 
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
-            bytesWritten = 0;
 
-            while (!TryDequeue(destination, out bytesWritten))
+            while ((bytesWritten = TryDequeueCore(destination, countFailure: false)) == 0)
             {
-                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(start, timeout))
+                {
+                    if (_statsEnabled)
+                        Interlocked.Increment(ref _header->FailedReads);
                     return false;
+                }
 
                 spinner.SpinOnce();
             }

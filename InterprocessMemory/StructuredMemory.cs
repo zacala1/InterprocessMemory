@@ -752,6 +752,7 @@ namespace InterprocessMemory
         /// <param name="timeout">Lock acquisition timeout</param>
         /// <returns>A disposable lock guard that releases the lock on dispose</returns>
         /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
+        /// <exception cref="InvalidOperationException">The calling thread holds only a read lock (upgrading would deadlock)</exception>
         /// <remarks>
         /// The lock is owned by the calling thread. Dispose the guard on that same thread; do not
         /// <c>await</c> inside the guarded scope, or <see cref="WriteLock.Dispose"/> throws
@@ -768,6 +769,13 @@ namespace InterprocessMemory
                 IncrementWriteLockDepth();
                 return new WriteLock(null, _decrementWriteLockDepth);
             }
+
+            // The write lock waits for every reader to leave, and this thread is one of them. Waiting would
+            // block all other processes (new readers and writers queue behind the pending writer) until the
+            // timeout, or for good with Timeout.InfiniteTimeSpan.
+            if (_readLockDepth.Value > 0)
+                throw new InvalidOperationException(
+                    "Cannot take the write lock while holding only a read lock. Release the read lock first.");
 
             if (!_buffer.TryAcquireWriteLock(timeout))
                 throw new TimeoutException($"Failed to acquire write lock within {timeout}");

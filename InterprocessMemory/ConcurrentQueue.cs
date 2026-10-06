@@ -208,7 +208,11 @@ namespace InterprocessMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static byte* GetSlotData(ConcurrentQueueSlot* slot) => (byte*)slot + SlotHeaderSize;
 
-        public bool TryEnqueue(in T item)
+        public bool TryEnqueue(in T item) => TryEnqueueCore(in item, countFailure: true);
+
+        // countFailure is false while a timeout overload polls: the call counts as one failed enqueue when
+        // it gives up, not once per poll (4 s of waiting used to add about 1,800 failed enqueues).
+        private bool TryEnqueueCore(in T item, bool countFailure)
         {
             ThrowIfDisposed();
             for (int spin = 0; spin < _maxSpins; spin++)
@@ -230,7 +234,7 @@ namespace InterprocessMemory
                 }
                 else if (difference < 0)
                 {
-                    if (_statisticsEnabled)
+                    if (_statisticsEnabled && countFailure)
                         Interlocked.Increment(ref _header->FailedEnqueues);
                     return false;
                 }
@@ -240,7 +244,9 @@ namespace InterprocessMemory
             return false;
         }
 
-        public bool TryDequeue(out T item)
+        public bool TryDequeue(out T item) => TryDequeueCore(out item, countFailure: true);
+
+        private bool TryDequeueCore(out T item, bool countFailure)
         {
             ThrowIfDisposed();
             for (int spin = 0; spin < _maxSpins; spin++)
@@ -262,7 +268,7 @@ namespace InterprocessMemory
                 }
                 else if (difference < 0)
                 {
-                    if (_statisticsEnabled)
+                    if (_statisticsEnabled && countFailure)
                         Interlocked.Increment(ref _header->FailedDequeues);
                     item = default;
                     return false;
@@ -281,12 +287,16 @@ namespace InterprocessMemory
             CancellationToken cancellationToken = default)
         {
             TimeoutHelper.Validate(timeout, nameof(timeout));
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
-            while (!TryEnqueue(in item))
+            while (!TryEnqueueCore(in item, countFailure: false))
             {
-                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(start, timeout))
+                {
+                    if (_statisticsEnabled)
+                        Interlocked.Increment(ref _header->FailedEnqueues);
                     return false;
+                }
                 spinner.SpinOnce();
             }
             return true;
@@ -298,12 +308,14 @@ namespace InterprocessMemory
             CancellationToken cancellationToken = default)
         {
             TimeoutHelper.Validate(timeout, nameof(timeout));
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
-            while (!TryDequeue(out item))
+            while (!TryDequeueCore(out item, countFailure: false))
             {
-                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(start, timeout))
                 {
+                    if (_statisticsEnabled)
+                        Interlocked.Increment(ref _header->FailedDequeues);
                     item = default;
                     return false;
                 }

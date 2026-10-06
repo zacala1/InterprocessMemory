@@ -33,6 +33,14 @@ Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATIO
   waiter looked the owner's pid up in its own namespace and did not find it. The owner now records its PID
   namespace (the inode of `/proc/self/ns/pid`, in the reserved part of the header) and a waiter in another
   namespace no longer declares the owner dead from its pid.
+- `StructuredMemory<T>.AcquireWriteLock()` called while the thread holds a read guard set the writer flag and
+  waited for that thread's own read lock, blocking every other process until the timeout. It now throws
+  `InvalidOperationException` at once, like the automatic write lock and `SharedArray<T>` do.
+- `SingleProducerByteStream.Available` and `.Used` read the unmapped header after `Dispose()`; they throw
+  `ObjectDisposedException` like the other members.
+- The timeout overloads of `ConcurrentQueue<T>` and `ConcurrentMessageQueue` counted a failed enqueue or
+  dequeue on every poll (about 1,800 for 4 s of waiting). A call now counts once, when it gives up, and
+  not at all when it succeeds after waiting. They also no longer allocate a `Stopwatch` per call.
 - A waiting reader now recovers a write lock whose owner process died, like a waiting writer does. It used
   to wait for its whole timeout.
 - Disposing a region while another thread waits for one of its locks no longer crashes the process;

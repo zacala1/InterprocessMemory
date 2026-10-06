@@ -76,12 +76,26 @@ namespace InterprocessMemory
         /// <summary>
         /// Gets the available space in bytes for writing
         /// </summary>
-        public long Available => CalculateAvailable();
+        public long Available
+        {
+            get
+            {
+                ThrowIfDisposed();
+                return CalculateAvailable();
+            }
+        }
 
         /// <summary>
         /// Gets the used space in bytes (data ready for reading)
         /// </summary>
-        public long Used => CalculateUsed();
+        public long Used
+        {
+            get
+            {
+                ThrowIfDisposed();
+                return CalculateUsed();
+            }
+        }
 
         /// <summary>
         /// Gets performance statistics for the buffer

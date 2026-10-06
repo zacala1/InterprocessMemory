@@ -728,6 +728,78 @@ public class LibraryHardeningTests
         Assert.That(File.Exists("/dev/shm/" + name), Is.False, "the failed region must not leave a file behind");
     }
 
+    [Test, Timeout(30000)]
+    public void StructuredMemory_ExplicitWriteLock_WhileHoldingOnlyAReadLock_ThrowsInsteadOfBlockingEveryone()
+    {
+        // The automatic write lock already refused this. The explicit one set the writer flag and then
+        // waited for this very thread's read lock to go away: every other reader and writer queued behind
+        // it until the timeout, or for good with an infinite timeout.
+        string name = N("ExplicitUpgrade");
+        using var memory = StructuredMemory<SimpleSchema>.CreateOrOpen(name, new SimpleSchema());
+
+        using (memory.AcquireReadLock())
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            Assert.Throws<InvalidOperationException>(() => memory.AcquireWriteLock(TimeSpan.FromSeconds(10)));
+            Assert.That(sw.ElapsedMilliseconds, Is.LessThan(2000), "it must fail at once, not wait for the timeout");
+        }
+
+        using (memory.AcquireWriteLock(TimeSpan.FromSeconds(1)))
+        {
+        }
+    }
+
+    [Test]
+    public void SingleProducerByteStream_AvailableAndUsed_AfterDispose_Throw()
+    {
+        // Both properties read the unmapped header, which ends the process, instead of failing like the
+        // other members do.
+        var stream = SingleProducerByteStream.CreateOrOpen(N("SpscDisposedProps"), 1024);
+        stream.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => _ = stream.Available);
+        Assert.Throws<ObjectDisposedException>(() => _ = stream.Used);
+    }
+
+    [Test, Timeout(30000)]
+    public void ConcurrentQueue_AWaitingCall_CountsAsOneFailureNotOnePerPoll()
+    {
+        using var queue = ConcurrentQueue<int>.CreateOrOpen(N("MpmcFailCount"), 4);
+
+        Assert.That(queue.TryDequeue(out _, TimeSpan.FromMilliseconds(300)), Is.False);
+        Assert.That(queue.GetStatistics().FailedDequeues, Is.EqualTo(1));
+
+        for (int i = 0; i < 4; i++)
+            Assert.That(queue.TryEnqueue(i), Is.True);
+        Assert.That(queue.TryEnqueue(99, TimeSpan.FromMilliseconds(300)), Is.False);
+        Assert.That(queue.GetStatistics().FailedEnqueues, Is.EqualTo(1));
+
+        // A call that waits and then succeeds is not a failure.
+        for (int i = 0; i < 4; i++)
+            Assert.That(queue.TryDequeue(out _), Is.True);
+        Task<bool> waiter = Task.Run(() => queue.TryDequeue(out _, TimeSpan.FromSeconds(10)));
+        Thread.Sleep(100);
+        Assert.That(queue.TryEnqueue(7), Is.True);
+        Assert.That(waiter.Wait(TimeSpan.FromSeconds(10)), Is.True);
+        Assert.That(waiter.Result, Is.True);
+        Assert.That(queue.GetStatistics().FailedDequeues, Is.EqualTo(1));
+    }
+
+    [Test, Timeout(30000)]
+    public void ConcurrentMessageQueue_AWaitingCall_CountsAsOneFailureNotOnePerPoll()
+    {
+        using var queue = ConcurrentMessageQueue.CreateOrOpen(N("MqFailCount"), 2, 16);
+        var buffer = new byte[16];
+
+        Assert.That(queue.TryDequeue(buffer, out _, TimeSpan.FromMilliseconds(300)), Is.False);
+        Assert.That(queue.GetStatistics().FailedReads, Is.EqualTo(1));
+
+        Assert.That(queue.TryEnqueue(new byte[] { 1 }), Is.True);
+        Assert.That(queue.TryEnqueue(new byte[] { 2 }), Is.True);
+        Assert.That(queue.TryEnqueue(new byte[] { 3 }, TimeSpan.FromMilliseconds(300)), Is.False);
+        Assert.That(queue.GetStatistics().FailedWrites, Is.EqualTo(1));
+    }
+
     public struct BlobSchema : IMemorySchema
     {
         public const string Data = "Data";
