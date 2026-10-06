@@ -46,7 +46,7 @@ public class ConcurrencyStabilityTests
         var errors = new ConcurrentBag<string>();
         var cts = new CancellationTokenSource(durationMs);
 
-        var writers = Enumerable.Range(0, writerCount).Select(w => Task.Run(() =>
+        var writers = Enumerable.Range(0, writerCount).Select(w => DedicatedThread.Run(() =>
         {
             Span<byte> stamp = stackalloc byte[4];
             BitConverter.TryWriteBytes(stamp, writerMagics[w]);
@@ -61,7 +61,7 @@ public class ConcurrencyStabilityTests
             }
         })).ToArray();
 
-        var readers = Enumerable.Range(0, readerCount).Select(r => Task.Run(() =>
+        var readers = Enumerable.Range(0, readerCount).Select(r => DedicatedThread.Run(() =>
         {
             Span<byte> rd = stackalloc byte[4];
             while (!cts.Token.IsCancellationRequested)
@@ -247,7 +247,7 @@ public class ConcurrencyStabilityTests
         var checkCount = 0L;
         var holdCount = 0L;
 
-        var holder = Task.Run(() =>
+        var holder = DedicatedThread.Run(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -264,7 +264,7 @@ public class ConcurrencyStabilityTests
             }
         });
 
-        var checkers = Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        var checkers = Enumerable.Range(0, 8).Select(_ => DedicatedThread.Run(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -447,7 +447,7 @@ public class ConcurrencyStabilityTests
         var maxWriterWaitMs = 0L;
         var writerAcquires = 0;
 
-        var readers = Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        var readers = Enumerable.Range(0, 8).Select(_ => DedicatedThread.Run(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -460,7 +460,7 @@ public class ConcurrencyStabilityTests
             }
         })).ToArray();
 
-        var writer = Task.Run(() =>
+        var writer = DedicatedThread.Run(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -500,8 +500,12 @@ public class ConcurrencyStabilityTests
 
     // ── MPMC producer fairness ───────────────────────────────────────────────
 
-    // The ratio depends on the core count and the scheduler (eight spinning producers share the
-    // thread pool), so CI runs this separately and does not fail the build on it.
+    // The ratio depends on the core count and the scheduler. Nine spinning threads (eight producers and the
+    // consumer) on a machine with fewer cores let the producer that is running win the next slot again and
+    // again while the others wait for a time slice: on 2 cores a ratio in the thousands was measured. The
+    // threads are dedicated, so a failure is that scheduling effect and not thread-pool starvation (which
+    // made the consumer never run, and every producer but one write nothing). CI runs this separately and
+    // reports a failure as a warning instead of failing the build.
     [Test]
     [Category("TimingSensitive")]
     [Timeout(30000)]
@@ -518,7 +522,7 @@ public class ConcurrencyStabilityTests
         var counts = new long[producerCount];
         var cts = new CancellationTokenSource(durationMs);
 
-        var producers = Enumerable.Range(0, producerCount).Select(p => Task.Run(() =>
+        var producers = Enumerable.Range(0, producerCount).Select(p => DedicatedThread.Run(() =>
         {
             Span<byte> data = stackalloc byte[16];
             BitConverter.TryWriteBytes(data, p);
@@ -530,7 +534,7 @@ public class ConcurrencyStabilityTests
         })).ToArray();
 
         // Single consumer drains continuously so producers don't all jam on full-buffer.
-        var consumer = Task.Run(() =>
+        var consumer = DedicatedThread.Run(() =>
         {
             Span<byte> rd = stackalloc byte[128];
             while (!cts.Token.IsCancellationRequested)

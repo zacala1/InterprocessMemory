@@ -542,7 +542,7 @@ public class ChangeVerificationTests
 
     // ── #8 InitializeOrOpen race-safe two-phase magic ───────────────────────
 
-    [Test]
+    [Test, Timeout(60000)]
     public void InitializeOrOpen_ConcurrentSameProcessOpen_NoTornCapacityRead()
     {
         // Spawn N threads that all try to open the same buffer simultaneously. Exactly one
@@ -557,7 +557,9 @@ public class ChangeVerificationTests
         var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
         var buffers = new MemoryRegion?[Threads];
 
-        Parallel.For(0, Threads, i =>
+        // Dedicated threads: Parallel.For would run the sixteen barrier waits on thread-pool workers, and the
+        // pool adds them one at a time, so on a two core machine this took 10 to 13 seconds.
+        var threads = Enumerable.Range(0, Threads).Select(i => new Thread(() =>
         {
             try
             {
@@ -568,7 +570,12 @@ public class ChangeVerificationTests
             {
                 errors.Add(ex);
             }
-        });
+        })).ToArray();
+
+        foreach (Thread thread in threads)
+            thread.Start();
+        foreach (Thread thread in threads)
+            Assert.That(thread.Join(TimeSpan.FromSeconds(30)), Is.True, "a thread did not finish opening the buffer");
 
         try
         {

@@ -336,8 +336,9 @@ cross-process lock exclusion, and orphan-lock recovery.
 request and every push to `main`. Two groups of tests are kept out of the blocking test step (use
 `--filter` to select or exclude them locally):
 
-- `Category=TimingSensitive`: assertions that depend on thread scheduling, such as a fairness ratio.
-  CI runs them in a separate, non-blocking step because a busy shared runner can fail them.
+- `Category=TimingSensitive`: assertions that depend on the core count and thread scheduling, such as a
+  fairness ratio, and the test that races `Dispose` against busy-polling threads in a child process.
+  CI runs them in a separate, non-blocking step and shows a failure as a warning on the run.
 - `Category=LongRunning`: the `[Explicit]` soak tests, which NUnit never runs unless asked to. CI does
   not run them.
 
