@@ -321,6 +321,102 @@ public class SharedArrayTests
         Assert.That(torn, Is.EqualTo(0), $"{torn} of {reads} reads were torn");
     }
 
+    // Two bytes: the width that used to be copied as a one byte store plus a two byte store.
+    public struct Pair2 { public byte X, Y; }
+
+    private enum ElementPath { Indexer, CopyRange, Fill }
+
+    // The writer alternates two values whose halves differ, the reader (a second instance, as another
+    // process would be) must only ever see one of the two. Before the element was written with a single
+    // store, a reader saw 0x0000 or 0xFFFF between 0x00FF and 0xFF00 about once in 200 reads.
+    private static void AssertNeverTorn<T>(string tag, T first, T second, ElementPath path)
+        where T : unmanaged
+    {
+        string name = LockName($"Atomic{tag}{path}");
+        using var writerArray = SharedArray<T>.CreateOrOpen(name, 4);
+        using var readerArray = SharedArray<T>.OpenExisting(name);
+        writerArray[0] = first;
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(0.6));
+        long reads = 0;
+        long torn = 0;
+
+        var writer = Task.Factory.StartNew(() =>
+        {
+            T[] one = new T[1];
+            while (!stop.IsCancellationRequested)
+            {
+                switch (path)
+                {
+                    case ElementPath.Indexer:
+                        writerArray[0] = second;
+                        writerArray[0] = first;
+                        break;
+                    case ElementPath.CopyRange:
+                        one[0] = second;
+                        writerArray.CopyFrom(0, one);
+                        one[0] = first;
+                        writerArray.CopyFrom(0, one);
+                        break;
+                    default:
+                        writerArray.Fill(second, 0, 1);
+                        writerArray.Fill(first, 0, 1);
+                        break;
+                }
+            }
+        }, TaskCreationOptions.LongRunning);
+
+        var reader = Task.Factory.StartNew(() =>
+        {
+            T[] one = new T[1];
+            var expectedFirst = System.Runtime.InteropServices.MemoryMarshal.AsBytes(new[] { first }.AsSpan()).ToArray();
+            var expectedSecond = System.Runtime.InteropServices.MemoryMarshal.AsBytes(new[] { second }.AsSpan()).ToArray();
+            while (!stop.IsCancellationRequested)
+            {
+                T value;
+                if (path == ElementPath.Indexer)
+                {
+                    value = readerArray[0];
+                }
+                else
+                {
+                    readerArray.CopyTo(0, one);
+                    value = one[0];
+                }
+
+                var bytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(new[] { value }.AsSpan());
+                if (!bytes.SequenceEqual(expectedFirst) && !bytes.SequenceEqual(expectedSecond))
+                    torn++;
+                reads++;
+            }
+        }, TaskCreationOptions.LongRunning);
+
+        Task.WaitAll(writer, reader);
+
+        Assert.That(reads, Is.GreaterThan(0));
+        Assert.That(torn, Is.EqualTo(0), $"{typeof(T).Name} via {path}: {torn} of {reads} reads were torn");
+    }
+
+    [Test, Timeout(60000)]
+    public void TwoByteElements_AreNeverObservedTorn()
+    {
+        foreach (ElementPath path in Enum.GetValues<ElementPath>())
+        {
+            AssertNeverTorn("U16", (ushort)0x00FF, (ushort)0xFF00, path);
+            AssertNeverTorn("Pair2", new Pair2 { X = 0x00, Y = 0xFF }, new Pair2 { X = 0xFF, Y = 0x00 }, path);
+        }
+    }
+
+    [Test, Timeout(60000)]
+    public void OtherAtomicWidths_AreNeverObservedTorn()
+    {
+        foreach (ElementPath path in Enum.GetValues<ElementPath>())
+        {
+            AssertNeverTorn("U8", (byte)0x0F, (byte)0xF0, path);
+            AssertNeverTorn("U32", 0x00FF00FFu, 0xFF00FF00u, path);
+            AssertNeverTorn("U64", 0x00FF00FF00FF00FFul, 0xFF00FF00FF00FF00ul, path);
+        }
+    }
+
     [Test, Timeout(60000)]
     public void AtomicElements_BypassTheLock_WideElementsDoNot()
     {

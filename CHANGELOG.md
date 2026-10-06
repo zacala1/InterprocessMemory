@@ -30,6 +30,11 @@ Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATIO
   the waiter fails with `ObjectDisposedException`.
 - Generic unmanaged structs (`ValueTuple`, `KeyValuePair<,>`) work in all typed containers.
   Fingerprints of types that already worked are unchanged, so existing regions stay compatible.
+- Two byte `SharedArray<T>` elements could be read half written by another process (a two byte copy is a
+  one byte store plus a two byte store). Elements of 1, 2, 4 and 8 bytes are now read and written with one
+  typed load/store. `StructuredMemory<T>` had the same defect for 2 byte scalars and, because it only locked
+  values wider than 8 bytes, also for 3, 5, 6 and 7 byte values and for small arrays: only 1, 2, 4 and 8
+  byte scalars are lock-free now, everything else (including every array) takes the shared lock.
 - `SharedArray<T>` disposes its region when opening fails because of a different element type or length.
 - `SharedArray<T>` and `StructuredMemory<T>` publish their header magic after the other fields, which
   prevents a spurious format error on weakly ordered CPUs.

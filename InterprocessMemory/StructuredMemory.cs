@@ -23,21 +23,24 @@ namespace InterprocessMemory
     /// state left behind by a crashed process.
     /// </para>
     /// </summary>
-    public sealed class StructuredMemory<TSchema> : IDisposable where TSchema : struct, IMemorySchema
+    public sealed unsafe class StructuredMemory<TSchema> : IDisposable where TSchema : struct, IMemorySchema
     {
         private const int SchemaHeaderSize = 64; // Reserved for schema metadata
         private const uint SchemaMagic = 0x53504D49; // "IMPS"
-        // x86-64 guarantees atomic load/store for aligned values up to 8 bytes (MOV instruction).
-        // Types wider than this threshold require automatic locking to prevent torn reads/writes.
-        // Note: ARM64 supports 16-byte atomics (ldp/stp) but not every supported platform guarantees
-        // them (e.g. x64 emulation on Windows ARM64), so 8 bytes is the safe cross-platform limit.
-        private const int AtomicThreshold = 8;
+        // An aligned load or store of 1, 2, 4 or 8 bytes is atomic on every supported platform, and
+        // AtomicAccess performs exactly one. Every other scalar size (3, 5, 6, 7 and anything wider than
+        // 8 bytes) as well as arrays, strings and blobs (several stores) go through the shared lock.
+        // ARM64 has 16-byte atomics (ldp/stp), but not every supported platform guarantees them
+        // (e.g. x64 emulation on Windows ARM64), so 8 bytes is the safe cross-platform limit.
         private const int MaxStackAllocBytes = 1024; // Max bytes for stackalloc (prevent stack overflow)
 
         // Cached TimeSpan to avoid repeated allocations
         private static readonly TimeSpan DefaultLockTimeout = TimeSpan.FromSeconds(5);
 
         private readonly IMemoryRegion _buffer;
+        // Address of the first byte after the region header, valid until Dispose; used for the
+        // lock-free scalar path (AtomicAccess).
+        private readonly byte* _dataBase;
         private readonly TSchema _schema;
         private readonly Dictionary<string, FieldMetadata> _fields;
         private readonly SchemaCompatibility _compatibility;
@@ -161,11 +164,13 @@ namespace InterprocessMemory
                 _buffer.Dispose();
                 throw;
             }
+
+            _dataBase = AtomicAccess.GetPointer(_buffer, 0);
         }
 
         /// <summary>
         /// Writes a strictly-typed value to a named field.
-        /// For types larger than 8 bytes (non-atomic), automatic locking is applied.
+        /// Values that are not 1, 2, 4 or 8 bytes wide are written under the shared lock automatically.
         /// </summary>
         /// <exception cref="InvalidOperationException">
         /// Thrown when the caller holds only a read lock and attempts to write a non-atomic value
@@ -182,7 +187,7 @@ namespace InterprocessMemory
             EnsureScalarField(metadata);
             ValidateFieldType<T>(metadata);
 
-            bool isNonAtomic = Unsafe.SizeOf<T>() > AtomicThreshold;
+            bool isNonAtomic = !AtomicAccess.IsAtomicSize(Unsafe.SizeOf<T>());
             if (isNonAtomic && !IsHoldingWriteLock())
             {
                 ThrowIfHoldingReadLock();
@@ -198,6 +203,14 @@ namespace InterprocessMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void WriteInternal<T>(T value, FieldMetadata metadata) where T : unmanaged
         {
+            if (AtomicAccess.IsAtomicSize(sizeof(T)))
+            {
+                // One typed store. Span.CopyTo is not enough: a two byte copy is a one byte store plus a
+                // two byte store, which another process can see half done.
+                AtomicAccess.Write(_dataBase + SchemaHeaderSize + metadata.Offset, value);
+                return;
+            }
+
             // MemoryMarshal.CreateSpan + AsBytes avoids a stackalloc by reinterpreting
             // the local variable directly as bytes without any extra copy.
             _buffer.Write(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref value, 1)),
@@ -206,7 +219,7 @@ namespace InterprocessMemory
 
         /// <summary>
         /// Reads a strictly-typed value from a named field.
-        /// For types larger than 8 bytes (non-atomic), automatic locking is applied.
+        /// Values that are not 1, 2, 4 or 8 bytes wide are read under the shared lock automatically.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public T Read<T>(string fieldName) where T : unmanaged
@@ -219,8 +232,8 @@ namespace InterprocessMemory
             EnsureScalarField(metadata);
             ValidateFieldType<T>(metadata);
 
-            // Auto-lock for non-atomic types (>8 bytes) to prevent torn reads
-            bool needsAutoLock = Unsafe.SizeOf<T>() > AtomicThreshold && !IsHoldingAnyLock();
+            // Auto-lock for sizes that one load cannot cover, to prevent torn reads
+            bool needsAutoLock = !AtomicAccess.IsAtomicSize(Unsafe.SizeOf<T>()) && !IsHoldingAnyLock();
             if (needsAutoLock)
             {
                 using var _ = AcquireReadLock();
@@ -235,6 +248,9 @@ namespace InterprocessMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private T ReadInternal<T>(FieldMetadata metadata) where T : unmanaged
         {
+            if (AtomicAccess.IsAtomicSize(sizeof(T)))
+                return AtomicAccess.Read<T>(_dataBase + SchemaHeaderSize + metadata.Offset);
+
             T value = default;
             _buffer.Read(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref value, 1)),
                 SchemaHeaderSize + metadata.Offset);
@@ -243,7 +259,7 @@ namespace InterprocessMemory
 
         /// <summary>
         /// Writes an array to a fixed-size array field.
-        /// For arrays larger than 8 bytes total, automatic locking is applied.
+        /// Automatic locking is applied: the elements and the zeroed tail are separate stores.
         /// </summary>
         public void WriteArray<T>(string fieldName, ReadOnlySpan<T> values) where T : unmanaged
         {
@@ -263,10 +279,10 @@ namespace InterprocessMemory
                     nameof(values));
 
             var bytes = MemoryMarshal.AsBytes(values);
-            bool isNonAtomic = metadata.Size > AtomicThreshold;
 
-            // Auto-lock for non-atomic operations (>8 bytes)
-            if (isNonAtomic && !IsHoldingWriteLock())
+            // Always lock: the data and the zeroed tail are separate stores, so even a field of a few
+            // bytes could be observed half written.
+            if (!IsHoldingWriteLock())
             {
                 ThrowIfHoldingReadLock();
                 using var _ = AcquireWriteLock();
@@ -307,7 +323,7 @@ namespace InterprocessMemory
 
         /// <summary>
         /// Reads an array from a fixed-size array field.
-        /// For arrays larger than 8 bytes total, automatic locking is applied.
+        /// Automatic locking is applied.
         /// </summary>
         public void ReadArray<T>(string fieldName, Span<T> destination) where T : unmanaged
         {
@@ -328,9 +344,7 @@ namespace InterprocessMemory
 
             var bytes = MemoryMarshal.AsBytes(destination);
 
-            // Auto-lock for non-atomic operations (>8 bytes)
-            using var _ = (bytes.Length > AtomicThreshold && !IsHoldingAnyLock())
-                ? AcquireReadLock() : default;
+            using var _ = !IsHoldingAnyLock() ? AcquireReadLock() : default;
             _buffer.Read(bytes, SchemaHeaderSize + metadata.Offset);
         }
 

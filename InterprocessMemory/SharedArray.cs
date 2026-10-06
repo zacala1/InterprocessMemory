@@ -14,11 +14,14 @@ namespace InterprocessMemory
     /// Provides array-like access to shared memory with compile-time type checking.
     /// Cross-platform: backed by <see cref="MemoryRegion"/> which supports Windows and Linux.
     /// <para>
-    /// <b>Atomicity.</b> Elements whose size is 1, 2, 4 or 8 bytes are copied with a single aligned
-    /// move, so another process never observes half of one, and they are accessed without any lock.
-    /// Every other element size (a 16-byte <see cref="Guid"/>, a 64-byte struct, ...) could be read
-    /// torn while another process writes it, so the indexer, <see cref="CopyTo"/>,
-    /// <see cref="CopyFrom"/> and <see cref="Fill"/> take the shared region lock for those types.
+    /// <b>Atomicity.</b> An element whose size is 1, 2, 4 or 8 bytes is read and written with one
+    /// aligned load or store (the indexer, and <see cref="CopyTo"/>/<see cref="CopyFrom"/> of a single
+    /// element), so another process never observes half of one, and no lock is taken. A range of
+    /// several elements is a plain memory copy: each element is intact in practice, but the range as
+    /// a whole is not a snapshot, so take a lock for that. Every other element size (a 16-byte
+    /// <see cref="Guid"/>, a 64-byte struct, ...) could be read torn while another process writes it,
+    /// so the indexer, <see cref="CopyTo"/>, <see cref="CopyFrom"/> and <see cref="Fill"/> take the
+    /// shared region lock for those types.
     /// </para>
     /// <para>
     /// Use <see cref="AcquireReadLock()"/> / <see cref="AcquireWriteLock()"/> when several elements
@@ -27,12 +30,16 @@ namespace InterprocessMemory
     /// </para>
     /// </summary>
     /// <typeparam name="T">Unmanaged value type</typeparam>
-    public sealed class SharedArray<T> : IDisposable where T : unmanaged
+    public sealed unsafe class SharedArray<T> : IDisposable where T : unmanaged
     {
         private readonly IMemoryRegion _buffer;
         private const int ArrayHeaderSize = 64;
         private const uint ArrayMagic = 0x59415249; // "IRAY"
         private const int FormatVersion = 3;
+
+        // Address of element 0. Valid until Dispose (the mapping does not move); used for the
+        // lock-free single-element path, see AtomicAccess.
+        private readonly byte* _elements;
 
         private int _length;
         private readonly int _elementSize;
@@ -110,6 +117,8 @@ namespace InterprocessMemory
                 _buffer.Dispose();
                 throw;
             }
+
+            _elements = AtomicAccess.GetPointer(_buffer, ArrayHeaderSize);
         }
 
         // The array exposes no statistics, so the region's per-call counters would only cost an
@@ -214,6 +223,11 @@ namespace InterprocessMemory
 
         private T ReadElement(int index)
         {
+            // 1, 2, 4 and 8 byte elements: one typed load. Going through Span.CopyTo is not enough,
+            // a two byte copy is a one byte store plus a two byte store and can be seen half done.
+            if (!s_needsLock)
+                return AtomicAccess.Read<T>(_elements + (long)index * _elementSize);
+
             T value = default;
             _buffer.Read(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref value, 1)),
                 ArrayHeaderSize + (long)index * _elementSize);
@@ -222,6 +236,12 @@ namespace InterprocessMemory
 
         private void WriteElement(int index, T value)
         {
+            if (!s_needsLock)
+            {
+                AtomicAccess.Write(_elements + (long)index * _elementSize, value);
+                return;
+            }
+
             _buffer.Write(MemoryMarshal.AsBytes(MemoryMarshal.CreateReadOnlySpan(ref value, 1)),
                 ArrayHeaderSize + (long)index * _elementSize);
         }
@@ -288,8 +308,18 @@ namespace InterprocessMemory
             }
         }
 
-        private void CopyToCore(int startIndex, Span<T> destination) =>
+        private void CopyToCore(int startIndex, Span<T> destination)
+        {
+            // A single element must stay one load (see ReadElement); longer ranges are a plain copy
+            // and are not atomic across elements.
+            if (!s_needsLock && destination.Length == 1)
+            {
+                destination[0] = AtomicAccess.Read<T>(_elements + (long)startIndex * _elementSize);
+                return;
+            }
+
             _buffer.Read(MemoryMarshal.AsBytes(destination), ArrayHeaderSize + (long)startIndex * _elementSize);
+        }
 
         /// <summary>
         /// Copies a span of elements to the array.
@@ -324,8 +354,16 @@ namespace InterprocessMemory
             }
         }
 
-        private void CopyFromCore(int startIndex, ReadOnlySpan<T> source) =>
+        private void CopyFromCore(int startIndex, ReadOnlySpan<T> source)
+        {
+            if (!s_needsLock && source.Length == 1)
+            {
+                AtomicAccess.Write(_elements + (long)startIndex * _elementSize, source[0]);
+                return;
+            }
+
             _buffer.Write(MemoryMarshal.AsBytes(source), ArrayHeaderSize + (long)startIndex * _elementSize);
+        }
 
         /// <summary>
         /// Fills a range with a value.

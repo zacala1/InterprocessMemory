@@ -232,12 +232,14 @@ Console.WriteLine(reader[0]);
 
 The array header validates the element type fingerprint and restores its length for openers.
 
-Elements that are 1, 2, 4 or 8 bytes wide are copied with a single aligned move, so another process
-never sees half of one, and they are read and written without any lock. Every other element size
-(a `Guid`, a `Vector3`, a 64-byte struct, ...) could be read torn while another process writes it,
-so `SharedArray<T>` takes the shared region lock for those types in the indexer, `CopyTo`, `CopyFrom`
-and `Fill` (the whole range of a `Fill` under one lock). That is correct but slower per access; for
-many elements take the lock once yourself.
+An element that is 1, 2, 4 or 8 bytes wide is read and written with one aligned load or store, so
+another process never sees half of one, and no lock is taken. A range of several elements (`CopyTo`,
+`CopyFrom`, `Fill`) is a plain memory copy; take a lock when it must be a consistent snapshot.
+
+Every other element size (a `Guid`, a `Vector3`, a 64-byte struct, ...) could be read torn while
+another process writes it, so `SharedArray<T>` takes the shared region lock for those types in the
+indexer, `CopyTo`, `CopyFrom` and `Fill` (the whole range of a `Fill` under one lock). That is correct
+but slower per access; for many elements take the lock once yourself.
 
 Use the explicit locks when several elements must be read or changed together. This applies to
 any element type, because two atomic elements can still be seen from different updates:
