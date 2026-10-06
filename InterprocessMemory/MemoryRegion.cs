@@ -446,6 +446,14 @@ namespace InterprocessMemory
         /// </summary>
         private void CreateMmfFromExplicitFilePath(long totalSize)
         {
+            if (_createOrOpen)
+            {
+                string fullPath = Path.GetFullPath(_options.FilePath!);
+                long existing = File.Exists(fullPath) ? new FileInfo(fullPath).Length : 0;
+                if (existing < totalSize)
+                    EnsureFreeSpace(Path.GetDirectoryName(fullPath) ?? fullPath, totalSize - existing, _name);
+            }
+
             string? mapName = OperatingSystem.IsWindows() ? _name : null;
             FileMode mode = _createOrOpen ? FileMode.OpenOrCreate : FileMode.Open;
             _mmf = MemoryMappedFile.CreateFromFile(
@@ -510,6 +518,10 @@ namespace InterprocessMemory
                 // file: if construction fails between here and AcquirePointer, Cleanup will
                 // unlink the file so the next caller doesn't trip over a half-initialized blob.
                 _createdBackingFile = true;
+
+                // SetLength only reserves address space in tmpfs. If the filesystem cannot hold the region,
+                // the first write past what fits kills the process with SIGBUS, which cannot be caught.
+                EnsureFreeSpace("/dev/shm", totalSize, _name);
                 _backingFile.SetLength(totalSize);
             }
             else if (_createOrOpen && _backingFile.Length != totalSize)
@@ -531,6 +543,32 @@ namespace InterprocessMemory
                 HandleInheritability.None,
                 leaveOpen: false);              // MMF takes ownership of the FileStream
             _backingFile = null;                // ownership transferred — don't double-dispose
+        }
+
+        /// <summary>
+        /// Throws <see cref="IOException"/> when the filesystem that will hold a new region has fewer than
+        /// <paramref name="requiredBytes"/> bytes available. Best effort: a filesystem that cannot report
+        /// its free space is not blocked, and another process can still fill it between this check and the
+        /// first write.
+        /// </summary>
+        internal static void EnsureFreeSpace(string directory, long requiredBytes, string regionName)
+        {
+            long free;
+            try
+            {
+                free = new DriveInfo(directory).AvailableFreeSpace;
+            }
+            catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException
+                                           or NotSupportedException)
+            {
+                return;
+            }
+
+            if (free < requiredBytes)
+                throw new IOException(
+                    $"Not enough space for shared memory '{regionName}': it needs {requiredBytes} bytes but " +
+                    $"'{directory}' has {free} available. In a container, raise the limit of /dev/shm " +
+                    "(docker run --shm-size, or a larger memory-backed emptyDir in Kubernetes).");
         }
 
         /// <summary>

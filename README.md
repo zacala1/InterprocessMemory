@@ -93,6 +93,10 @@ The `name` must be the same non-empty flat identifier in every process. Path sep
 control characters, NUL, and UTF-8 names longer than 255 bytes are rejected consistently on
 Windows and Linux.
 
+On Linux a region lives in `/dev/shm`, which Docker limits to 64 MB by default. Creating a region that
+does not fit throws `IOException` (raise the limit with `--shm-size`, or a larger memory-backed
+`emptyDir` in Kubernetes) instead of killing the process with `SIGBUS` on a later write.
+
 ## Typed queues
 
 Typed queues accept only fixed-size `unmanaged` values. They copy the value directly to a slot;

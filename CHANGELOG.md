@@ -37,6 +37,9 @@ Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATIO
   one was enqueued and then never delivered anything again. They need two slots, so a requested capacity
   of 1 is now raised to 2, and an existing region that stored a capacity of 1 is rejected as invalid
   (remove it with `MemoryRegion.Remove`).
+- Linux: creating a region larger than the free space of `/dev/shm` (Docker's default is 64 MB) succeeded and
+  the process was killed with an uncatchable `SIGBUS` at the first write that did not fit. `CreateOrOpen`
+  now throws `IOException` up front; a file-backed region (`MemoryRegionOptions.FilePath`) is checked too.
 - Generic unmanaged structs (`ValueTuple`, `KeyValuePair<,>`) work in all typed containers.
   Fingerprints of types that already worked are unchanged, so existing regions stay compatible.
 - Two byte `SharedArray<T>` elements could be read half written by another process (a two byte copy is a

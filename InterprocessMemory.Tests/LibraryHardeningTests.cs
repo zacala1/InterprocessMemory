@@ -701,6 +701,33 @@ public class LibraryHardeningTests
         Assert.That(reopened.Capacity, Is.EqualTo(2));
     }
 
+    [Test]
+    public void EnsureFreeSpace_ThrowsWhenTheFilesystemCannotHoldTheRegion()
+    {
+        string directory = Path.GetTempPath();
+
+        Assert.DoesNotThrow(() => MemoryRegion.EnsureFreeSpace(directory, 1024, "small"));
+        var ex = Assert.Throws<IOException>(() => MemoryRegion.EnsureFreeSpace(directory, long.MaxValue, "huge"));
+        Assert.That(ex!.Message, Does.Contain("huge"));
+        Assert.That(ex.Message, Does.Contain("--shm-size"));
+
+        // A path the OS cannot describe must not block creating the region.
+        Assert.DoesNotThrow(() => MemoryRegion.EnsureFreeSpace("\0:/does-not-exist", long.MaxValue, "unknown"));
+    }
+
+    [Test, Timeout(30000)]
+    public void CreateOrOpen_WithMoreThanTheDevShmCanHold_ThrowsInsteadOfCrashingLater()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("Only the Linux /dev/shm backing can be oversubscribed.");
+
+        // A sparse tmpfs file of this size is created without error, and the process dies with SIGBUS
+        // at the first write that does not fit. 4 TiB is far beyond any /dev/shm.
+        string name = N("TooBig");
+        Assert.Throws<IOException>(() => MemoryRegion.CreateOrOpen(name, 4L << 40));
+        Assert.That(File.Exists("/dev/shm/" + name), Is.False, "the failed region must not leave a file behind");
+    }
+
     public struct BlobSchema : IMemorySchema
     {
         public const string Data = "Data";
