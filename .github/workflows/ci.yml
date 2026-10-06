@@ -9,10 +9,11 @@ on:
 permissions:
   contents: read
 
-# A newer push to the same branch or pull request supersedes the run in progress.
+# A newer push to the same pull request supersedes the run in progress. Runs for main are never cancelled,
+# so that every commit that lands there keeps its own result.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   DOTNET_NOLOGO: true
@@ -58,11 +59,12 @@ jobs:
       # Builds every project, including the benchmarks and the child-process test worker that the
       # cross-process tests start. Packing on every build is not needed here.
       - name: Build
+        id: build
         run: dotnet build InterprocessMemory.sln --configuration Release --no-restore -p:GeneratePackageOnBuild=false
 
-      # --blame names the running test when the test host dies, which is what an
-      # AccessViolationException from a memory-mapped region looks like; the hang timeout stops a
-      # stuck test from holding the runner until the job timeout.
+      # The blame collector (enabled by --blame-hang-timeout) names the running test when the test host
+      # dies, which is what an AccessViolationException from a memory-mapped region looks like; the hang
+      # timeout stops a stuck test from holding the runner until the job timeout.
       - name: Test
         run: >
           dotnet test InterprocessMemory.Tests/InterprocessMemory.Tests.csproj
@@ -77,7 +79,8 @@ jobs:
       # Tests whose outcome depends on the core count and the scheduler. They still run and show up
       # in the log and the artifact, but a failure here does not fail the job.
       - name: Test (timing sensitive, informational)
-        if: ${{ !cancelled() }}
+        id: timing
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
         continue-on-error: true
         run: >
           dotnet test InterprocessMemory.Tests/InterprocessMemory.Tests.csproj
@@ -86,6 +89,18 @@ jobs:
           --blame-hang-timeout 5m --blame-hang-dump-type none
           --logger "trx;LogFileName=timing-sensitive-results.trx"
           --results-directory TestResults
+
+      # continue-on-error shows a failed step as a success, so say it out loud: a warning annotation on the
+      # run and a section in its summary. Otherwise a test that fails on every run looks green for ever.
+      - name: Report timing sensitive failures
+        if: ${{ !cancelled() && steps.timing.outcome == 'failure' }}
+        run: |
+          echo "::warning title=Timing sensitive tests failed on ${{ matrix.os }}::This step does not fail the job. See the step log and timing-sensitive-results.trx in the test-results artifact."
+          {
+            echo "### Timing sensitive tests failed on ${{ matrix.os }}"
+            echo ""
+            echo "These tests depend on scheduling and do not fail the job, but a failure is still a result to read: see the log of the step above and the test-results artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload test results
         if: always()
