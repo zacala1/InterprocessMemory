@@ -626,6 +626,59 @@ public class CrossProcessTests
         Assert.That(view.ReadInt64(88), Is.EqualTo(0L), "a stale namespace would mislead the next owner's waiters");
     }
 
+    [Test, Timeout(40000)]
+    public void CrossProcess_OwnerThatIsAZombie_IsRecovered()
+    {
+        // A killed process whose parent has not reaped it still exists for GetProcessById and HasExited, so
+        // it looked alive. This happens in a container whose init does not reap, or under a busy supervisor.
+        if (!OperatingSystem.IsLinux() || !File.Exists("/bin/sh"))
+            Assert.Ignore("Needs Linux /proc and /bin/sh to make a zombie.");
+
+        // The shell starts a background sleep, prints its pid and replaces itself with another sleep, which
+        // never waits for children: once the background sleep is killed it stays a zombie.
+        var psi = new ProcessStartInfo("/bin/sh")
+        {
+            RedirectStandardOutput = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        psi.ArgumentList.Add("-c");
+        psi.ArgumentList.Add("sleep 600 & echo $!; exec sleep 600");
+
+        using Process parent = Process.Start(psi)!;
+        try
+        {
+            int zombiePid = int.Parse(parent.StandardOutput.ReadLine()!);
+            using (Process child = Process.GetProcessById(zombiePid))
+                child.Kill();
+
+            bool isZombie = false;
+            for (int i = 0; i < 100 && !isZombie; i++)
+            {
+                try
+                { isZombie = File.ReadAllText($"/proc/{zombiePid}/stat").Contains(") Z"); }
+                catch (IOException) { break; }
+                if (!isZombie)
+                    Thread.Sleep(50);
+            }
+
+            if (!isZombie)
+                Assert.Ignore("The killed process was reaped at once here, so there is no zombie to test with.");
+
+            string name = GetUniqueName("Zombie");
+            using var region = MemoryRegion.CreateOrOpen(name, 256);
+            HoldLockAs(name, zombiePid, MemoryRegion.CurrentPidNamespace);
+
+            Assert.That(region.IsWriteLockOrphaned(), Is.True, "a zombie holds nothing");
+            Assert.That(region.TryAcquireWriteLock(TimeSpan.FromSeconds(5)), Is.True);
+            region.ReleaseWriteLock();
+        }
+        finally
+        {
+            KillAndWait(parent);
+        }
+    }
+
     [Test, Timeout(30000)]
     public void CrossProcess_DeadReaderProcess_NeedsForceResetLocks()
     {

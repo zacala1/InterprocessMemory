@@ -758,6 +758,215 @@ public class LibraryHardeningTests
         Assert.That(queue.GetStatistics().FailedWrites, Is.EqualTo(1));
     }
 
+    [Test, Timeout(120000)]
+    public void OpenExisting_RacingTheCreator_WaitsInsteadOfReportingACorruptHeader()
+    {
+        // The creator makes the backing file, sizes it and writes the header one step after another.
+        // An opener that arrived in between found an empty file or a zero magic number and reported
+        // "invalid header" (about 9% of 300 races) instead of waiting the few microseconds.
+        var failures = new System.Collections.Concurrent.ConcurrentBag<string>();
+
+        for (int round = 0; round < 300; round++)
+        {
+            string name = N($"OpenRace{round}");
+            using var go = new ManualResetEventSlim(false);
+            MemoryRegion? created = null;
+
+            var creator = new Thread(() =>
+            {
+                go.Wait();
+                created = MemoryRegion.CreateOrOpen(name, 256);
+            });
+            var opener = new Thread(() =>
+            {
+                go.Wait();
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                while (sw.Elapsed < TimeSpan.FromSeconds(5))
+                {
+                    try
+                    {
+                        using var region = MemoryRegion.OpenExisting(name);
+                        return;
+                    }
+                    catch (FileNotFoundException)
+                    {
+                        // Not created yet: the only error a caller is expected to retry.
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add($"round {round}: {ex.GetType().Name}: {ex.Message}");
+                        return;
+                    }
+                }
+            });
+
+            creator.Start();
+            opener.Start();
+            go.Set();
+            Assert.That(creator.Join(TimeSpan.FromSeconds(30)), Is.True);
+            Assert.That(opener.Join(TimeSpan.FromSeconds(30)), Is.True);
+            created?.Dispose();
+            MemoryRegion.Remove(name);
+        }
+
+        Assert.That(failures, Is.Empty, $"{failures.Count} of 300 races failed, e.g. {failures.FirstOrDefault()}");
+    }
+
+    [Test, Timeout(120000)]
+    public void CreateOrOpen_LosingTheCreationRace_DoesNotDeleteTheWinnersFile()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("The race is about the file in /dev/shm.");
+
+        // Both processes saw an empty file, both took the creator's role, and the one whose capacity did
+        // not match then deleted the file that the other was using: later openers got a second, separate
+        // region under the same name (981 of 3000 races).
+        int deleted = 0;
+        int unexpected = 0;
+
+        for (int round = 0; round < 300; round++)
+        {
+            string name = N($"CreateRace{round}");
+            using var go = new Barrier(2);
+            MemoryRegion?[] regions = new MemoryRegion?[2];
+            Exception?[] errors = new Exception?[2];
+
+            Thread Start(int index, long capacity) => new Thread(() =>
+            {
+                try
+                {
+                    go.SignalAndWait();
+                    regions[index] = MemoryRegion.CreateOrOpen(name, capacity);
+                }
+                catch (Exception ex)
+                {
+                    errors[index] = ex;
+                }
+            });
+
+            Thread a = Start(0, 1024);
+            Thread b = Start(1, 2048);
+            a.Start();
+            b.Start();
+            Assert.That(a.Join(TimeSpan.FromSeconds(30)), Is.True);
+            Assert.That(b.Join(TimeSpan.FromSeconds(30)), Is.True);
+
+            int winners = regions.Count(r => r != null);
+            if (winners != 1 || errors.Count(e => e is InvalidOperationException) != 1)
+                unexpected++;
+            else if (!File.Exists("/dev/shm/" + name))
+                deleted++;
+
+            foreach (var region in regions)
+                region?.Dispose();
+            MemoryRegion.Remove(name);
+        }
+
+        Assert.That(unexpected, Is.EqualTo(0), "exactly one creator must win and the other must report the size mismatch");
+        Assert.That(deleted, Is.EqualTo(0), "the loser must not unlink the winner's file");
+    }
+
+    [Test]
+    public void FilePath_ExistingFileOfAnotherSize_IsRejectedWithoutChangingIt()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"ipm_resize_{Guid.NewGuid():N}.bin");
+        string name = N("FileResize");
+        try
+        {
+            using (MemoryRegion.CreateOrOpen(name, 1000, new MemoryRegionOptions { FilePath = path }))
+            {
+            }
+
+            long before = new FileInfo(path).Length;
+
+            Assert.Throws<InvalidOperationException>(() =>
+                MemoryRegion.CreateOrOpen(name, 2000, new MemoryRegionOptions { FilePath = path }));
+            Assert.That(new FileInfo(path).Length, Is.EqualTo(before),
+                "the file used to be grown to the requested size before anything was checked");
+
+            using var again = MemoryRegion.CreateOrOpen(name, 1000, new MemoryRegionOptions { FilePath = path });
+            Assert.That(again.Capacity, Is.EqualTo(1000));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch (IOException) { }
+        }
+    }
+
+    [Test]
+    public void FilePath_ExistingVersion2File_IsReportedAsOldFormatAndNotResized()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"ipm_v2size_{Guid.NewGuid():N}.bin");
+        try
+        {
+            byte[] bytes = new byte[128 + 4096];
+            BitConverter.TryWriteBytes(bytes.AsSpan(0), 0x48504D53u);
+            BitConverter.TryWriteBytes(bytes.AsSpan(4), 2u);
+            File.WriteAllBytes(path, bytes);
+
+            var error = Assert.Throws<InvalidDataException>(() =>
+                MemoryRegion.CreateOrOpen(N("V2Size"), 8192, new MemoryRegionOptions { FilePath = path }));
+
+            Assert.That(error!.Message, Does.Contain("2.x"));
+            Assert.That(File.ReadAllBytes(path), Is.EqualTo(bytes), "the old file must not be modified");
+        }
+        finally
+        {
+            try { File.Delete(path); } catch (IOException) { }
+        }
+    }
+
+    [Test]
+    public void FilePath_TwoInstancesOfTheSameFile_ShareTheMemory()
+    {
+        if (OperatingSystem.IsWindows())
+            Assert.Ignore("Windows names the mapping after the region; a second named mapping of one region is a separate case.");
+
+        string path = Path.Combine(Path.GetTempPath(), $"ipm_shared_{Guid.NewGuid():N}.bin");
+        string name = N("FileShared");
+        var options = new MemoryRegionOptions { FilePath = path };
+        try
+        {
+            using var first = MemoryRegion.CreateOrOpen(name, 256, options);
+            using var second = MemoryRegion.OpenExisting(name, options);
+
+            first.Write(new byte[] { 7, 8, 9 }, 0);
+            var read = new byte[3];
+            second.Read(read, 0);
+            Assert.That(read, Is.EqualTo(new byte[] { 7, 8, 9 }));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch (IOException) { }
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static (Memory<byte> Memory, WeakReference Region) GetMemoryAndForgetTheRegion(string name)
+    {
+        var region = MemoryRegion.CreateOrOpen(name, 256);
+        return (region.GetMemory(0, 64), new WeakReference(region));
+    }
+
+    [Test, Timeout(30000)]
+    public void GetMemory_KeepsTheRegionAliveForAsLongAsTheMemoryIsUsed()
+    {
+        // The Memory<byte> wraps a raw pointer into the mapping. Nothing tied it to the MemoryRegion, so a
+        // caller that dropped the region and kept the Memory let the finalizer unmap the view under it.
+        var (memory, region) = GetMemoryAndForgetTheRegion(N("Rooted"));
+
+        for (int i = 0; i < 3; i++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+
+        Assert.That(region.IsAlive, Is.True, "the region was finalized while its Memory<byte> was still in use");
+        memory.Span[0] = 42;
+        Assert.That(memory.Span[0], Is.EqualTo((byte)42));
+        GC.KeepAlive(memory);
+    }
+
     public struct BlobSchema : IMemorySchema
     {
         public const string Data = "Data";

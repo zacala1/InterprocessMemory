@@ -78,6 +78,12 @@ namespace InterprocessMemory
         // How often a lock waiter re-probes whether the owning process is still alive.
         private const long OrphanCheckIntervalMs = 250;
 
+        // OpenExisting (and a creator that lost the race to create the file) can arrive between the creator
+        // making the backing file and its first header write. The file is created empty, sized right after, and
+        // its header is written right after that: a few microseconds apart, so a short wait is enough, and a
+        // file that is still empty after it has no live creator.
+        private const int OpenerWaitMs = 2000;
+
         // A held write lock with no owner recorded is normal for a few nanoseconds: the owner sets
         // WriterLockState first and writes its identity right after, and clears the identity before it
         // clears the state. A process killed in one of those two windows leaves the lock held with nobody
@@ -201,6 +207,25 @@ namespace InterprocessMemory
             catch
             {
                 return 0;
+            }
+        }
+
+        /// <summary>
+        /// True when <c>/proc/&lt;pid&gt;/stat</c> reports the process as a zombie (<c>Z</c>) or dead (<c>X</c>).
+        /// </summary>
+        private static bool IsLinuxZombie(int pid)
+        {
+            try
+            {
+                string stat = File.ReadAllText("/proc/" + pid + "/stat");
+
+                // The state is the first field after the parenthesised command name (see TryReadLinuxStartTicks).
+                int commEnd = stat.LastIndexOf(')');
+                return commEnd >= 0 && commEnd + 2 < stat.Length && stat[commEnd + 2] is 'Z' or 'X';
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -482,22 +507,70 @@ namespace InterprocessMemory
         /// </summary>
         private void CreateMmfFromExplicitFilePath(long totalSize)
         {
-            if (_createOrOpen)
+            string fullPath = Path.GetFullPath(_options.FilePath!);
+            string? mapName = OperatingSystem.IsWindows() ? _name : null;
+
+            // The file is opened here, with sharing, instead of by MemoryMappedFile.CreateFromFile(path, ...):
+            // that overload grows an existing file to the requested capacity before anything has checked that
+            // it is the region the caller meant, which left a file of the wrong size permanently resized, and
+            // it does not share the file with a second process on Windows.
+            var file = new FileStream(fullPath, _createOrOpen ? FileMode.OpenOrCreate : FileMode.Open,
+                FileAccess.ReadWrite, FileShare.ReadWrite);
+            try
             {
-                string fullPath = Path.GetFullPath(_options.FilePath!);
-                long existing = File.Exists(fullPath) ? new FileInfo(fullPath).Length : 0;
-                if (existing < totalSize)
-                    EnsureFreeSpace(Path.GetDirectoryName(fullPath) ?? fullPath, totalSize - existing, _name);
+                if (_createOrOpen)
+                {
+                    long length = file.Length;
+                    if (length == 0)
+                    {
+                        EnsureFreeSpace(Path.GetDirectoryName(fullPath) ?? fullPath, totalSize, _name);
+                        file.SetLength(totalSize);
+                    }
+                    else if (length != totalSize)
+                    {
+                        ThrowForExistingFileOfAnotherSize(file, fullPath, length, totalSize);
+                    }
+                }
+
+                _mmf = MemoryMappedFile.CreateFromFile(
+                    file,
+                    mapName,
+                    _createOrOpen ? totalSize : 0,
+                    MemoryMappedFileAccess.ReadWrite,
+                    HandleInheritability.None,
+                    leaveOpen: false);          // the MMF takes ownership of the FileStream
+            }
+            catch
+            {
+                file.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// An existing file of another size is not this region. A file that clearly is not a version 3 region
+        /// (an older format, or something else entirely) is reported as that, as opening it without a
+        /// requested capacity does; otherwise it is a region with another capacity. The file is not modified.
+        /// </summary>
+        private void ThrowForExistingFileOfAnotherSize(FileStream file, string path, long actualLength, long totalSize)
+        {
+            if (actualLength >= sizeof(uint))
+            {
+                Span<byte> magic = stackalloc byte[sizeof(uint)];
+                file.Position = 0;
+                if (file.Read(magic) == magic.Length)
+                {
+                    uint observed = BitConverter.ToUInt32(magic);
+                    if (observed != 0 &&
+                        observed != SharedHeader.MagicNumber &&
+                        observed != SharedHeader.MagicInitializing)
+                        ThrowForUnexpectedMagic(observed);
+                }
             }
 
-            string? mapName = OperatingSystem.IsWindows() ? _name : null;
-            FileMode mode = _createOrOpen ? FileMode.OpenOrCreate : FileMode.Open;
-            _mmf = MemoryMappedFile.CreateFromFile(
-                _options.FilePath!,
-                mode,
-                mapName,
-                _createOrOpen ? totalSize : 0,
-                MemoryMappedFileAccess.ReadWrite);
+            throw new InvalidOperationException(
+                $"Existing shared memory '{path}' has size {actualLength} but {totalSize} was requested. " +
+                "Either match the existing size or remove the file.");
         }
 
         /// <summary>
@@ -535,40 +608,71 @@ namespace InterprocessMemory
         private void CreateMmfFromLinuxDevShm(long totalSize)
         {
             _backingFilePath = "/dev/shm/" + _name;
-            FileMode mode = _createOrOpen ? FileMode.OpenOrCreate : FileMode.Open;
-            _backingFile = new FileStream(_backingFilePath,
-                mode, FileAccess.ReadWrite, FileShare.ReadWrite);
 
-            if (_backingFile.Length == 0)
+            // FileMode.CreateNew lets the kernel decide who creates the file. Two processes that both saw an
+            // empty file used to take the creator's role, and the one that then failed (another capacity,
+            // another region kind) deleted the file the other was already using, which split one name into
+            // two independent regions. Only the process that created the file may size it, and only it
+            // unlinks the file when construction fails.
+            for (int attempt = 0; _backingFile == null; attempt++)
             {
-                if (!_createOrOpen)
+                if (_createOrOpen)
                 {
-                    _backingFile.Dispose();
-                    _backingFile = null;
-                    throw new InvalidDataException(
-                        $"Existing shared memory '{_backingFilePath}' is empty and has not been initialized.");
+                    try
+                    {
+                        _backingFile = new FileStream(_backingFilePath,
+                            FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite);
+                        _createdBackingFile = true;
+                        break;
+                    }
+                    catch (IOException) when (File.Exists(_backingFilePath))
+                    {
+                        // Somebody else created it first: open it below.
+                    }
                 }
 
-                // Fresh region — set the size up front. Subsequent openers will see this length
-                // and skip the SetLength call below. Mark that WE were the process to size this
-                // file: if construction fails between here and AcquirePointer, Cleanup will
-                // unlink the file so the next caller doesn't trip over a half-initialized blob.
-                _createdBackingFile = true;
+                try
+                {
+                    _backingFile = new FileStream(_backingFilePath,
+                        FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+                }
+                catch (FileNotFoundException) when (_createOrOpen && attempt < 3)
+                {
+                    // Removed between the two attempts: try to create it again.
+                }
+            }
 
+            if (_createdBackingFile)
+            {
                 // SetLength only reserves address space in tmpfs. If the filesystem cannot hold the region,
                 // the first write past what fits kills the process with SIGBUS, which cannot be caught.
                 EnsureFreeSpace("/dev/shm", totalSize, _name);
                 _backingFile.SetLength(totalSize);
             }
-            else if (_createOrOpen && _backingFile.Length != totalSize)
+            else
             {
-                // Mirror the Windows behavior where capacity mismatch on open throws.
+                // The creator makes the file empty and sizes it a moment later; wait for that.
+                WaitForLength(_backingFile, OpenerWaitMs);
+
                 long actualLen = _backingFile.Length;
-                _backingFile.Dispose();
-                _backingFile = null;
-                throw new InvalidOperationException(
-                    $"Existing shared memory '{_backingFilePath}' has size {actualLen} but {totalSize} was requested. " +
-                    $"Either match the existing size or remove the file.");
+                if (actualLen == 0)
+                {
+                    _backingFile.Dispose();
+                    _backingFile = null;
+                    throw new InvalidDataException(
+                        $"Existing shared memory '{_backingFilePath}' is empty and has not been initialized. " +
+                        "If its creator crashed, stop every user of the region and call MemoryRegion.Remove(name).");
+                }
+
+                if (_createOrOpen && actualLen != totalSize)
+                {
+                    // Mirror the Windows behavior where capacity mismatch on open throws.
+                    _backingFile.Dispose();
+                    _backingFile = null;
+                    throw new InvalidOperationException(
+                        $"Existing shared memory '{_backingFilePath}' has size {actualLen} but {totalSize} was requested. " +
+                        $"Either match the existing size or remove the file.");
+                }
             }
 
             _mmf = MemoryMappedFile.CreateFromFile(
@@ -579,6 +683,30 @@ namespace InterprocessMemory
                 HandleInheritability.None,
                 leaveOpen: false);              // MMF takes ownership of the FileStream
             _backingFile = null;                // ownership transferred — don't double-dispose
+        }
+
+        private static void WaitForLength(FileStream file, int timeoutMs)
+        {
+            var sw = Stopwatch.StartNew();
+            while (file.Length == 0 && sw.ElapsedMilliseconds < timeoutMs)
+                Thread.Sleep(1);
+        }
+
+        /// <summary>
+        /// Throws the exception for a header whose magic number is neither the version 3 one nor the marker of a
+        /// header that is still being written.
+        /// </summary>
+        private void ThrowForUnexpectedMagic(uint observed)
+        {
+            if (observed == 0x48504D53)
+            {
+                throw new InvalidDataException(
+                    $"Memory region '{_name}' uses the 2.x format. Stop all 2.x processes, " +
+                    "remove the old region, and recreate it with InterprocessMemory 3.0.");
+            }
+
+            throw new InvalidDataException(
+                $"Memory region '{_name}' has an invalid version 3 header (magic=0x{observed:X8}).");
         }
 
         /// <summary>
@@ -694,15 +822,15 @@ namespace InterprocessMemory
                     break;
                 if (observed != SharedHeader.MagicInitializing)
                 {
-                    if (observed == 0x48504D53)
+                    // OpenExisting can arrive after the creator made the file but before its first header
+                    // write. That is not a corrupt header: wait for the creator.
+                    if (observed == 0 && !_createOrOpen && sw.ElapsedMilliseconds < OpenerWaitMs)
                     {
-                        throw new InvalidDataException(
-                            $"Memory region '{_name}' uses the 2.x format. Stop all 2.x processes, " +
-                            "remove the old region, and recreate it with InterprocessMemory 3.0.");
+                        Thread.Sleep(1);
+                        continue;
                     }
 
-                    throw new InvalidDataException(
-                        $"Memory region '{_name}' has an invalid version 3 header (magic=0x{observed:X8}).");
+                    ThrowForUnexpectedMagic(observed);
                 }
                 if (sw.Elapsed > TimeSpan.FromSeconds(5))
                     throw new TimeoutException(
@@ -948,7 +1076,7 @@ namespace InterprocessMemory
             ValidateOffset(offset, length);
 
             byte* ptr = GetDataPtr() + offset;
-            return new UnmanagedMemoryManager<byte>(ptr, length).Memory;
+            return new UnmanagedMemoryManager<byte>(ptr, length, owner: this).Memory;
         }
 
         /// <inheritdoc/>
@@ -1229,6 +1357,12 @@ namespace InterprocessMemory
             {
                 using var process = Process.GetProcessById(ownerPid);
                 if (process.HasExited)
+                    return true;
+
+                // A process that was killed but not yet reaped by its parent (a container whose init does not
+                // reap, a supervisor that is busy) still exists for GetProcessById and HasExited, but it holds
+                // nothing any more.
+                if (OperatingSystem.IsLinux() && IsLinuxZombie(ownerPid))
                     return true;
 
                 // PID-reuse defense: even when a process with this PID exists, it might be an

@@ -41,6 +41,21 @@ Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATIO
 - The timeout overloads of `ConcurrentQueue<T>` and `ConcurrentMessageQueue` counted a failed enqueue or
   dequeue on every poll (about 1,800 for 4 s of waiting). A call now counts once, when it gives up, and
   not at all when it succeeds after waiting. They also no longer allocate a `Stopwatch` per call.
+- `OpenExisting` racing the process that creates the region reported "invalid header" or "empty" about once in
+  eleven races instead of waiting the few microseconds until the creator had written the header. It waits up
+  to two seconds for a region that is still being created.
+- Linux: two processes calling `CreateOrOpen` for a new name at the same moment both became the creator, and
+  the one that then failed (another capacity or region kind) deleted the file the other was using, so later
+  openers got a second, separate region. `FileMode.CreateNew` decides who creates and sizes the file, and
+  only that process removes it when construction fails.
+- `MemoryRegionOptions.FilePath`: an existing file of another size was grown to the requested capacity before
+  anything checked it, which left it permanently resized and could never be undone. It is now rejected
+  without being modified (an older format or a foreign file is reported as such), and the file is opened
+  with sharing so that a second process can map it.
+- `MemoryRegion.GetMemory` returned a `Memory<byte>` that did not keep the region reachable; a caller that
+  dropped the region and kept the memory let the finalizer unmap it, which ended the process.
+- Linux: a lock owner that had been killed but not yet reaped by its parent (a zombie) counted as alive. It is
+  recognised as gone now.
 - A waiting reader now recovers a write lock whose owner process died, like a waiting writer does. It used
   to wait for its whole timeout.
 - Disposing a region while another thread waits for one of its locks no longer crashes the process;
