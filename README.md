@@ -233,6 +233,15 @@ a guard after the original, or releasing the guards in another order than last-t
 lock state is left untouched and the guard stays valid, so it can still be released properly. Disposing
 the instance while one of its guards is open on the calling thread releases that lock.
 
+### Schema versions
+
+`StructuredMemory<TSchema>.OpenExisting(name, schema, compatibility)` accepts a region of another schema
+version according to `SchemaCompatibility`: `Strict` needs the same version, `Forward` also accepts a region
+written by a newer version (it may be larger: the older schema uses its first fields, so a newer version must
+only append fields), `Backward` a region written by an older version, `Full` both. A region is never smaller
+than the schema that opens it. The library does not compare the field layout of two different versions; a schema
+that changes more than appended fields has to say so in `IVersionedSchema.IsCompatibleWith`.
+
 ## Shared arrays
 
 ```csharp

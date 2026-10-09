@@ -33,6 +33,12 @@ Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATIO
   waiter looked the owner's pid up in its own namespace and did not find it. The owner now records its PID
   namespace (the inode of `/proc/self/ns/pid`, in the reserved part of the header) and a waiter in another
   namespace no longer declares the owner dead from its pid.
+- `StructuredMemory<T>.OpenExisting` checked the size of the region before the schema version, so no
+  `SchemaCompatibility` mode could open a region of another size (`Forward` and `Full` only worked when an
+  appended field fitted in the padding) and `Strict` reported a size mismatch instead of the version. The
+  version is checked first now; for different versions the region must only be at least as large as the
+  schema, so an older schema can read a larger region written by a newer one. The same version still needs
+  the exact size. See "Schema versions" in the README.
 - The lock guards of `StructuredMemory<T>` and `SharedArray<T>` now remember the depth at which they were taken.
   Disposing a copy of a guard a second time used to decrement the thread's depth again, so a thread inside an
   outer lock believed it held none and tried to take the lock it already held; releasing a write guard before

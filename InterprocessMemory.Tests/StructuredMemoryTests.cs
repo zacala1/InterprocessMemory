@@ -318,11 +318,14 @@ public class StructuredMemoryTests
         using var memory1 = new StructuredMemory<VersionedSchemaV1>(uniqueName, schemaV1, create: true);
         memory1.Write(VersionedSchemaV1.IntField, 42);
 
-        // Try to open with V2 in strict mode - should throw
+        // Try to open with V2 in strict mode - should throw, and because the VERSION differs. This used to
+        // throw InvalidDataException for the size of the region, which was checked before the version, so
+        // the test passed without the compatibility mode ever being consulted.
         var schemaV2 = new VersionedSchemaV2();
-        Assert.Throws<InvalidDataException>(() =>
+        var error = Assert.Throws<InvalidOperationException>(() =>
             new StructuredMemory<VersionedSchemaV2>(
                 uniqueName, schemaV2, create: false, compatibility: SchemaCompatibility.Strict));
+        Assert.That(error!.Message, Does.Contain("version mismatch"));
     }
 
     [Test]

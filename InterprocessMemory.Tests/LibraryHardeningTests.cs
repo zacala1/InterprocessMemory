@@ -1033,6 +1033,104 @@ public class LibraryHardeningTests
         }
     }
 
+    public struct EvolvingV1 : IVersionedSchema
+    {
+        public int Version => 1;
+        public bool IsCompatibleWith(int otherVersion) => true;
+
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Scalar<int>("A");
+            yield return FieldDefinition.Scalar<double>("B");
+        }
+    }
+
+    // The same fields as V1 plus an appended one that makes the region larger.
+    public struct EvolvingV2 : IVersionedSchema
+    {
+        public int Version => 2;
+        public bool IsCompatibleWith(int otherVersion) => true;
+
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Scalar<int>("A");
+            yield return FieldDefinition.Scalar<double>("B");
+            yield return FieldDefinition.String("Label", 100);
+        }
+    }
+
+    [Test]
+    public void StructuredMemory_OlderSchema_CanOpenALargerRegionOfANewerVersion_WithForwardCompatibility()
+    {
+        // The size check ran before the version check, so no compatibility mode could ever open a region of
+        // a different size: Forward and Full only worked when the appended field fitted in the padding.
+        string name = N("EvolveForward");
+        using var writer = StructuredMemory<EvolvingV2>.CreateOrOpen(name, new EvolvingV2());
+        writer.Write("A", 42);
+        writer.Write("B", 2.5);
+
+        using var reader = StructuredMemory<EvolvingV1>.OpenExisting(name, new EvolvingV1(), SchemaCompatibility.Forward);
+        Assert.That(reader.Read<int>("A"), Is.EqualTo(42));
+        Assert.That(reader.Read<double>("B"), Is.EqualTo(2.5));
+
+        using var full = StructuredMemory<EvolvingV1>.OpenExisting(name, new EvolvingV1(), SchemaCompatibility.Full);
+        Assert.That(full.Read<int>("A"), Is.EqualTo(42));
+    }
+
+    [Test]
+    public void StructuredMemory_StrictOrWrongDirection_ReportsTheVersionMismatchNotTheSize()
+    {
+        string name = N("EvolveStrict");
+        using var writer = StructuredMemory<EvolvingV2>.CreateOrOpen(name, new EvolvingV2());
+
+        var strict = Assert.Throws<InvalidOperationException>(() =>
+            StructuredMemory<EvolvingV1>.OpenExisting(name, new EvolvingV1()));
+        Assert.That(strict!.Message, Does.Contain("version mismatch"));
+
+        // Backward means "the region is older than the schema"; this region is newer.
+        Assert.Throws<InvalidOperationException>(() =>
+            StructuredMemory<EvolvingV1>.OpenExisting(name, new EvolvingV1(), SchemaCompatibility.Backward));
+    }
+
+    [Test]
+    public void StructuredMemory_NewerSchema_CannotOpenASmallerRegion()
+    {
+        // A region cannot be smaller than the schema that opens it, whatever the mode says: failing here is
+        // better than failing at the first read of an appended field.
+        string name = N("EvolveBackward");
+        using var writer = StructuredMemory<EvolvingV1>.CreateOrOpen(name, new EvolvingV1());
+
+        var error = Assert.Throws<InvalidDataException>(() =>
+            StructuredMemory<EvolvingV2>.OpenExisting(name, new EvolvingV2(), SchemaCompatibility.Backward));
+        Assert.That(error!.Message, Does.Contain("contains only"));
+
+        Assert.Throws<InvalidDataException>(() =>
+            StructuredMemory<EvolvingV2>.OpenExisting(name, new EvolvingV2(), SchemaCompatibility.Full));
+    }
+
+    [Test]
+    public void StructuredMemory_SameVersionOfAnotherSize_IsStillRejectedAsASizeMismatch()
+    {
+        string name = N("EvolveSameVersion");
+        using var writer = StructuredMemory<EvolvingV1>.CreateOrOpen(name, new EvolvingV1());
+
+        Assert.Throws<InvalidDataException>(() =>
+            StructuredMemory<SameVersionDifferentSize>.OpenExisting(name, new SameVersionDifferentSize(), SchemaCompatibility.Full));
+    }
+
+    public struct SameVersionDifferentSize : IVersionedSchema
+    {
+        public int Version => 1;
+        public bool IsCompatibleWith(int otherVersion) => true;
+
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Scalar<int>("A");
+            yield return FieldDefinition.Scalar<double>("B");
+            yield return FieldDefinition.String("Extra", 100);
+        }
+    }
+
     public struct BlobSchema : IMemorySchema
     {
         public const string Data = "Data";

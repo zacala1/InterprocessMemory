@@ -38,6 +38,7 @@ namespace InterprocessMemory
         private static readonly TimeSpan DefaultLockTimeout = TimeSpan.FromSeconds(5);
 
         private readonly IMemoryRegion _buffer;
+        private readonly long _totalSize; // bytes the schema needs: header plus all fields
         // Address of the first byte after the region header, valid until Dispose; used for the
         // lock-free scalar path (AtomicAccess).
         private readonly byte* _dataBase;
@@ -120,6 +121,7 @@ namespace InterprocessMemory
             _schemaHash = ComputeSchemaHash();
 
             long totalSize = SchemaHeaderSize + CalculateTotalSize(_fields);
+            _totalSize = totalSize;
 
             // No statistics are exposed here, so skip the region's per-call counters.
             var regionOptions = new MemoryRegionOptions { EnableStatistics = false };
@@ -131,15 +133,10 @@ namespace InterprocessMemory
             }
             else
             {
+                // The size is checked in ValidateSchemaCompatibility, once the stored schema version is
+                // known: a region written by a newer version of the schema is legitimately larger.
                 _buffer = MemoryRegion.OpenExisting(
                     name, regionOptions, RegionKind.StructuredMemory);
-                if (_buffer.Capacity != totalSize)
-                {
-                    _buffer.Dispose();
-                    throw new InvalidDataException(
-                        $"Structured-memory size mismatch: schema requires {totalSize} bytes, " +
-                        $"but the region contains {_buffer.Capacity} bytes.");
-                }
             }
 
             try
@@ -888,6 +885,15 @@ namespace InterprocessMemory
             int storedFieldCount = BitConverter.ToInt32(header.Slice(8));
             int storedHash = BitConverter.ToInt32(header.Slice(12));
 
+            long regionSize = _buffer.Capacity;
+
+            if (StoredSchemaVersion == SchemaVersion && regionSize != _totalSize)
+            {
+                throw new InvalidDataException(
+                    $"Structured-memory size mismatch: schema requires {_totalSize} bytes, " +
+                    $"but the region contains {regionSize} bytes.");
+            }
+
             if (StoredSchemaVersion == SchemaVersion && storedFieldCount != _fields.Count)
             {
                 throw new InvalidOperationException(
@@ -911,6 +917,16 @@ namespace InterprocessMemory
                     throw new InvalidOperationException(
                         $"Schema version mismatch: expected {SchemaVersion}, found {StoredSchemaVersion}. " +
                         $"Compatibility mode: {_compatibility}");
+                }
+
+                // Whatever the versions are, the schema can only use what the region holds. A region written
+                // by a newer schema that appended fields is larger and an older reader uses its prefix;
+                // a region written by an older, smaller schema cannot hold the fields of this one.
+                if (regionSize < _totalSize)
+                {
+                    throw new InvalidDataException(
+                        $"Structured-memory size mismatch: schema version {SchemaVersion} requires {_totalSize} bytes, " +
+                        $"but the region (schema version {StoredSchemaVersion}) contains only {regionSize} bytes.");
                 }
 
                 // Schema-side veto: if the schema itself can declare incompatibility for this
