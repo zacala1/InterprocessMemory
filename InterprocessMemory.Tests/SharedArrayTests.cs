@@ -393,6 +393,49 @@ public class SharedArrayTests
         guard.Dispose();   // a guard that outlives its array is harmless
     }
 
+    // Larger than a managed array may hold per element (64 KiB), and a mid-sized one that is batched.
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, Size = 100_000)]
+    public struct Big100K { public int Tag; }
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, Size = 20_000)]
+    public struct Mid20K { public int Tag; }
+
+    [Test, Timeout(60000)]
+    public void FillAndClear_ElementsOf64KiBOrMore_Work()
+    {
+        // Fill's staging buffer was a T[] and an ArrayPool<T> rental. A managed array cannot hold elements of
+        // 64 KiB or more, so the method failed to load with a TypeLoadException before writing anything.
+        using var array = SharedArray<Big100K>.CreateOrOpen(LockName("Fill100K"), 3);
+
+        array.Fill(new Big100K { Tag = 7 });
+        Assert.That(array[0].Tag, Is.EqualTo(7));
+        Assert.That(array[1].Tag, Is.EqualTo(7));
+        Assert.That(array[2].Tag, Is.EqualTo(7));
+
+        array.Fill(new Big100K { Tag = 9 }, 1, 1);
+        Assert.That(array[0].Tag, Is.EqualTo(7));
+        Assert.That(array[1].Tag, Is.EqualTo(9));
+        Assert.That(array[2].Tag, Is.EqualTo(7));
+
+        array.Clear();
+        Assert.That(array[0].Tag, Is.EqualTo(0));
+        Assert.That(array[1].Tag, Is.EqualTo(0));
+        Assert.That(array[2].Tag, Is.EqualTo(0));
+    }
+
+    [Test, Timeout(60000)]
+    public void FillAndClear_MidSizedElements_AreBatchedWithinTheByteBudget()
+    {
+        using var array = SharedArray<Mid20K>.CreateOrOpen(LockName("Fill20K"), 10);
+
+        array.Fill(new Mid20K { Tag = 5 });
+        for (int i = 0; i < 10; i++)
+            Assert.That(array[i].Tag, Is.EqualTo(5), $"element {i}");
+
+        array.Clear();
+        Assert.That(array[9].Tag, Is.EqualTo(0));
+    }
+
     // Two bytes: the width that used to be copied as a one byte store plus a two byte store.
     public struct Pair2 { public byte X, Y; }
 

@@ -402,10 +402,34 @@ namespace InterprocessMemory
             }
         }
 
+        // A batch of this many bytes is the most that is staged at a time.
+        private const int FillBatchBytes = 64 * 1024;
+
         private void FillCore(T value, int startIndex, int count)
         {
-            // Batch fill: create a filled buffer and write in chunks
-            int batchCount = Math.Min(count, 4096);
+            // A managed array cannot hold elements of 64 KiB or more, and a method that so much as mentions
+            // T[] or ArrayPool<T> for such a T does not even load (TypeLoadException when it is compiled,
+            // before a single element is written). A batch of such elements would be one or two elements
+            // anyway, so they are copied one by one from a method that has no array in it.
+            if (_elementSize >= FillBatchBytes / 2)
+                FillOneByOne(value, startIndex, count);
+            else
+                FillInBatches(value, startIndex, count);
+        }
+
+        private void FillOneByOne(T value, int startIndex, int count)
+        {
+            ReadOnlySpan<T> one = MemoryMarshal.CreateReadOnlySpan(ref value, 1);
+            for (int i = 0; i < count; i++)
+                CopyFromCore(startIndex + i, one);
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void FillInBatches(T value, int startIndex, int count)
+        {
+            // Batch fill: create a filled buffer and write in chunks. The batch is bounded in bytes as well as
+            // in elements: 4096 elements of 32 KiB would be a 128 MiB temporary buffer on every call.
+            int batchCount = Math.Min(count, Math.Min(4096, Math.Max(1, FillBatchBytes / _elementSize)));
             int batchBytes = batchCount * _elementSize;
 
             // Use stackalloc for small batches, ArrayPool for large.

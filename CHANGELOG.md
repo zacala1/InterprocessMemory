@@ -39,6 +39,9 @@ Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATIO
   version is checked first now; for different versions the region must only be at least as large as the
   schema, so an older schema can read a larger region written by a newer one. The same version still needs
   the exact size. See "Schema versions" in the README.
+- `SharedArray<T>.Fill` and `Clear` threw `TypeLoadException` for elements of 64 KiB or more (a managed array
+  cannot hold them, and the staging buffer was a `T[]`) and staged up to 4096 elements per batch whatever their
+  size, 128 MiB for 32 KiB elements. Large elements are written one by one, and a batch is limited to 64 KiB.
 - The lock guards of `StructuredMemory<T>` and `SharedArray<T>` now remember the depth at which they were taken.
   Disposing a copy of a guard a second time used to decrement the thread's depth again, so a thread inside an
   outer lock believed it held none and tried to take the lock it already held; releasing a write guard before
