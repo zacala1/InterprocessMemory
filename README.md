@@ -228,7 +228,10 @@ fields form one transaction.
 
 The lock guards returned by `AcquireWriteLock()` and `AcquireReadLock()` must be disposed on the
 thread that acquired them. Keep the guarded scope synchronous: an `await` inside it lets the guard
-be disposed on another thread, which throws `SynchronizationLockException`.
+be disposed on another thread, which throws `SynchronizationLockException`. So does disposing a *copy* of
+a guard after the original, or releasing the guards in another order than last-taken-first-released: the
+lock state is left untouched and the guard stays valid, so it can still be released properly. Disposing
+the instance while one of its guards is open on the calling thread releases that lock.
 
 ## Shared arrays
 

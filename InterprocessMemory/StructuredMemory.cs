@@ -53,8 +53,6 @@ namespace InterprocessMemory
 
         // A method group is converted to a new delegate on every use, which allocated on each
         // automatically locked read or write. Convert once per instance instead.
-        private readonly Action _decrementWriteLockDepth;
-        private readonly Action _decrementReadLockDepth;
 
         /// <summary>
         /// Gets the schema instance defining the memory layout
@@ -110,8 +108,6 @@ namespace InterprocessMemory
 
             _schema = schema;
             _compatibility = compatibility;
-            _decrementWriteLockDepth = DecrementWriteLockDepth;
-            _decrementReadLockDepth = DecrementReadLockDepth;
             _fields = BuildFieldMetadata(schema);
 
             if (_fields.Count == 0)
@@ -765,10 +761,7 @@ namespace InterprocessMemory
 
             // Reentrant: if already holding write lock, just increment depth
             if (_writeLockDepth.Value > 0)
-            {
-                IncrementWriteLockDepth();
-                return new WriteLock(null, _decrementWriteLockDepth);
-            }
+                return new WriteLock(this, null, ++_writeLockDepth.Value);
 
             // The write lock waits for every reader to leave, and this thread is one of them. Waiting would
             // block all other processes (new readers and writers queue behind the pending writer) until the
@@ -780,8 +773,7 @@ namespace InterprocessMemory
             if (!_buffer.TryAcquireWriteLock(timeout))
                 throw new TimeoutException($"Failed to acquire write lock within {timeout}");
 
-            IncrementWriteLockDepth();
-            return new WriteLock(_buffer, _decrementWriteLockDepth);
+            return new WriteLock(this, _buffer, ++_writeLockDepth.Value);
         }
 
         /// <summary>
@@ -815,16 +807,12 @@ namespace InterprocessMemory
 
             // Reentrant: if already holding any lock, just increment depth
             if (_readLockDepth.Value > 0 || _writeLockDepth.Value > 0)
-            {
-                IncrementReadLockDepth();
-                return new ReadLock(null, _decrementReadLockDepth);
-            }
+                return new ReadLock(this, null, ++_readLockDepth.Value);
 
             if (!_buffer.TryAcquireReadLock(timeout))
                 throw new TimeoutException($"Failed to acquire read lock within {timeout}");
 
-            IncrementReadLockDepth();
-            return new ReadLock(_buffer, _decrementReadLockDepth);
+            return new ReadLock(this, _buffer, ++_readLockDepth.Value);
         }
 
         /// <summary>
@@ -1137,21 +1125,6 @@ namespace InterprocessMemory
         private int GetWriteLockDepth() => _writeLockDepth.Value;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void IncrementWriteLockDepth() => _writeLockDepth.Value++;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void DecrementWriteLockDepth() => _writeLockDepth.Value--;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private int GetReadLockDepth() => _readLockDepth.Value;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void IncrementReadLockDepth() => _readLockDepth.Value++;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void DecrementReadLockDepth() => _readLockDepth.Value--;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool IsHoldingAnyLock() => _writeLockDepth.Value > 0 || _readLockDepth.Value > 0;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1184,6 +1157,21 @@ namespace InterprocessMemory
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
+            // A guard that is still open on this thread would otherwise leave the cross-process lock held
+            // until the process ends (its owner is alive, so no waiter would recover it). Guards held by
+            // other threads cannot be reached from here: stop and join those threads before disposing.
+            try
+            {
+                if (_writeLockDepth.Value > 0)
+                    _buffer.ReleaseWriteLock();
+                else if (_readLockDepth.Value > 0)
+                    _buffer.ReleaseReadLock();
+            }
+            catch (Exception ex) when (ex is SynchronizationLockException or ObjectDisposedException)
+            {
+                // The lock was taken over (orphan recovery or ForceResetLocks) or the region is gone.
+            }
+
             _buffer?.Dispose();
             _writeLockDepth.Dispose();
             _readLockDepth.Dispose();
@@ -1198,27 +1186,74 @@ namespace InterprocessMemory
             }
         }
 
+        internal void ExitWriteLock(IMemoryRegion? regionToRelease, int depth)
+        {
+            // Dispose() already released what this thread held.
+            if (_disposed != 0)
+                return;
+
+            if (_writeLockDepth.Value != depth)
+                throw new SynchronizationLockException(
+                    "A write lock guard was disposed twice, out of order or on another thread. Nothing was released.");
+
+            // A read guard taken inside the write lock holds no region lock of its own; releasing the write
+            // lock under it would leave that guard reading without any protection.
+            if (regionToRelease != null && _readLockDepth.Value > 0)
+                throw new SynchronizationLockException(
+                    "The write lock cannot be released while a read lock guard taken inside it is still open. Nothing was released.");
+
+            try
+            {
+                regionToRelease?.ReleaseWriteLock();
+            }
+            finally
+            {
+                _writeLockDepth.Value = depth - 1;
+            }
+        }
+
+        internal void ExitReadLock(IMemoryRegion? regionToRelease, int depth)
+        {
+            if (_disposed != 0)
+                return;
+
+            if (_readLockDepth.Value != depth)
+                throw new SynchronizationLockException(
+                    "A read lock guard was disposed twice, out of order or on another thread. Nothing was released.");
+
+            try
+            {
+                regionToRelease?.ReleaseReadLock();
+            }
+            finally
+            {
+                _readLockDepth.Value = depth - 1;
+            }
+        }
+
         /// <summary>
-        /// RAII wrapper for write lock with double-dispose and reentrant safety.
-        /// When acquired via reentrant path, buffer is null and Dispose only decrements the depth counter.
+        /// RAII wrapper for the write lock. A reentrant acquisition holds no region of its own and only
+        /// decrements the depth when it is disposed.
         ///
-        /// <para><b>Do not copy this struct.</b> The double-dispose guard (an
-        /// <c>Interlocked.Exchange</c> on <c>_onDispose</c>) operates on the struct's own field,
-        /// not a shared one. Copying the struct duplicates the field, and each copy's
-        /// <c>Dispose()</c> will independently decrement the lock depth — corrupting the
-        /// reentrant depth counter and potentially releasing the underlying buffer lock twice.
-        /// Always consume via <c>using var ... = AcquireWriteLock(...)</c>, never <c>var copy = lock;</c>.</para>
+        /// <para>Disposing the same variable twice has no further effect. A <i>copy</i> of the guard is a
+        /// different matter: it remembers the depth at which the lock was taken, and disposing it after the
+        /// original (or in any other order than last-acquired-first-released) throws
+        /// <see cref="SynchronizationLockException"/> without touching the lock state, instead of silently
+        /// corrupting the depth counter of the thread. Consume it with <c>using var ... =
+        /// AcquireWriteLock(...)</c>.</para>
         /// </summary>
         public struct WriteLock : IDisposable
         {
-            private IMemoryRegion? _buffer;
-            private Action? _onDispose;
+            private StructuredMemory<TSchema>? _owner;
+            private readonly IMemoryRegion? _regionToRelease;
+            private readonly int _depth;
             private readonly int _ownerThreadId;
 
-            internal WriteLock(IMemoryRegion? buffer, Action? onDispose = null)
+            internal WriteLock(StructuredMemory<TSchema> owner, IMemoryRegion? regionToRelease, int depth)
             {
-                _buffer = buffer;
-                _onDispose = onDispose;
+                _owner = owner;
+                _regionToRelease = regionToRelease;
+                _depth = depth;
                 _ownerThreadId = Environment.CurrentManagedThreadId;
             }
 
@@ -1227,11 +1262,13 @@ namespace InterprocessMemory
             /// </summary>
             /// <exception cref="SynchronizationLockException">
             /// Called on a different thread than the one that acquired the lock, which is what happens
-            /// when the guarded scope contains an <c>await</c>. Nothing is released in that case.
+            /// when the guarded scope contains an <c>await</c>, or called on a copy of a guard that was
+            /// already released, or out of order. Nothing is released in these cases.
             /// </exception>
             public void Dispose()
             {
-                if (_onDispose == null)
+                StructuredMemory<TSchema>? owner = _owner;
+                if (owner is null)
                     return;
 
                 // The lock and its reentrancy depth belong to the acquiring thread. Releasing from
@@ -1241,40 +1278,28 @@ namespace InterprocessMemory
                         "A write lock guard must be disposed on the thread that acquired it. " +
                         "Do not await inside a lock scope.");
 
-                var onDispose = Interlocked.Exchange(ref _onDispose, null);
-                if (onDispose != null)
-                {
-                    try
-                    {
-                        _buffer?.ReleaseWriteLock();
-                    }
-                    finally
-                    {
-                        _buffer = null;
-                        onDispose.Invoke();
-                    }
-                }
+                // A refused release (a copy, or an order that would leave a read guard unprotected) throws
+                // before anything changes, and the guard stays valid so that it can be released properly.
+                owner.ExitWriteLock(_regionToRelease, _depth);
+                _owner = null;
             }
         }
 
         /// <summary>
-        /// RAII wrapper for read lock with double-dispose and reentrant safety.
-        /// When acquired via reentrant path, buffer is null and Dispose only decrements the depth counter.
-        ///
-        /// <para><b>Do not copy this struct.</b> Same reasoning as <see cref="WriteLock"/> —
-        /// copies will each run <c>Dispose()</c>, double-decrementing the reentrant depth and
-        /// potentially releasing the underlying buffer lock twice.</para>
+        /// RAII wrapper for the read lock; see <see cref="WriteLock"/> for the rules about copies and order.
         /// </summary>
         public struct ReadLock : IDisposable
         {
-            private IMemoryRegion? _buffer;
-            private Action? _onDispose;
+            private StructuredMemory<TSchema>? _owner;
+            private readonly IMemoryRegion? _regionToRelease;
+            private readonly int _depth;
             private readonly int _ownerThreadId;
 
-            internal ReadLock(IMemoryRegion? buffer, Action? onDispose = null)
+            internal ReadLock(StructuredMemory<TSchema> owner, IMemoryRegion? regionToRelease, int depth)
             {
-                _buffer = buffer;
-                _onDispose = onDispose;
+                _owner = owner;
+                _regionToRelease = regionToRelease;
+                _depth = depth;
                 _ownerThreadId = Environment.CurrentManagedThreadId;
             }
 
@@ -1282,12 +1307,14 @@ namespace InterprocessMemory
             /// Releases the read lock if not already released.
             /// </summary>
             /// <exception cref="SynchronizationLockException">
-            /// Called on a different thread than the one that acquired the lock. Nothing is released
-            /// in that case. See <see cref="WriteLock.Dispose"/>.
+            /// Called on a different thread than the one that acquired the lock, or on a copy of a guard that
+            /// was already released, or out of order. Nothing is released in these cases.
+            /// See <see cref="WriteLock.Dispose"/>.
             /// </exception>
             public void Dispose()
             {
-                if (_onDispose == null)
+                StructuredMemory<TSchema>? owner = _owner;
+                if (owner is null)
                     return;
 
                 if (Environment.CurrentManagedThreadId != _ownerThreadId)
@@ -1295,19 +1322,8 @@ namespace InterprocessMemory
                         "A read lock guard must be disposed on the thread that acquired it. " +
                         "Do not await inside a lock scope.");
 
-                var onDispose = Interlocked.Exchange(ref _onDispose, null);
-                if (onDispose != null)
-                {
-                    try
-                    {
-                        _buffer?.ReleaseReadLock();
-                    }
-                    finally
-                    {
-                        _buffer = null;
-                        onDispose.Invoke();
-                    }
-                }
+                owner.ExitReadLock(_regionToRelease, _depth);
+                _owner = null;
             }
         }
 

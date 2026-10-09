@@ -967,6 +967,72 @@ public class LibraryHardeningTests
         GC.KeepAlive(memory);
     }
 
+    [Test, Timeout(30000)]
+    public void StructuredMemory_LockGuardCopyDisposedTwice_IsRefusedWithoutDisturbingTheLockState()
+    {
+        string name = N("GuardCopy");
+        using var memory = StructuredMemory<GuidSchema>.CreateOrOpen(name, new GuidSchema());
+        using var peer = StructuredMemory<GuidSchema>.OpenExisting(name, new GuidSchema());
+
+        using (memory.AcquireWriteLock())
+        {
+            var inner = memory.AcquireWriteLock();
+            var copy = inner;
+            inner.Dispose();
+
+            Assert.Throws<SynchronizationLockException>(() => copy.Dispose());
+
+            // Still inside the outer guard: an automatic lock must not try to take the region lock again.
+            memory.Write("Value", Guid.NewGuid());
+        }
+
+        Assert.That(Task.Run(() => { using (peer.AcquireWriteLock(TimeSpan.FromSeconds(2))) { } }).Wait(TimeSpan.FromSeconds(5)), Is.True);
+    }
+
+    [Test, Timeout(30000)]
+    public void StructuredMemory_WriteReleasedBeforeTheReadGuardInsideIt_IsRefusedAndTheLockStaysHeld()
+    {
+        string name = N("GuardOrder");
+        using var memory = StructuredMemory<GuidSchema>.CreateOrOpen(name, new GuidSchema());
+        using var peer = StructuredMemory<GuidSchema>.OpenExisting(name, new GuidSchema());
+
+        var write = memory.AcquireWriteLock();
+        var read = memory.AcquireReadLock();
+
+        Assert.Throws<SynchronizationLockException>(() => write.Dispose());
+        Assert.That(Task.Run(() => peer.Read<Guid>("Value")).Wait(TimeSpan.FromMilliseconds(300)), Is.False,
+            "the write lock must still be held");
+
+        read.Dispose();
+        write.Dispose();
+        Assert.That(Task.Run(() => peer.Read<Guid>("Value")).Wait(TimeSpan.FromSeconds(5)), Is.True);
+    }
+
+    [Test, Timeout(30000)]
+    public void StructuredMemory_DisposeWithAnOpenGuardOnThisThread_DoesNotLeaveTheCrossProcessLockHeld()
+    {
+        string name = N("DisposeOpenGuard");
+        var memory = StructuredMemory<GuidSchema>.CreateOrOpen(name, new GuidSchema());
+        using var peer = StructuredMemory<GuidSchema>.OpenExisting(name, new GuidSchema());
+
+        var guard = memory.AcquireWriteLock();
+        memory.Dispose();
+
+        Assert.That(Task.Run(() => { using (peer.AcquireWriteLock(TimeSpan.FromSeconds(2))) { } }).Wait(TimeSpan.FromSeconds(5)), Is.True,
+            "the lock was still held after the instance was disposed");
+
+        Assert.DoesNotThrow(() => guard.Dispose(), "a guard that outlives its instance is harmless");
+    }
+
+    // A 16 byte field: written and read under the shared lock, which is what the guard tests need.
+    public struct GuidSchema : IMemorySchema
+    {
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Scalar<Guid>("Value");
+        }
+    }
+
     public struct BlobSchema : IMemorySchema
     {
         public const string Data = "Data";

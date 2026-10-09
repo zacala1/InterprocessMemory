@@ -33,6 +33,14 @@ Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATIO
   waiter looked the owner's pid up in its own namespace and did not find it. The owner now records its PID
   namespace (the inode of `/proc/self/ns/pid`, in the reserved part of the header) and a waiter in another
   namespace no longer declares the owner dead from its pid.
+- The lock guards of `StructuredMemory<T>` and `SharedArray<T>` now remember the depth at which they were taken.
+  Disposing a copy of a guard a second time used to decrement the thread's depth again, so a thread inside an
+  outer lock believed it held none and tried to take the lock it already held; releasing a write guard before
+  a read guard taken inside it removed the protection under that read guard. Both throw
+  `SynchronizationLockException` now, before anything changes, and the guard stays valid.
+- Disposing a `StructuredMemory<T>` or `SharedArray<T>` while one of its guards was open on the calling thread
+  left the cross-process lock held until the process ended (its owner was alive, so nobody recovered it). It
+  releases that lock now; a guard that outlives its instance can still be disposed.
 - `StructuredMemory<T>.AcquireWriteLock()` called while the thread holds a read guard set the writer flag and
   waited for that thread's own read lock, blocking every other process until the timeout. It now throws
   `InvalidOperationException` at once, like the automatic write lock and `SharedArray<T>` do.

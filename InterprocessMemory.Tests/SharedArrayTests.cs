@@ -321,6 +321,78 @@ public class SharedArrayTests
         Assert.That(torn, Is.EqualTo(0), $"{torn} of {reads} reads were torn");
     }
 
+    [Test, Timeout(30000)]
+    public void LockGuard_CopyDisposedTwice_IsRefusedWithoutDisturbingTheLockState()
+    {
+        // A ref struct can still be copied. The second Dispose used to decrement the thread's depth again,
+        // so the thread believed it held no lock while it was still inside an outer one.
+        string name = LockName("GuardCopy");
+        using var array = SharedArray<Wide64>.CreateOrOpen(name, 4);
+        using var peer = SharedArray<Wide64>.OpenExisting(name);
+
+        using (array.AcquireWriteLock())
+        {
+            var inner = array.AcquireWriteLock();
+            var copy = inner;
+            inner.Dispose();
+
+            bool refused = false;
+            try
+            { copy.Dispose(); }
+            catch (SynchronizationLockException) { refused = true; }
+            Assert.That(refused, Is.True);
+
+            // Still inside the outer guard: the wide indexer must not try to lock again.
+            array[0] = Wide(1);
+            Assert.That(array[0].A, Is.EqualTo(1));
+        }
+
+        // And the region lock was released exactly once: another instance gets it at once.
+        Assert.That(Task.Run(() => { using (peer.AcquireWriteLock(TimeSpan.FromSeconds(2))) { } }).Wait(TimeSpan.FromSeconds(5)), Is.True);
+    }
+
+    [Test, Timeout(30000)]
+    public void LockGuard_WriteReleasedBeforeTheReadGuardInsideIt_IsRefusedAndTheLockStaysHeld()
+    {
+        string name = LockName("GuardOrder");
+        using var array = SharedArray<Wide64>.CreateOrOpen(name, 4);
+        using var peer = SharedArray<Wide64>.OpenExisting(name);
+
+        var write = array.AcquireWriteLock();
+        var read = array.AcquireReadLock();
+
+        bool refused = false;
+        try
+        { write.Dispose(); }
+        catch (SynchronizationLockException) { refused = true; }
+        Assert.That(refused, Is.True);
+
+        // The write lock is still held, so another instance still cannot read a wide element.
+        Assert.That(Task.Run(() => peer[0]).Wait(TimeSpan.FromMilliseconds(300)), Is.False);
+
+        read.Dispose();
+        write.Dispose();
+        Assert.That(Task.Run(() => peer[0]).Wait(TimeSpan.FromSeconds(5)), Is.True);
+    }
+
+    [Test, Timeout(30000)]
+    public void Dispose_WithAnOpenGuardOnThisThread_DoesNotLeaveTheCrossProcessLockHeld()
+    {
+        // The owner of the leaked lock is this very process, which is alive, so no waiter would ever
+        // have recovered it: every other process timed out for as long as this one ran.
+        string name = LockName("DisposeOpenGuard");
+        var array = SharedArray<Wide64>.CreateOrOpen(name, 4);
+        using var peer = SharedArray<Wide64>.OpenExisting(name);
+
+        var guard = array.AcquireWriteLock();
+        array.Dispose();
+
+        Assert.That(Task.Run(() => { using (peer.AcquireWriteLock(TimeSpan.FromSeconds(2))) { } }).Wait(TimeSpan.FromSeconds(5)), Is.True,
+            "the lock was still held after the array was disposed");
+
+        guard.Dispose();   // a guard that outlives its array is harmless
+    }
+
     // Two bytes: the width that used to be copied as a one byte store plus a two byte store.
     public struct Pair2 { public byte X, Y; }
 

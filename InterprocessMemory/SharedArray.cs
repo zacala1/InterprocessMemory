@@ -248,27 +248,27 @@ namespace InterprocessMemory
 
         private T ReadElementLocked(int index)
         {
-            bool tookRegionLock = EnterRead(MemoryRegionOptions.DefaultLockTimeout);
+            LockTicket ticket = EnterRead(MemoryRegionOptions.DefaultLockTimeout);
             try
             {
                 return ReadElement(index);
             }
             finally
             {
-                ExitRead(tookRegionLock);
+                ExitRead(ticket);
             }
         }
 
         private void WriteElementLocked(int index, T value)
         {
-            bool tookRegionLock = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
+            LockTicket ticket = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
             try
             {
                 WriteElement(index, value);
             }
             finally
             {
-                ExitWrite(tookRegionLock);
+                ExitWrite(ticket);
             }
         }
 
@@ -297,14 +297,14 @@ namespace InterprocessMemory
                 return;
             }
 
-            bool tookRegionLock = EnterRead(MemoryRegionOptions.DefaultLockTimeout);
+            LockTicket ticket = EnterRead(MemoryRegionOptions.DefaultLockTimeout);
             try
             {
                 CopyToCore(startIndex, destination);
             }
             finally
             {
-                ExitRead(tookRegionLock);
+                ExitRead(ticket);
             }
         }
 
@@ -343,14 +343,14 @@ namespace InterprocessMemory
                 return;
             }
 
-            bool tookRegionLock = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
+            LockTicket ticket = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
             try
             {
                 CopyFromCore(startIndex, source);
             }
             finally
             {
-                ExitWrite(tookRegionLock);
+                ExitWrite(ticket);
             }
         }
 
@@ -391,14 +391,14 @@ namespace InterprocessMemory
                 return;
             }
 
-            bool tookRegionLock = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
+            LockTicket ticket = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
             try
             {
                 FillCore(value, startIndex, count);
             }
             finally
             {
-                ExitWrite(tookRegionLock);
+                ExitWrite(ticket);
             }
         }
 
@@ -507,7 +507,25 @@ namespace InterprocessMemory
         private bool IsHoldingWriteLock() => _writeLockDepth.Value > 0;
 
         /// <summary>Returns true when the region lock was taken, false for a reentrant acquisition.</summary>
-        private bool EnterWrite(TimeSpan timeout)
+        /// <summary>
+        /// Proof of one acquisition: the depth the thread was at right afterwards, and whether this
+        /// acquisition took the region lock (false for a reentrant one). Releasing checks the depth, so a copy
+        /// of a guard, a guard released out of order or one released on another thread is refused instead of
+        /// corrupting the bookkeeping of the thread that really holds the lock.
+        /// </summary>
+        internal readonly struct LockTicket
+        {
+            public readonly bool TookRegionLock;
+            public readonly int Depth;
+
+            public LockTicket(bool tookRegionLock, int depth)
+            {
+                TookRegionLock = tookRegionLock;
+                Depth = depth;
+            }
+        }
+
+        private LockTicket EnterWrite(TimeSpan timeout)
         {
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
@@ -525,25 +543,37 @@ namespace InterprocessMemory
                 tookRegionLock = true;
             }
 
-            _writeLockDepth.Value++;
-            return tookRegionLock;
+            return new LockTicket(tookRegionLock, ++_writeLockDepth.Value);
         }
 
-        private void ExitWrite(bool tookRegionLock)
+        private void ExitWrite(LockTicket ticket)
         {
+            // Dispose() already released what this thread held.
+            if (_disposed != 0)
+                return;
+
+            if (_writeLockDepth.Value != ticket.Depth)
+                throw new SynchronizationLockException(
+                    "A write lock guard was released twice, out of order or on another thread. Nothing was released.");
+
+            // A read guard taken inside the write lock holds no region lock of its own; releasing the write
+            // lock under it would leave that guard reading without any protection.
+            if (ticket.TookRegionLock && _readLockDepth.Value > 0)
+                throw new SynchronizationLockException(
+                    "The write lock cannot be released while a read lock guard taken inside it is still open. Nothing was released.");
+
             try
             {
-                if (tookRegionLock)
+                if (ticket.TookRegionLock)
                     _buffer.ReleaseWriteLock();
             }
             finally
             {
-                _writeLockDepth.Value--;
+                _writeLockDepth.Value = ticket.Depth - 1;
             }
         }
 
-        /// <summary>Returns true when the region lock was taken, false for a reentrant acquisition.</summary>
-        private bool EnterRead(TimeSpan timeout)
+        private LockTicket EnterRead(TimeSpan timeout)
         {
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
@@ -556,20 +586,26 @@ namespace InterprocessMemory
                 tookRegionLock = true;
             }
 
-            _readLockDepth.Value++;
-            return tookRegionLock;
+            return new LockTicket(tookRegionLock, ++_readLockDepth.Value);
         }
 
-        private void ExitRead(bool tookRegionLock)
+        private void ExitRead(LockTicket ticket)
         {
+            if (_disposed != 0)
+                return;
+
+            if (_readLockDepth.Value != ticket.Depth)
+                throw new SynchronizationLockException(
+                    "A read lock guard was released twice, out of order or on another thread. Nothing was released.");
+
             try
             {
-                if (tookRegionLock)
+                if (ticket.TookRegionLock)
                     _buffer.ReleaseReadLock();
             }
             finally
             {
-                _readLockDepth.Value--;
+                _readLockDepth.Value = ticket.Depth - 1;
             }
         }
 
@@ -581,12 +617,12 @@ namespace InterprocessMemory
         public ref struct WriteLock
         {
             private SharedArray<T>? _owner;
-            private readonly bool _tookRegionLock;
+            private readonly LockTicket _ticket;
 
-            internal WriteLock(SharedArray<T> owner, bool tookRegionLock)
+            internal WriteLock(SharedArray<T> owner, LockTicket ticket)
             {
                 _owner = owner;
-                _tookRegionLock = tookRegionLock;
+                _ticket = ticket;
             }
 
             /// <summary>Releases the write lock; disposing more than once has no further effect.</summary>
@@ -596,8 +632,10 @@ namespace InterprocessMemory
                 if (owner is null)
                     return;
 
+                // A refused release (a copy, or an order that would leave a read guard unprotected) throws
+                // before anything changes, and the guard stays valid so that it can be released properly.
+                owner.ExitWrite(_ticket);
                 _owner = null;
-                owner.ExitWrite(_tookRegionLock);
             }
         }
 
@@ -608,12 +646,12 @@ namespace InterprocessMemory
         public ref struct ReadLock
         {
             private SharedArray<T>? _owner;
-            private readonly bool _tookRegionLock;
+            private readonly LockTicket _ticket;
 
-            internal ReadLock(SharedArray<T> owner, bool tookRegionLock)
+            internal ReadLock(SharedArray<T> owner, LockTicket ticket)
             {
                 _owner = owner;
-                _tookRegionLock = tookRegionLock;
+                _ticket = ticket;
             }
 
             /// <summary>Releases the read lock; disposing more than once has no further effect.</summary>
@@ -623,8 +661,8 @@ namespace InterprocessMemory
                 if (owner is null)
                     return;
 
+                owner.ExitRead(_ticket);
                 _owner = null;
-                owner.ExitRead(_tookRegionLock);
             }
         }
 
@@ -644,6 +682,21 @@ namespace InterprocessMemory
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
+
+            // A guard that is still open on this thread would otherwise leave the cross-process lock held
+            // until the process ends (its owner is alive, so no waiter would recover it). Guards held by
+            // other threads cannot be reached from here: stop and join those threads before disposing.
+            try
+            {
+                if (_writeLockDepth.Value > 0)
+                    _buffer.ReleaseWriteLock();
+                else if (_readLockDepth.Value > 0)
+                    _buffer.ReleaseReadLock();
+            }
+            catch (Exception ex) when (ex is SynchronizationLockException or ObjectDisposedException)
+            {
+                // The lock was taken over (orphan recovery or ForceResetLocks) or the region is gone.
+            }
 
             // No finalizer: if Dispose is never called, the MemoryRegion's own finalizer unmaps the memory.
             _buffer?.Dispose();
