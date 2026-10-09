@@ -393,34 +393,47 @@ public class SharedArrayTests
         guard.Dispose();   // a guard that outlives its array is harmless
     }
 
-    // Larger than a managed array may hold per element (64 KiB), and a mid-sized one that is batched.
-    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, Size = 100_000)]
-    public struct Big100K { public int Tag; }
+    // The smallest size that a managed array cannot hold per element (64 KiB), and a mid-sized one that is
+    // batched. Every temporary copy of the first one is 64 KiB of stack, and a thread of 1 MiB (Windows) does not
+    // have many: the tests below read elements through NoInlining helpers instead of `array[i].Tag`, which would
+    // leave a temporary per expression in the test's own frame (twelve of them overflowed the stack on Windows).
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, Size = 65_536)]
+    public struct Big64K { public int Tag; }
 
     [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, Size = 20_000)]
     public struct Mid20K { public int Tag; }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static int TagOf(SharedArray<Big64K> array, int index) => array[index].Tag;
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static int TagOf(SharedArray<Mid20K> array, int index) => array[index].Tag;
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void FillWith(SharedArray<Big64K> array, int tag, int startIndex = 0, int count = -1) =>
+        array.Fill(new Big64K { Tag = tag }, startIndex, count);
 
     [Test, Timeout(60000)]
     public void FillAndClear_ElementsOf64KiBOrMore_Work()
     {
         // Fill's staging buffer was a T[] and an ArrayPool<T> rental. A managed array cannot hold elements of
         // 64 KiB or more, so the method failed to load with a TypeLoadException before writing anything.
-        using var array = SharedArray<Big100K>.CreateOrOpen(LockName("Fill100K"), 3);
+        using var array = SharedArray<Big64K>.CreateOrOpen(LockName("Fill64K"), 3);
 
-        array.Fill(new Big100K { Tag = 7 });
-        Assert.That(array[0].Tag, Is.EqualTo(7));
-        Assert.That(array[1].Tag, Is.EqualTo(7));
-        Assert.That(array[2].Tag, Is.EqualTo(7));
+        FillWith(array, 7);
+        Assert.That(TagOf(array, 0), Is.EqualTo(7));
+        Assert.That(TagOf(array, 1), Is.EqualTo(7));
+        Assert.That(TagOf(array, 2), Is.EqualTo(7));
 
-        array.Fill(new Big100K { Tag = 9 }, 1, 1);
-        Assert.That(array[0].Tag, Is.EqualTo(7));
-        Assert.That(array[1].Tag, Is.EqualTo(9));
-        Assert.That(array[2].Tag, Is.EqualTo(7));
+        FillWith(array, 9, 1, 1);
+        Assert.That(TagOf(array, 0), Is.EqualTo(7));
+        Assert.That(TagOf(array, 1), Is.EqualTo(9));
+        Assert.That(TagOf(array, 2), Is.EqualTo(7));
 
         array.Clear();
-        Assert.That(array[0].Tag, Is.EqualTo(0));
-        Assert.That(array[1].Tag, Is.EqualTo(0));
-        Assert.That(array[2].Tag, Is.EqualTo(0));
+        Assert.That(TagOf(array, 0), Is.EqualTo(0));
+        Assert.That(TagOf(array, 1), Is.EqualTo(0));
+        Assert.That(TagOf(array, 2), Is.EqualTo(0));
     }
 
     [Test, Timeout(60000)]
@@ -430,10 +443,10 @@ public class SharedArrayTests
 
         array.Fill(new Mid20K { Tag = 5 });
         for (int i = 0; i < 10; i++)
-            Assert.That(array[i].Tag, Is.EqualTo(5), $"element {i}");
+            Assert.That(TagOf(array, i), Is.EqualTo(5), $"element {i}");
 
         array.Clear();
-        Assert.That(array[9].Tag, Is.EqualTo(0));
+        Assert.That(TagOf(array, 9), Is.EqualTo(0));
     }
 
     // Two bytes: the width that used to be copied as a one byte store plus a two byte store.

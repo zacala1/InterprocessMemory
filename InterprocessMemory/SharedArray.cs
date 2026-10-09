@@ -387,14 +387,14 @@ namespace InterprocessMemory
 
             if (!s_needsLock || IsHoldingWriteLock())
             {
-                FillCore(value, startIndex, count);
+                FillCore(in value, startIndex, count);
                 return;
             }
 
             LockTicket ticket = EnterWrite(MemoryRegionOptions.DefaultLockTimeout);
             try
             {
-                FillCore(value, startIndex, count);
+                FillCore(in value, startIndex, count);
             }
             finally
             {
@@ -405,27 +405,29 @@ namespace InterprocessMemory
         // A batch of this many bytes is the most that is staged at a time.
         private const int FillBatchBytes = 64 * 1024;
 
-        private void FillCore(T value, int startIndex, int count)
+        // The value is passed by reference down to the copy: a by-value parameter of an element of tens of KiB
+        // puts a copy of it on the stack in every frame, and a thread of 1 MiB (Windows) does not have many.
+        private void FillCore(in T value, int startIndex, int count)
         {
             // A managed array cannot hold elements of 64 KiB or more, and a method that so much as mentions
             // T[] or ArrayPool<T> for such a T does not even load (TypeLoadException when it is compiled,
             // before a single element is written). A batch of such elements would be one or two elements
             // anyway, so they are copied one by one from a method that has no array in it.
             if (_elementSize >= FillBatchBytes / 2)
-                FillOneByOne(value, startIndex, count);
+                FillOneByOne(in value, startIndex, count);
             else
-                FillInBatches(value, startIndex, count);
+                FillInBatches(in value, startIndex, count);
         }
 
-        private void FillOneByOne(T value, int startIndex, int count)
+        private void FillOneByOne(in T value, int startIndex, int count)
         {
-            ReadOnlySpan<T> one = MemoryMarshal.CreateReadOnlySpan(ref value, 1);
+            ReadOnlySpan<T> one = MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in value), 1);
             for (int i = 0; i < count; i++)
                 CopyFromCore(startIndex + i, one);
         }
 
         [MethodImpl(MethodImplOptions.NoInlining)]
-        private void FillInBatches(T value, int startIndex, int count)
+        private void FillInBatches(in T value, int startIndex, int count)
         {
             // Batch fill: create a filled buffer and write in chunks. The batch is bounded in bytes as well as
             // in elements: 4096 elements of 32 KiB would be a 128 MiB temporary buffer on every call.
