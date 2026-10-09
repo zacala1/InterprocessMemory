@@ -2,6 +2,10 @@
 
 Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATION.md).
 
+**Do not mix 3.0.0 with a later version in processes that share a region on Linux.** 3.0.0 compares
+`Process.StartTime`, which differs between observers, so it takes the write lock away from every live owner,
+including one that runs a later version. Update all processes that use a region together.
+
 ## Unreleased
 
 ### Behavior changes

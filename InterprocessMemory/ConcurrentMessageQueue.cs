@@ -13,6 +13,12 @@ namespace InterprocessMemory
     /// Thread-safe for concurrent access from multiple writers and readers.
     /// Uses sequence numbers for coordination instead of simple head/tail pointers.
     /// Cross-platform: backed by <see cref="MemoryRegion"/> which supports Windows and Linux.
+    /// <para>
+    /// A process that dies inside <c>TryEnqueue</c> or <c>TryDequeue</c>, after it claimed a slot and before it
+    /// published or released it, leaves that slot claimed for good: consumers see an empty queue, or producers a
+    /// full one, although other slots hold messages. There is no automatic recovery; stop all users and call
+    /// <see cref="MemoryRegion.Remove"/>, which discards the queued messages.
+    /// </para>
     /// </summary>
     public sealed unsafe class ConcurrentMessageQueue : IDisposable
     {
@@ -436,6 +442,10 @@ namespace InterprocessMemory
         /// Destination span. Must be at least as large as the next message; otherwise an
         /// <see cref="ArgumentException"/> is thrown WITHOUT consuming the message — caller can
         /// retry with a larger buffer. Use <see cref="MaxMessageSize"/> to size the destination safely.
+        /// </param>
+        /// <param name="countFailure">
+        /// Whether an empty queue is counted in the statistics. The timeout overload polls with false and counts
+        /// once when it gives up.
         /// </param>
         /// <returns>Number of bytes read, or 0 if buffer is empty</returns>
         /// <exception cref="ArgumentException">

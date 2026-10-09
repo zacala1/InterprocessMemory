@@ -34,6 +34,12 @@ namespace InterprocessMemory
 
     /// <summary>
     /// Fixed-size lock-free queue for multiple producers and multiple consumers across processes.
+    /// <para>
+    /// A process that dies inside <see cref="TryEnqueue(in T)"/> or <see cref="TryDequeue(out T)"/>, after it
+    /// claimed a slot and before it published or released it, leaves that slot claimed for good: consumers see an
+    /// empty queue, or producers a full one, although other slots hold data. There is no automatic recovery;
+    /// stop all users and call <see cref="MemoryRegion.Remove"/>, which discards the queued items.
+    /// </para>
     /// </summary>
     public sealed unsafe class ConcurrentQueue<T> : IDisposable where T : unmanaged
     {

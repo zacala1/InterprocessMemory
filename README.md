@@ -299,6 +299,11 @@ modifying the existing bytes.
 Version 3 does not migrate live 2.x regions. Stop every 2.x process, remove the named/file-backed
 region, and recreate it with version 3. See [MIGRATION.md](MIGRATION.md).
 
+Do not run 3.0.0 and a later version in processes that share a region on Linux. 3.0.0 compares the
+owner's `Process.StartTime`, which differs between observers, so it takes the write lock away from every
+live owner (including one of the later version, whose recorded start tick it can never match). Update all
+processes that use a region together. See [CHANGELOG.md](CHANGELOG.md).
+
 ## Disposing while other threads are running
 
 Stop and join every thread that uses an instance before you dispose it. The lock-free members
@@ -327,6 +332,14 @@ Windows named sections disappear when their last handle closes. On Linux a regio
   every writer times out. Read locks have no owner, so this cannot be detected automatically.
   `GetLockOwnerInfo().ReaderCount` shows the stale count; once no process is inside a critical
   section, call `MemoryRegion.ForceResetLocks()` (or the same method on `StructuredMemory<T>` or `SharedArray<T>`).
+- A process that dies **inside** `TryEnqueue` or `TryDequeue` of `ConcurrentQueue<T>` or
+  `ConcurrentMessageQueue`, after it has claimed a slot and before it has published or released it, leaves
+  that slot claimed for good. Consumers then see an empty queue (or, after a full turn of the ring, producers
+  see a full one) although the other slots hold data, and nothing can tell the slot is stale. The window is a
+  few nanoseconds wide, but there is no automatic recovery: stop all users and call
+  `MemoryRegion.Remove(name)`, which discards the queued items. `SingleProducerQueue<T>` and
+  `SingleProducerByteStream` publish with one store and are not affected: a restarted producer or consumer
+  simply carries on.
 - A creator that dies during initialization makes every opener time out. A region with a different
   capacity or element type than the one you now want is rejected as well. In both cases stop all
   users and call `MemoryRegion.Remove(name)` (pass the same `MemoryRegionOptions` for file-backed
