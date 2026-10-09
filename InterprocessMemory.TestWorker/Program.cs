@@ -18,6 +18,11 @@ using InterprocessMemory;
 ///   concurrent_producer &lt;name&gt; &lt;producerId&gt; — enqueue 1000 unique integers
 ///   try_write_lock &lt;name&gt; — try the cross-process write lock for 250 ms
 ///   orphan_write_lock &lt;name&gt; — acquire a write lock and exit without releasing it
+///   dispose_busy_poll &lt;prefix&gt; — 200 rounds of: pollers spin on a ConcurrentQueue while it is disposed
+///   hold_write_lock &lt;name&gt; — acquire a write lock, print "holding", and keep it until killed or until
+///                            the parent closes our standard input (the parent died)
+///   hold_read_lock &lt;name&gt; — acquire a read lock, print "holding", and keep it until killed or until
+///                           the parent closes our standard input (the parent died)
 /// </summary>
 if (args.Length < 2)
 {
@@ -43,6 +48,9 @@ return role switch
         args.Length >= 3 ? int.Parse(args[2]) : 0),
     "try_write_lock" => TryWriteLock(bufferName),
     "orphan_write_lock" => OrphanWriteLock(bufferName),
+    "dispose_busy_poll" => DisposeBusyPoll(bufferName),
+    "hold_write_lock" => HoldWriteLock(bufferName),
+    "hold_read_lock" => HoldReadLock(bufferName),
     _               => Error($"Unknown role: {role}")
 };
 
@@ -195,6 +203,97 @@ static int OrphanWriteLock(string name)
         return Error("failed to acquire orphan test lock");
     Console.WriteLine("orphan_locked");
     return 0; // Deliberately skip Dispose/Release; process teardown closes only the mapping handle.
+}
+
+// The common shutdown pattern: consumers spin on TryDequeue while another thread disposes the queue. Without
+// MemoryRegion.DisposeGracePeriod this killed the process with an AccessViolationException within a few hundred
+// rounds. It is a mitigation, not a proof: a thread that is descheduled for longer than the grace period at the
+// wrong moment can still fail, and that kills this process, which is why it runs here and not in the test host.
+static int DisposeBusyPoll(string namePrefix)
+{
+    var random = new Random(42);
+    int pollerCount = Math.Max(3, Environment.ProcessorCount - 1);
+
+    for (int round = 0; round < 200; round++)
+    {
+        string name = $"{namePrefix}_{round}";
+        var queue = InterprocessMemory.ConcurrentQueue<long>.CreateOrOpen(name, 64);
+        var pollers = new Thread[pollerCount];
+        for (int i = 0; i < pollers.Length; i++)
+        {
+            pollers[i] = new Thread(() =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        queue.TryDequeue(out _);
+                        queue.TryEnqueue(1);
+                    }
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Expected: the queue was disposed under the poller.
+                }
+            }) { IsBackground = true };
+            pollers[i].Start();
+        }
+
+        Thread.Sleep(random.Next(0, 3));
+        queue.Dispose();
+
+        foreach (Thread poller in pollers)
+        {
+            if (!poller.Join(TimeSpan.FromSeconds(10)))
+                return Error($"round {round}: a poller did not stop");
+        }
+
+        MemoryRegion.Remove(name);
+    }
+
+    Console.WriteLine("ok");
+    return 0;
+}
+
+static int HoldWriteLock(string name)
+{
+    using var region = MemoryRegion.OpenExisting(name);
+    if (!region.TryAcquireWriteLock(TimeSpan.FromSeconds(5)))
+        return Error("failed to acquire held test lock");
+
+    // The parent reads this line, probes the lock while we are alive, and then kills us
+    // to simulate a crash while the lock is held.
+    Console.WriteLine("holding");
+    Console.Out.Flush();
+    WaitUntilTheParentIsGone();
+    return 0;
+}
+
+static int HoldReadLock(string name)
+{
+    using var region = MemoryRegion.OpenExisting(name);
+    if (!region.TryAcquireReadLock(TimeSpan.FromSeconds(5)))
+        return Error("failed to acquire held test read lock");
+
+    Console.WriteLine("holding");
+    Console.Out.Flush();
+    WaitUntilTheParentIsGone();
+    return 0;
+}
+
+// The test kills us in the normal case. If it dies first (crash, hang timeout, Ctrl-C) the pipe that is our
+// standard input closes, which ends this wait instead of holding the lock, and the process, for ever.
+// The upper bound covers a parent that hangs without dying.
+static void WaitUntilTheParentIsGone()
+{
+    try
+    {
+        System.Threading.Tasks.Task.Run(() => Console.In.ReadToEnd()).Wait(TimeSpan.FromMinutes(2));
+    }
+    catch (Exception)
+    {
+        // Nothing to wait on (no stdin): exit.
+    }
 }
 
 static int Error(string msg)

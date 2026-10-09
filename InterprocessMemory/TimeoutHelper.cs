@@ -21,11 +21,13 @@ namespace InterprocessMemory
             return timeout != Timeout.InfiniteTimeSpan && stopwatch.Elapsed > timeout;
         }
 
-        public static bool IsNearExpiry(Stopwatch stopwatch, TimeSpan timeout, double fraction)
+        /// <summary>
+        /// Same check against a <see cref="Stopwatch.GetTimestamp"/> start value. Unlike a
+        /// <see cref="Stopwatch"/> instance this does not allocate, which matters on paths that run per call.
+        /// </summary>
+        public static bool HasExpired(long startTimestamp, TimeSpan timeout)
         {
-            return timeout != Timeout.InfiniteTimeSpan
-                && timeout > TimeSpan.Zero
-                && stopwatch.Elapsed.TotalMilliseconds >= timeout.TotalMilliseconds * fraction;
+            return timeout != Timeout.InfiniteTimeSpan && Stopwatch.GetElapsedTime(startTimestamp) > timeout;
         }
     }
 }

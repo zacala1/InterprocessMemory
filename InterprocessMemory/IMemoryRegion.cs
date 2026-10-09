@@ -71,9 +71,18 @@ namespace InterprocessMemory
         public long AcquiredTimestamp { get; init; }
 
         /// <summary>
-        /// Gets whether the lock is orphaned (owner process died)
+        /// Gets whether the write lock is orphaned: its owner process has exited (or its PID was reused
+        /// by another process), or, when <see cref="MemoryRegionOptions.OrphanLockTimeout"/> is enabled,
+        /// it has been held for longer than that limit
         /// </summary>
         public bool IsOrphan { get; init; }
+
+        /// <summary>
+        /// Gets the number of read locks currently held across all processes. Read locks are not
+        /// attributed to an owner, so a process that dies while holding one leaves this count
+        /// permanently above zero (writers then time out); see <see cref="MemoryRegion.ForceResetLocks"/>.
+        /// </summary>
+        public int ReaderCount { get; init; }
     }
 
     /// <summary>
@@ -131,32 +140,46 @@ namespace InterprocessMemory
         Memory<byte> GetMemory(long offset, int length);
 
         /// <summary>
-        /// Tries to acquire an exclusive write lock with timeout
+        /// Tries to acquire an exclusive write lock with timeout.
+        /// The wait is released with <see cref="ObjectDisposedException"/> if the region is disposed
+        /// by another thread while waiting.
         /// </summary>
         bool TryAcquireWriteLock(TimeSpan timeout);
 
         /// <summary>
-        /// Releases the write lock
+        /// Releases the write lock. The lock is owned by the acquiring thread of the acquiring
+        /// process, so it must be released on that same thread: do not <c>await</c> between
+        /// acquiring and releasing it.
         /// </summary>
+        /// <exception cref="SynchronizationLockException">
+        /// The calling thread does not own the write lock, or the lock was taken over (for example by
+        /// orphan-lock recovery) before it was released.
+        /// </exception>
         void ReleaseWriteLock();
 
         /// <summary>
-        /// Tries to acquire a shared read lock with timeout
+        /// Tries to acquire a shared read lock with timeout.
+        /// The wait is released with <see cref="ObjectDisposedException"/> if the region is disposed
+        /// by another thread while waiting.
         /// </summary>
         bool TryAcquireReadLock(TimeSpan timeout);
 
         /// <summary>
-        /// Releases the read lock
+        /// Releases the read lock. Read locks are counted, not owned: a process that exits while
+        /// holding one leaves the shared count raised, which cannot be detected automatically
+        /// (see <see cref="MemoryRegion.ForceResetLocks"/>).
         /// </summary>
         void ReleaseReadLock();
 
         /// <summary>
-        /// Checks if the current write lock is orphaned (owner process died)
+        /// Checks if the current write lock is orphaned: its owner process has exited or its PID was
+        /// reused, or the opt-in <see cref="MemoryRegionOptions.OrphanLockTimeout"/> has elapsed
         /// </summary>
         bool IsWriteLockOrphaned();
 
         /// <summary>
-        /// Forces release of an orphaned write lock
+        /// Forces release of an orphaned write lock. Waiting lock acquisitions perform this
+        /// recovery themselves; call it directly only to clear the lock without waiting for it.
         /// </summary>
         /// <returns>True if lock was orphaned and released</returns>
         bool TryForceReleaseWriteLock();

@@ -542,7 +542,7 @@ public class ChangeVerificationTests
 
     // ── #8 InitializeOrOpen race-safe two-phase magic ───────────────────────
 
-    [Test]
+    [Test, Timeout(60000)]
     public void InitializeOrOpen_ConcurrentSameProcessOpen_NoTornCapacityRead()
     {
         // Spawn N threads that all try to open the same buffer simultaneously. Exactly one
@@ -557,7 +557,9 @@ public class ChangeVerificationTests
         var errors = new System.Collections.Concurrent.ConcurrentBag<Exception>();
         var buffers = new MemoryRegion?[Threads];
 
-        Parallel.For(0, Threads, i =>
+        // Dedicated threads: Parallel.For would run the sixteen barrier waits on thread-pool workers, and the
+        // pool adds them one at a time, so on a two core machine this took 10 to 13 seconds.
+        var threads = Enumerable.Range(0, Threads).Select(i => new Thread(() =>
         {
             try
             {
@@ -568,7 +570,12 @@ public class ChangeVerificationTests
             {
                 errors.Add(ex);
             }
-        });
+        })).ToArray();
+
+        foreach (Thread thread in threads)
+            thread.Start();
+        foreach (Thread thread in threads)
+            Assert.That(thread.Join(TimeSpan.FromSeconds(30)), Is.True, "a thread did not finish opening the buffer");
 
         try
         {
@@ -1041,18 +1048,19 @@ public class ChangeVerificationTests
     // ── AUDIT-5: ReleaseWriteLock CAS-by-owner ───────────────────────────────
 
     [Test]
-    public void Audit5_ReleaseWriteLock_WithoutAcquire_IsNoOp()
+    public void Audit5_ReleaseWriteLock_WithoutAcquire_Throws()
     {
-        // Caller bug: releasing a lock that wasn't acquired by this process. Without the
-        // owner-CAS guard, ReleaseWriteLock would zero ownership metadata and free the lock —
-        // dangerous when another process legitimately holds it. With the fix it's a logged no-op.
+        // Caller bug: releasing a lock that wasn't acquired by this thread. Without the owner
+        // guard, ReleaseWriteLock would zero ownership metadata and free the lock — dangerous
+        // when another process legitimately holds it. The guard leaves the lock state untouched
+        // and reports the misuse instead of hiding it.
         using var buf = new MemoryRegion(N("Audit5_NoAcquire"),
             new MemoryRegionOptions { Capacity = 4096 });
 
-        // No acquire here. Release should be a safe no-op (logs a warning).
-        Assert.DoesNotThrow(() => buf.ReleaseWriteLock());
+        // No acquire here.
+        Assert.Throws<SynchronizationLockException>(() => buf.ReleaseWriteLock());
 
-        // Now actually acquire — must still work normally after the no-op release.
+        // Now actually acquire — must still work normally after the rejected release.
         Assert.That(buf.TryAcquireWriteLock(TimeSpan.FromSeconds(1)), Is.True);
         buf.ReleaseWriteLock();
     }

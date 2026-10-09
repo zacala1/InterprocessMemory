@@ -13,6 +13,12 @@ namespace InterprocessMemory
     /// Thread-safe for concurrent access from multiple writers and readers.
     /// Uses sequence numbers for coordination instead of simple head/tail pointers.
     /// Cross-platform: backed by <see cref="MemoryRegion"/> which supports Windows and Linux.
+    /// <para>
+    /// A process that dies inside <c>TryEnqueue</c> or <c>TryDequeue</c>, after it claimed a slot and before it
+    /// published or released it, leaves that slot claimed for good: consumers see an empty queue, or producers a
+    /// full one, although other slots hold messages. There is no automatic recovery; stop all users and call
+    /// <see cref="MemoryRegion.Remove"/>, which discards the queued messages.
+    /// </para>
     /// </summary>
     public sealed unsafe class ConcurrentMessageQueue : IDisposable
     {
@@ -57,6 +63,9 @@ namespace InterprocessMemory
         }
 
         private const int HeaderSize = 384; // 6 cache lines for false-sharing prevention
+
+        // See ConcurrentQueue<T>: with one slot the published and the free sequence are equal.
+        private const int MinimumCapacity = 2;
         private const int SlotHeaderSize = 16;
         private const int FormatVersion = 3;
         private const long HeaderMagic = 0x514D434D504953;
@@ -194,7 +203,7 @@ namespace InterprocessMemory
 
             if (createOrOpen)
             {
-                _slotCount = RoundUpToPowerOf2(capacity!.Value);
+                _slotCount = PowerOfTwo.RoundUp(capacity!.Value, "capacity", MinimumCapacity);
                 _maxMessageSize = maxMessageSize!.Value;
                 _slotTotalSize = RoundUpToMultiple(
                     checked(SlotHeaderSize + _maxMessageSize), 8);
@@ -305,14 +314,17 @@ namespace InterprocessMemory
                     ex);
             }
 
-            if (storedSlotCount <= 0 || (storedSlotCount & (storedSlotCount - 1)) != 0 ||
+            if (storedSlotCount < MinimumCapacity || (storedSlotCount & (storedSlotCount - 1)) != 0 ||
                 storedMaxMessageSize <= 0 || storedSlotStride != expectedSlotStride)
                 throw new InvalidDataException("The message queue header contains invalid sizing metadata.");
 
-            if (requestedCapacity.HasValue &&
-                RoundUpToPowerOf2(requestedCapacity.Value) != storedSlotCount)
-                throw new InvalidOperationException(
-                    $"Capacity mismatch: expected {RoundUpToPowerOf2(requestedCapacity.Value)}, found {storedSlotCount}");
+            if (requestedCapacity.HasValue)
+            {
+                int expectedCapacity = PowerOfTwo.RoundUp(requestedCapacity.Value, "capacity", MinimumCapacity);
+                if (expectedCapacity != storedSlotCount)
+                    throw new InvalidOperationException(
+                        $"Capacity mismatch: expected {expectedCapacity}, found {storedSlotCount}");
+            }
             if (requestedMaxMessageSize.HasValue &&
                 requestedMaxMessageSize.Value != storedMaxMessageSize)
                 throw new InvalidOperationException(
@@ -358,8 +370,12 @@ namespace InterprocessMemory
         /// Lock-free operation safe for concurrent writers.
         /// </summary>
         /// <returns>True if write succeeded, false if buffer is full</returns>
+        public bool TryEnqueue(ReadOnlySpan<byte> data) => TryEnqueueCore(data, countFailure: true);
+
+        // countFailure is false while a timeout overload polls: the call counts as one failed write when it
+        // gives up, not once per poll.
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        public bool TryEnqueue(ReadOnlySpan<byte> data)
+        private bool TryEnqueueCore(ReadOnlySpan<byte> data, bool countFailure)
         {
             ThrowIfDisposed();
 
@@ -401,7 +417,7 @@ namespace InterprocessMemory
                 else if (diff < 0)
                 {
                     // Buffer is full
-                    if (_statsEnabled)
+                    if (_statsEnabled && countFailure)
                         Interlocked.Increment(ref _header->FailedWrites);
                     return false;
                 }
@@ -427,13 +443,17 @@ namespace InterprocessMemory
         /// <see cref="ArgumentException"/> is thrown WITHOUT consuming the message — caller can
         /// retry with a larger buffer. Use <see cref="MaxMessageSize"/> to size the destination safely.
         /// </param>
+        /// <param name="countFailure">
+        /// Whether an empty queue is counted in the statistics. The timeout overload polls with false and counts
+        /// once when it gives up.
+        /// </param>
         /// <returns>Number of bytes read, or 0 if buffer is empty</returns>
         /// <exception cref="ArgumentException">
         /// Thrown when the next message does not fit in <paramref name="destination"/>. The slot is
         /// left intact so the caller can retry with an adequately sized buffer.
         /// </exception>
         [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-        private int TryDequeueCore(Span<byte> destination)
+        private int TryDequeueCore(Span<byte> destination, bool countFailure = true)
         {
             ThrowIfDisposed();
 
@@ -487,7 +507,7 @@ namespace InterprocessMemory
                 else if (diff < 0)
                 {
                     // Buffer is empty
-                    if (_statsEnabled)
+                    if (_statsEnabled && countFailure)
                         Interlocked.Increment(ref _header->FailedReads);
                     return 0;
                 }
@@ -530,13 +550,17 @@ namespace InterprocessMemory
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
 
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
 
-            while (!TryEnqueue(data))
+            while (!TryEnqueueCore(data, countFailure: false))
             {
-                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(start, timeout))
+                {
+                    if (_statsEnabled)
+                        Interlocked.Increment(ref _header->FailedWrites);
                     return false;
+                }
 
                 spinner.SpinOnce();
             }
@@ -561,14 +585,17 @@ namespace InterprocessMemory
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
 
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
-            bytesWritten = 0;
 
-            while (!TryDequeue(destination, out bytesWritten))
+            while ((bytesWritten = TryDequeueCore(destination, countFailure: false)) == 0)
             {
-                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(start, timeout))
+                {
+                    if (_statsEnabled)
+                        Interlocked.Increment(ref _header->FailedReads);
                     return false;
+                }
 
                 spinner.SpinOnce();
             }
@@ -626,43 +653,19 @@ namespace InterprocessMemory
         }
 
         /// <summary>
-        /// Releases all resources used by this buffer
+        /// Releases the underlying memory region. Stop and join every thread that uses this instance first:
+        /// calls that do not take a lock are not tracked, so one that is still running while the memory is
+        /// unmapped terminates the process (see <see cref="MemoryRegion.DisposeGracePeriod"/>).
         /// </summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
+            // The MemoryHandle wraps an unmanaged pointer and owns nothing, so there is no finalizer
+            // here: if Dispose is never called, the MemoryRegion's own finalizer unmaps the memory.
             _memoryHandle.Dispose();
-            // See SingleProducerByteStream: only dispose the managed _buffer on the deterministic
-            // path. The finalizer below skips it to avoid touching peer objects whose own
-            // finalizers may have already run.
             _buffer?.Dispose();
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Releases unmanaged resources if Dispose was not called.
-        /// </summary>
-        ~ConcurrentMessageQueue()
-        {
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
-                return;
-            try
-            { _memoryHandle.Dispose(); }
-            catch { /* best-effort */ }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static int RoundUpToPowerOf2(int value)
-        {
-            value--;
-            value |= value >> 1;
-            value |= value >> 2;
-            value |= value >> 4;
-            value |= value >> 8;
-            value |= value >> 16;
-            return value + 1;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

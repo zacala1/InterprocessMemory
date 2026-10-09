@@ -94,7 +94,9 @@ Version 3 rejects version 2 headers and never overwrites them.
 
 1. Stop all processes using the 2.x region.
 2. Preserve data externally if it must survive the upgrade.
-3. Remove the explicit backing file or stale Linux `/dev/shm` entry when applicable.
+3. Remove the explicit backing file or stale Linux `/dev/shm` entry when applicable. A version 3
+   process can do this with `MemoryRegion.Remove(name)` (pass the same `MemoryRegionOptions` for a
+   file-backed region).
 4. Start the version 3 creating process.
 5. Start remaining processes with `OpenExisting`.
 

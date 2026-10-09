@@ -52,15 +52,29 @@ namespace InterprocessMemory
     }
 
     /// <summary>
-    /// Schema compatibility mode for version handling
+    /// Schema compatibility mode for version handling.
+    ///
+    /// <para>The library checks the schema version, the size of the region and, when the schema implements
+    /// <see cref="IVersionedSchema"/>, <see cref="IVersionedSchema.IsCompatibleWith"/>. It does <b>not</b> compare
+    /// the field layout of two different versions: a newer schema must only append fields (or change nothing
+    /// that is stored), and a schema that changes anything else has to say so in
+    /// <see cref="IVersionedSchema.IsCompatibleWith"/>. A region is never smaller than the schema that opens it,
+    /// whatever the mode.</para>
     /// </summary>
     public enum SchemaCompatibility
     {
         /// <summary>Exact version match required</summary>
         Strict,
-        /// <summary>Allow reading from newer compatible versions</summary>
+        /// <summary>
+        /// Allow opening a region written by a newer version of the schema. The region may be larger than this
+        /// schema needs; this schema uses its first fields. Use <c>OpenExisting</c>: <c>CreateOrOpen</c> asks for
+        /// a region of exactly this schema's size.
+        /// </summary>
         Forward,
-        /// <summary>Allow reading from older compatible versions</summary>
+        /// <summary>
+        /// Allow opening a region written by an older version of the schema. Since the region cannot be smaller
+        /// than this schema, that means a version change that did not grow the region.
+        /// </summary>
         Backward,
         /// <summary>Allow both forward and backward compatibility</summary>
         Full

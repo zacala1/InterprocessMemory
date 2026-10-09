@@ -20,7 +20,9 @@ namespace InterprocessMemory
         public static readonly TimeSpan DefaultLockTimeout = TimeSpan.FromSeconds(5);
 
         /// <summary>
-        /// Default orphan lock timeout: 30 seconds
+        /// A reasonable value to pass as <see cref="OrphanLockTimeout"/> when you opt in to
+        /// time-based lock takeover (30 seconds). It is NOT the default: <see cref="OrphanLockTimeout"/>
+        /// is <see cref="TimeSpan.Zero"/> (disabled) unless you set it.
         /// </summary>
         public static readonly TimeSpan DefaultOrphanLockTimeout = TimeSpan.FromSeconds(30);
 
@@ -45,14 +47,24 @@ namespace InterprocessMemory
         public string? FilePath { get; set; }
 
         /// <summary>
-        /// Gets or sets whether to enable orphan lock detection and recovery
+        /// Gets or sets whether a waiting process recovers a write lock whose owner process has exited
+        /// (or whose PID was reused by another process)
         /// </summary>
         public bool EnableOrphanLockDetection { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets the timeout after which a lock is considered orphaned
+        /// Gets or sets the time after which a write lock held by a process that is still ALIVE is
+        /// also treated as orphaned, so that a waiter may take it over. <see cref="TimeSpan.Zero"/>
+        /// (the default) disables this.
+        /// <para>
+        /// A lock whose owner process has exited is always recovered while
+        /// <see cref="EnableOrphanLockDetection"/> is on. A time limit additionally breaks mutual
+        /// exclusion for a healthy owner that simply holds the lock for longer than the limit (a long
+        /// transaction, a paused debugger), so enable it only when every critical section is known to
+        /// be shorter than the value you choose.
+        /// </para>
         /// </summary>
-        public TimeSpan OrphanLockTimeout { get; set; } = DefaultOrphanLockTimeout;
+        public TimeSpan OrphanLockTimeout { get; set; } = TimeSpan.Zero;
 
         /// <summary>
         /// Gets or sets whether to enable checksum verification

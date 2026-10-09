@@ -59,7 +59,24 @@ if (memory.TryAcquireWriteLock(TimeSpan.FromSeconds(1)))
 ```
 
 Lock ownership includes the process ID, managed thread ID, and process start time. A process
-waiting for a write lock can recover a lock left behind by a terminated process.
+waiting for a write lock or a read lock keeps checking whether the writer that holds the lock is
+still alive (also when it waits with `Timeout.InfiniteTimeSpan`) and recovers a lock left behind by a
+terminated process. A process killed exactly while it takes or releases the lock can leave it held
+with no owner recorded; a waiter clears such a lock once it has looked like that for two seconds.
+
+A process id only means something inside its own PID namespace. On Linux the owner records its namespace
+in the region header, and a waiter in a different one (two containers sharing `/dev/shm`) never decides
+from the pid alone that the owner is gone; only the opt-in `OrphanLockTimeout` can take such a lock over.
+
+Recovery is based on the owner process being gone. A write lock held by a process that is still
+alive is never taken over unless you opt in with `MemoryRegionOptions.OrphanLockTimeout`, which
+trades mutual exclusion for liveness when a critical section may run longer than the timeout.
+
+The write lock belongs to the thread that acquired it. Release it on that same thread; releasing
+from another thread throws `SynchronizationLockException` and leaves the lock held. In particular,
+do not `await` between acquiring and releasing a lock, because the continuation may resume on a
+different thread. Disposing a region while another thread is waiting for one of its locks releases
+that thread with an `ObjectDisposedException`.
 
 ## Choosing a data structure
 
@@ -79,6 +96,10 @@ All types use `CreateOrOpen(...)` for the process that supplies sizing metadata 
 The `name` must be the same non-empty flat identifier in every process. Path separators,
 control characters, NUL, and UTF-8 names longer than 255 bytes are rejected consistently on
 Windows and Linux.
+
+On Linux a region lives in `/dev/shm`, which Docker limits to 64 MB by default. Creating a region that
+does not fit throws `IOException` (raise the limit with `--shm-size`, or a larger memory-backed
+`emptyDir` in Kubernetes) instead of killing the process with `SIGBUS` on a later write.
 
 ## Typed queues
 
@@ -116,7 +137,8 @@ if (consumer.TryDequeue(out SensorSample sample))
 }
 ```
 
-Queue capacity is an item count, not bytes, and is rounded up to the next power of two.
+Queue capacity is an item count, not bytes, and is rounded up to the next power of two. The two
+multi-producer queues need at least two slots, so a requested capacity of 1 becomes 2.
 `Capacity` reports the resulting number of slots.
 
 The shared header records `sizeof(T)` and a deterministic fingerprint of the type name,
@@ -204,6 +226,22 @@ using (memory.AcquireWriteLock())
 UTF-8 strings, and arrays to prevent torn reads and writes. Use an explicit lock when several
 fields form one transaction.
 
+The lock guards returned by `AcquireWriteLock()` and `AcquireReadLock()` must be disposed on the
+thread that acquired them. Keep the guarded scope synchronous: an `await` inside it lets the guard
+be disposed on another thread, which throws `SynchronizationLockException`. So does disposing a *copy* of
+a guard after the original, or releasing the guards in another order than last-taken-first-released: the
+lock state is left untouched and the guard stays valid, so it can still be released properly. Disposing
+the instance while one of its guards is open on the calling thread releases that lock.
+
+### Schema versions
+
+`StructuredMemory<TSchema>.OpenExisting(name, schema, compatibility)` accepts a region of another schema
+version according to `SchemaCompatibility`: `Strict` needs the same version, `Forward` also accepts a region
+written by a newer version (it may be larger: the older schema uses its first fields, so a newer version must
+only append fields), `Backward` a region written by an older version, `Full` both. A region is never smaller
+than the schema that opens it. The library does not compare the field layout of two different versions; a schema
+that changes more than appended fields has to say so in `IVersionedSchema.IsCompatibleWith`.
+
 ## Shared arrays
 
 ```csharp
@@ -217,6 +255,41 @@ Console.WriteLine(reader[0]);
 
 The array header validates the element type fingerprint and restores its length for openers.
 
+An element that is 1, 2, 4 or 8 bytes wide is read and written with one aligned load or store, so
+another process never sees half of one, and no lock is taken. A range of several elements (`CopyTo`,
+`CopyFrom`, `Fill`) is a plain memory copy; take a lock when it must be a consistent snapshot.
+
+Every other element size (a `Guid`, a `Vector3`, a 64-byte struct, ...) could be read torn while
+another process writes it, so `SharedArray<T>` takes the shared region lock for those types in the
+indexer, `CopyTo`, `CopyFrom` and `Fill` (the whole range of a `Fill` under one lock). That is correct
+but slower per access; for many elements take the lock once yourself.
+
+Use the explicit locks when several elements must be read or changed together. This applies to
+any element type, because two atomic elements can still be seen from different updates:
+
+```csharp
+using (array.AcquireWriteLock())
+{
+    array[0] = x;
+    array[1] = y;      // other processes see both changes or neither
+}
+
+using (reader.AcquireReadLock())
+{
+    long first = reader[0];
+    long second = reader[1];   // a consistent pair
+}
+```
+
+The locks are shared by every process and thread that uses a lock, reentrant for the calling thread
+(the indexer inside a lock does not take it again), and time out with `TimeoutException`. Taking the
+write lock while the thread holds only a read lock throws `InvalidOperationException`. The guards are
+`ref struct`s, because a lock belongs to one thread and must never be held across an `await`: the
+compiler rejects a guard as a `using` resource in an `async` method (error CS9104), so do the locked
+work in a small synchronous method and call that. `array.ForceResetLocks()` clears a lock state left
+behind by a crash (see below). Processes still running a version without
+this locking do not take part in it.
+
 ## Version 3 format
 
 Every region has a version 3 magic value, format version, and data-structure kind. Opening a
@@ -226,13 +299,72 @@ modifying the existing bytes.
 Version 3 does not migrate live 2.x regions. Stop every 2.x process, remove the named/file-backed
 region, and recreate it with version 3. See [MIGRATION.md](MIGRATION.md).
 
+Do not run 3.0.0 and a later version in processes that share a region on Linux. 3.0.0 compares the
+owner's `Process.StartTime`, which differs between observers, so it takes the write lock away from every
+live owner (including one of the later version, whose recorded start tick it can never match). Update all
+processes that use a region together. See [CHANGELOG.md](CHANGELOG.md).
+
+## Disposing while other threads are running
+
+Stop and join every thread that uses an instance before you dispose it. The lock-free members
+(`Read`, `Write`, the typed queues, `SharedArray`) read and write through a raw pointer and do no
+per-call bookkeeping, because tracking calls costs every one of them two interlocked operations
+(roughly 9 times slower for a queue round trip, and about 17 times slower for two threads
+exchanging items). A call that is still running when the memory is unmapped terminates the process
+with an `AccessViolationException`, which cannot be caught.
+
+What the library does to reduce the risk:
+
+- Calls made after `Dispose()` started fail with `ObjectDisposedException`.
+- Threads waiting for a lock are released with `ObjectDisposedException`, and `Dispose()` waits for
+  them before it unmaps anything.
+- `Dispose()` keeps the memory mapped for `MemoryRegion.DisposeGracePeriod` (10 ms by default,
+  process-wide, `TimeSpan.Zero` disables it) so that calls already in flight can finish. This is
+  best effort: a thread that is descheduled for longer than that at exactly the wrong moment still
+  hits unmapped memory.
+
+## Recovering after a crash
+
+Windows named sections disappear when their last handle closes. On Linux a region is a file in
+`/dev/shm` that outlives its users, so a crash can leave state behind:
+
+- A process that dies while holding a **read lock** leaves the shared reader count above zero and
+  every writer times out. Read locks have no owner, so this cannot be detected automatically.
+  `GetLockOwnerInfo().ReaderCount` shows the stale count; once no process is inside a critical
+  section, call `MemoryRegion.ForceResetLocks()` (or the same method on `StructuredMemory<T>` or `SharedArray<T>`).
+- A process that dies **inside** `TryEnqueue` or `TryDequeue` of `ConcurrentQueue<T>` or
+  `ConcurrentMessageQueue`, after it has claimed a slot and before it has published or released it, leaves
+  that slot claimed for good. Consumers then see an empty queue (or, after a full turn of the ring, producers
+  see a full one) although the other slots hold data, and nothing can tell the slot is stale. The window is a
+  few nanoseconds wide, but there is no automatic recovery: stop all users and call
+  `MemoryRegion.Remove(name)`, which discards the queued items. `SingleProducerQueue<T>` and
+  `SingleProducerByteStream` publish with one store and are not affected: a restarted producer or consumer
+  simply carries on.
+- A creator that dies during initialization makes every opener time out. A region with a different
+  capacity or element type than the one you now want is rejected as well. In both cases stop all
+  users and call `MemoryRegion.Remove(name)` (pass the same `MemoryRegionOptions` for file-backed
+  regions); the next `CreateOrOpen` starts from scratch. It works for every data structure because
+  they are all addressed by the same name.
+
 ## Build and test
 
 ```shell
 dotnet restore InterprocessMemory.sln
-dotnet test InterprocessMemory.sln
 dotnet build InterprocessMemory.sln --configuration Release
+dotnet test InterprocessMemory.sln --configuration Release
 ```
 
 The test suite includes real child-process transfer, multi-process typed MPMC delivery,
 cross-process lock exclusion, and orphan-lock recovery.
+
+[GitHub Actions](.github/workflows/ci.yml) builds and tests on Linux and Windows for every pull
+request and every push to `main`. Two groups of tests are kept out of the blocking test step (use
+`--filter` to select or exclude them locally):
+
+- `Category=TimingSensitive`: assertions that depend on the core count and thread scheduling, such as a
+  fairness ratio, and the test that races `Dispose` against busy-polling threads in a child process.
+  CI runs them in a separate, non-blocking step and shows a failure as a warning on the run.
+- `Category=LongRunning`: the `[Explicit]` soak tests, which NUnit never runs unless asked to. CI does
+  not run them.
+
+Changes since the last release are listed in [CHANGELOG.md](CHANGELOG.md).

@@ -37,6 +37,7 @@ public class ExtremeStressTests
     [Test]
     [Timeout(180000)]
     [Explicit("Long-running stress test")]
+    [Category("LongRunning")]
     public async Task MPMC_16Producers_16Consumers_1MillionMessages()
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("MPMC_16x16"), slotCount: 4096, slotSize: 128);
@@ -127,7 +128,7 @@ public class ExtremeStressTests
         for (int burst = 0; burst < burstCount; burst++)
         {
             var received = new ConcurrentBag<int>();
-            var producerDone = false;
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
 
             // Burst producer
             var producer = Task.Run(() =>
@@ -137,30 +138,34 @@ public class ExtremeStressTests
                 {
                     BitConverter.TryWriteBytes(data, burst * messagesPerBurst + i);
                     while (!buffer.TryWrite(data))
+                    {
+                        if (deadline.Elapsed > TimeSpan.FromSeconds(30))
+                        {
+                            errors.Add($"Burst {burst}: producer blocked at message {i}");
+                            return;
+                        }
+
                         Thread.SpinWait(1);
+                    }
                 }
-                producerDone = true;
             });
 
-            // Consumer
+            // Consumer: wait for the full burst instead of giving up after a number of empty polls.
+            // That budget used to run out in microseconds when the consumer started before the
+            // producer, after which the producer spun forever on a full queue and the test hung.
             var consumer = Task.Run(() =>
             {
                 var readBuf = new byte[64];
-                int emptyCount = 0;
-                while (received.Count < messagesPerBurst && emptyCount < 10000)
+                while (received.Count < messagesPerBurst)
                 {
+                    if (deadline.Elapsed > TimeSpan.FromSeconds(30))
+                        return;
+
                     var bytesRead = buffer.TryRead(readBuf);
                     if (bytesRead > 0)
-                    {
                         received.Add(BitConverter.ToInt32(readBuf, 0));
-                        emptyCount = 0;
-                    }
                     else
-                    {
-                        emptyCount++;
-                        if (producerDone && buffer.ApproximateCount == 0)
-                            break;
-                    }
+                        Thread.SpinWait(1);
                 }
             });
 
@@ -687,6 +692,7 @@ public class ExtremeStressTests
     [Test]
     [Timeout(150000)] // 2 minutes plus teardown/assertion headroom
     [Explicit("Long-running test")]
+    [Category("LongRunning")]
     public async Task Stability_MPMC_2Minutes_Continuous()
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("Stability_2min"), slotCount: 2048, slotSize: 128);
