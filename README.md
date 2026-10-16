@@ -12,7 +12,7 @@ arrays, and structured records through named shared memory.
 ## Install
 
 ```shell
-dotnet add package InterprocessMemory --version 3.0.0
+dotnet add package InterprocessMemory --version 4.0.0
 ```
 
 ```csharp
@@ -294,14 +294,15 @@ this locking do not take part in it.
 
 ## Version 3 format
 
-Every region has a version 3 magic value, format version, and data-structure kind. Opening a
+Every region has a version 3 magic value, format version, and data-structure kind (package 4.0.0
+still writes format version 3, so 3.0.0 regions can be opened). Opening a
 queue as raw memory, using a different element type, or opening a 2.x region is rejected without
 modifying the existing bytes.
 
 Version 3 does not migrate live 2.x regions. Stop every 2.x process, remove the named/file-backed
 region, and recreate it with version 3. See [MIGRATION.md](MIGRATION.md).
 
-Do not run 3.0.0 and a later version in processes that share a region on Linux. 3.0.0 compares the
+Do not run 3.0.0 and 4.0.0 in processes that share a region on Linux. 3.0.0 compares the
 owner's `Process.StartTime`, which differs between observers, so it takes the write lock away from every
 live owner (including one of the later version, whose recorded start tick it can never match). Update all
 processes that use a region together. See [CHANGELOG.md](CHANGELOG.md).

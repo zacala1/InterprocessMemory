@@ -1,20 +1,22 @@
 # Changelog
 
-Changes since the 3.0.0 release. Migrating from 2.x: see [MIGRATION.md](MIGRATION.md).
+Migrating from 3.0.0 or 2.x: see [MIGRATION.md](MIGRATION.md).
 
 **Do not mix 3.0.0 with a later version in processes that share a region on Linux.** 3.0.0 compares
 `Process.StartTime`, which differs between observers, so it takes the write lock away from every live owner,
 including one that runs a later version. Update all processes that use a region together.
 
-## Unreleased
+## 4.0.0 (not released yet)
+
+Changes since the 3.0.0 release. The memory format is unchanged (format version 3).
 
 ### Breaking changes
 
 - `StructuredMemory<T>.WriteLock` and `StructuredMemory<T>.ReadLock` (the guards returned by
   `AcquireWriteLock()` and `AcquireReadLock()`) are `ref struct`s now; they were plain structs implementing
-  `IDisposable`. A lock belongs to the thread that took it, so an `await` inside a lock scope (the thread
-  that resumes releases nothing and the lock stays held by the thread-pool thread that took it) used to
-  compile and fail when the guard was disposed. It is a compile error now. `using var guard = ...` and
+  `IDisposable`. A lock belongs to the thread that took it, so an `await` inside a lock scope used to
+  compile; the guard was then disposed on whichever thread resumed, which could not release the lock, and the
+  lock stayed held by the thread that took it. It is a compile error now. `using var guard = ...` and
   `using (...)` in synchronous code compile unchanged. What no longer compiles: a guard that is a local or
   a `using` resource of an `async` method, one captured by a lambda or stored in a field, and one converted
   to `IDisposable`. Do the locked work in a synchronous method and call that. Assemblies compiled against
