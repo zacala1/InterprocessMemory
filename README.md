@@ -379,9 +379,8 @@ request and every push to `main`. Two groups of tests are kept out of the blocki
 `--filter` to select or exclude them locally):
 
 - `Category=TimingSensitive`: tests that depend on the core count and thread scheduling, such as the one
-  that checks that no MPMC producer is locked out, and the one that races `Dispose` against busy-polling
-  threads in a child process. CI runs them in a separate, non-blocking step and shows a failure as a
-  warning on the run.
+  that races `Dispose` against busy-polling threads in a child process. CI runs them in a separate,
+  non-blocking step and shows a failure as a warning on the run.
 - `Category=LongRunning`: the `[Explicit]` soak tests, which NUnit never runs unless asked to. CI does
   not run them.
 

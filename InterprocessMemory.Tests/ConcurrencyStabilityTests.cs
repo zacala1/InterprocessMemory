@@ -498,58 +498,68 @@ public class ConcurrencyStabilityTests
     // that cannot tolerate writer starvation should cap reader threads, insert pauses
     // between reader cycles, or layer a higher-level coordination primitive on top.
 
-    // ── MPMC producer fairness ───────────────────────────────────────────────
+    // ── MPMC producers: none is locked out ───────────────────────────────────
 
-    // The queue promises that every producer eventually gets a slot, not that producers get equal shares.
-    // How far apart the shares are depends on the core count and the scheduler: nine spinning threads
-    // (eight producers and the consumer) on a machine with fewer cores let the producer that is running win
-    // the next slot again and again while the others wait for a time slice (a ratio of 3.5 was measured on
-    // a Linux CI runner, 31 on Windows, and in the thousands on 2 cores). A ratio limit therefore tests the
-    // scheduler and not the library, so the ratio is only reported. What is asserted is that no producer
-    // is locked out completely. The threads are dedicated: thread-pool starvation made the consumer never
-    // run, and every producer but one write nothing.
+    // The queue promises that every producer eventually gets its messages through, not that producers get
+    // equal shares in a given time. How the shares compare depends on the core count and the scheduler: nine
+    // spinning threads (eight producers and the consumer) on a few cores let the producer that is running
+    // win the next slot again and again while the others wait for a time slice. A ratio limit tested the
+    // scheduler, and so did a rule that every producer writes at least once in two seconds: a Windows CI
+    // runner gave one producer no slot at all in that time. So every producer gets a fixed amount of work and
+    // the test asks that all of it arrives, in order per producer, within a generous deadline.
     [Test]
-    [Category("TimingSensitive")]
-    [Timeout(30000)]
+    [Timeout(120000)]
     public async Task Mpmc_NoProducerIsLockedOut()
     {
-        // Every producer retries the CAS on WriteSequence, so each one wins eventually; none is excluded.
         using var buf = new ConcurrentMessageQueue(N("FairProd"), slotCount: 256, slotSize: 128);
 
         const int producerCount = 8;
-        const int durationMs = 2000;
-        var counts = new long[producerCount];
-        var cts = new CancellationTokenSource(durationMs);
+        const int perProducer = 20000;
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
 
         var producers = Enumerable.Range(0, producerCount).Select(p => DedicatedThread.Run(() =>
         {
-            Span<byte> data = stackalloc byte[16];
-            BitConverter.TryWriteBytes(data, p);
-            while (!cts.Token.IsCancellationRequested)
+            var data = new byte[16];
+            for (int i = 0; i < perProducer; i++)
             {
-                if (buf.TryWrite(data))
-                    Interlocked.Increment(ref counts[p]);
+                BitConverter.TryWriteBytes(data.AsSpan(0, 4), p);
+                BitConverter.TryWriteBytes(data.AsSpan(4, 4), i);
+                while (!buf.TryWrite(data))
+                {
+                    if (deadline.IsCancellationRequested)
+                        return;   // the test reports the missing messages
+                }
             }
         })).ToArray();
 
-        // Single consumer drains continuously so producers don't all jam on full-buffer.
+        var received = new int[producerCount];
+        var inOrder = true;
         var consumer = DedicatedThread.Run(() =>
         {
-            Span<byte> rd = stackalloc byte[128];
-            while (!cts.Token.IsCancellationRequested)
+            var rd = new byte[128];
+            int total = 0;
+            while (total < producerCount * perProducer && !deadline.IsCancellationRequested)
             {
-                buf.TryRead(rd);
+                int length = buf.TryRead(rd);
+                if (length == 0)
+                    continue;
+
+                int producer = BitConverter.ToInt32(rd, 0);
+                int sequence = BitConverter.ToInt32(rd, 4);
+                // One consumer sees the messages of one producer in the order that producer wrote them.
+                if (sequence != received[producer])
+                    inOrder = false;
+                received[producer]++;
+                total++;
             }
         });
 
         await Task.WhenAll(producers.Append(consumer));
 
-        long min = counts.Min();
-        long max = counts.Max();
-        TestContext.Out.WriteLine(
-            $"Producer counts: [{string.Join(", ", counts)}], min={min}, max={max}, max/min={(min > 0 ? (double)max / min : double.PositiveInfinity):F1} (reported, not asserted)");
-
-        Assert.That(min, Is.GreaterThan(0), "Some producer wrote zero messages — total starvation");
+        TestContext.Out.WriteLine($"Messages received per producer: [{string.Join(", ", received)}]");
+        for (int p = 0; p < producerCount; p++)
+            Assert.That(received[p], Is.EqualTo(perProducer), $"producer {p} did not get its messages through");
+        Assert.That(inOrder, Is.True, "messages of one producer arrived out of order");
     }
 
     // ── Helper schema ─────────────────────────────────────────────────────────
