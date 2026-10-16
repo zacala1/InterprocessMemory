@@ -55,7 +55,7 @@ namespace InterprocessMemory
         }
 
         [StructLayout(LayoutKind.Sequential, Pack = 8)]
-        private struct Slot
+        internal struct Slot
         {
             public long Sequence;
             public int DataLength;
@@ -435,6 +435,19 @@ namespace InterprocessMemory
         }
 
         /// <summary>
+        /// True while <paramref name="slot"/> still carries <paramref name="expectedSequence"/>, which is the
+        /// only time a <c>DataLength</c> read after the sequence belongs to the message that sequence
+        /// published: a writer changes the length only after a reader has moved the sequence on. The fence
+        /// keeps the length read ahead of this check on weakly ordered CPUs; it is only reached when the
+        /// length looks wrong, never on the normal path.
+        /// </summary>
+        internal static bool SlotStillHolds(Slot* slot, long expectedSequence)
+        {
+            Thread.MemoryBarrier();
+            return Volatile.Read(ref slot->Sequence) == expectedSequence;
+        }
+
+        /// <summary>
         /// Tries to read data from the buffer.
         /// Lock-free operation safe for concurrent readers.
         /// </summary>
@@ -474,6 +487,15 @@ namespace InterprocessMemory
                     // throw without CAS so the message is preserved for a retry with a larger buffer.
                     // This prevents silent data loss that would occur if we claimed and truncated.
                     int peekLength = Volatile.Read(ref slot->DataLength);
+                    if ((peekLength <= 0 || peekLength > _maxMessageSize || peekLength > destination.Length)
+                        && !SlotStillHolds(slot, currentRead + 1))
+                    {
+                        // Another reader took the message after the sequence was read and a writer may
+                        // already have reused the slot, so the length belongs to some other message.
+                        // Looking at it again is the only safe answer; throwing for it would be wrong.
+                        spinCount++;
+                        continue;
+                    }
                     if (peekLength <= 0 || peekLength > _maxMessageSize)
                         throw new InvalidDataException(
                             $"The next message declares invalid length {peekLength}.");

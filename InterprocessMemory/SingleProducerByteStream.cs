@@ -350,12 +350,17 @@ namespace InterprocessMemory
         /// <param name="destination">Buffer to read into</param>
         /// <param name="timeout">Maximum time to wait</param>
         /// <param name="cancellationToken">Token to cancel the wait</param>
-        /// <returns>Number of bytes read; 0 on timeout or cancellation</returns>
+        /// <returns>Number of bytes read; 0 on timeout, on cancellation, or when <paramref name="destination"/> is empty</returns>
         public int WaitRead(Span<byte> destination, TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
+
+            // Nothing can be read into an empty buffer, so waiting would last until the timeout, which is
+            // for ever with Timeout.InfiniteTimeSpan.
+            if (destination.IsEmpty)
+                return 0;
 
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();

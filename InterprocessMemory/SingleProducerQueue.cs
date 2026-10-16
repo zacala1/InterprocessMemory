@@ -23,6 +23,12 @@ namespace InterprocessMemory
 
     /// <summary>
     /// Fixed-size queue for exactly one producer and one consumer, which may live in separate processes.
+    /// <para>
+    /// Items are copied as raw bytes, padding included. The bytes between the fields of a struct are not
+    /// defined and may hold whatever the sender's stack held, so a struct with padding can pass such data
+    /// on to the receiving process. Use a type without padding (or zero it with <c>default</c> and
+    /// assign every field) when that matters.
+    /// </para>
     /// </summary>
     public sealed unsafe class SingleProducerQueue<T> : IDisposable where T : unmanaged
     {

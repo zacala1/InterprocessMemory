@@ -40,6 +40,12 @@ namespace InterprocessMemory
     /// empty queue, or producers a full one, although other slots hold data. There is no automatic recovery;
     /// stop all users and call <see cref="MemoryRegion.Remove"/>, which discards the queued items.
     /// </para>
+    /// <para>
+    /// Items are copied as raw bytes, padding included. The bytes between the fields of a struct are not
+    /// defined and may hold whatever the sender's stack held, so a struct with padding can pass such data
+    /// on to the receiving process. Use a type without padding (or zero it with <c>default</c> and
+    /// assign every field) when that matters.
+    /// </para>
     /// </summary>
     public sealed unsafe class ConcurrentQueue<T> : IDisposable where T : unmanaged
     {
@@ -185,7 +191,7 @@ namespace InterprocessMemory
                 storedCapacity < MinimumCapacity ||
                 (storedCapacity & (storedCapacity - 1)) != 0 ||
                 _header->ElementSize != _elementSize ||
-                storedStride < SlotHeaderSize + _elementSize ||
+                storedStride != RoundUpToMultiple(SlotHeaderSize + _elementSize, 8) ||
                 _header->FingerprintLow != _fingerprint.Low ||
                 _header->FingerprintHigh != _fingerprint.High)
                 throw new InvalidDataException("The queue has a different format or element type.");
