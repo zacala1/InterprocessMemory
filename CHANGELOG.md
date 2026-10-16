@@ -35,6 +35,10 @@ Changes since the 3.0.0 release. The memory format is unchanged (format version 
   1, 2, 4 and 8 bytes, so values are no longer torn. These accesses are slower; take the lock once with
   `AcquireReadLock()` / `AcquireWriteLock()` for bulk work.
 - An out-of-range queue `capacity` is reported with the parameter name `capacity`.
+- `StructuredMemory<T>` no longer writes zeros over a region it has just created. The memory is already zero, and
+  writing it made every page resident at once (about 5 s for a 1 GB region, and a sparse file in `/dev/shm`
+  became real memory).
+- `FieldDefinition`s that contradict themselves are rejected (see Fixed).
 
 ### Fixed
 
@@ -113,9 +117,31 @@ Changes since the 3.0.0 release. The memory format is unchanged (format version 
   prevents a spurious format error on weakly ordered CPUs.
 - `Dispose()` racing a call that is still running on another thread is mitigated by
   `DisposeGracePeriod`. This is best effort; stop and join threads before disposing.
+- `ConcurrentMessageQueue.TryRead` could throw `ArgumentException` ("destination smaller than the next message")
+  or `InvalidDataException` for a message that was not the one it was about to take: it read the length of the
+  slot after another reader had taken the message and a writer had reused the slot. It looks again instead.
+- `SingleProducerByteStream.WaitRead` with an empty destination waited for its whole timeout (for ever with
+  `Timeout.InfiniteTimeSpan`). It returns 0 at once.
+- `StructuredMemory<T>.WriteUtf8String` did not clear the bytes of the previous value: an empty string left all of
+  it in the shared memory, a shorter one the tail. It zeroes what the old value used (not the whole field, so the
+  cost still depends on the data and not on the capacity of the field).
+- `FieldDefinition`s whose type code and element size contradict each other (a `Char` field of 1 byte per element
+  wrote 16 bytes into an 8 byte field) and blobs or UTF-8 strings without room for data are rejected when the
+  schema is used. The factory methods never produced such definitions.
+- `MemoryRegion.DisposeGracePeriod` accepted values that `Thread.Sleep` cannot sleep (more than
+  `int.MaxValue` milliseconds); `Dispose()` then threw after the region had been marked disposed. The setter
+  rejects them.
+- A reader that backed out because a writer got in decremented the reader count even when `ForceResetLocks` had
+  cleared it in between, which left -1 behind for good. The count never goes below zero now.
+- `IsWriteLockOrphaned()` read the pid and the start time of the owner separately, so a lock that changed hands
+  in between could be reported as orphaned. It reads one snapshot and gives up when the owner changed.
+- `ConcurrentQueue<T>` accepted any stored slot stride that was large enough; it requires the stride it computes
+  itself, as `ConcurrentMessageQueue` does, so a damaged header cannot produce misaligned slots.
 
 ### Added
 
+- `MemoryRegionOptions.UnixCreateMode` sets the permissions of the backing file a process creates on Linux
+  and macOS (the default stays the platform default, usually 0644).
 - `MemoryRegion.Remove(name, options)` deletes the backing storage of a region left unusable by a crash.
 - `MemoryRegion.ForceResetLocks()` and `StructuredMemory<T>.ForceResetLocks()` /
   `SharedArray<T>.ForceResetLocks()` clear lock state left behind by a crashed process.
@@ -123,7 +149,7 @@ Changes since the 3.0.0 release. The memory format is unchanged (format version 
 - `MemoryRegion.DisposeGracePeriod` (static, process-wide).
 - `SharedArray<T>.AcquireReadLock()` / `AcquireWriteLock()` with timeout overloads, returning
   reentrant `ref struct` guards.
-- GitHub Actions workflow that builds and tests on Linux and Windows.
+- GitHub Actions workflow that builds and tests on Linux and Windows, and packs the library.
 
 ### Removed
 

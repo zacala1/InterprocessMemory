@@ -78,6 +78,20 @@ do not `await` between acquiring and releasing a lock, because the continuation 
 different thread. Disposing a region while another thread is waiting for one of its locks releases
 that thread with an `ObjectDisposedException`.
 
+A lock is remembered by the instance that took it. Opening the same region twice in one process and
+taking the lock through both instances on one thread therefore waits for itself until the timeout (the
+second instance cannot tell that the lock belongs to its own thread). Open a region once per process and
+share the instance, or keep the two instances in different threads.
+
+On Windows a region name lives in the namespace of the session of the process that creates it. A
+service (session 0) and a process of a logged-on user do not see each other's regions, and names with a
+`Global\` or `Local\` prefix are rejected (names must be flat identifiers); sharing across sessions is not
+supported yet.
+
+On Linux and macOS a new backing file gets the platform default permissions (usually 0644: readable by every
+user, writable by the owner). Set `MemoryRegionOptions.UnixCreateMode` to restrict it (for example to owner
+read/write) or to open it to a group.
+
 ## Choosing a data structure
 
 | Type | Use it for |
