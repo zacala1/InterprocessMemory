@@ -37,6 +37,7 @@ public class ExtremeStressTests
     [Test]
     [Timeout(180000)]
     [Explicit("Long-running stress test")]
+    [Category("LongRunning")]
     public async Task MPMC_16Producers_16Consumers_1MillionMessages()
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("MPMC_16x16"), slotCount: 4096, slotSize: 128);
@@ -119,56 +120,71 @@ public class ExtremeStressTests
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("MPMC_Burst"), slotCount: 1024, slotSize: 64);
 
+        // Several producers and several consumers per burst: the point of an MPMC queue is that they race.
         const int burstCount = 10;
-        const int messagesPerBurst = 10000;
+        const int producerCount = 4;
+        const int consumerCount = 4;
+        const int perProducer = 2500;
+        const int messagesPerBurst = producerCount * perProducer;
         var errors = new ConcurrentBag<string>();
         var totalReceived = 0;
 
         for (int burst = 0; burst < burstCount; burst++)
         {
+            int burstNumber = burst;
             var received = new ConcurrentBag<int>();
-            var producerDone = false;
+            int receivedCount = 0;
+            var deadline = System.Diagnostics.Stopwatch.StartNew();
 
-            // Burst producer
-            var producer = Task.Run(() =>
+            // Dedicated threads: eight spinning loops would otherwise starve the thread pool.
+            var producers = Enumerable.Range(0, producerCount).Select(p => DedicatedThread.Run(() =>
             {
                 var data = new byte[32];
-                for (int i = 0; i < messagesPerBurst; i++)
+                for (int i = 0; i < perProducer; i++)
                 {
-                    BitConverter.TryWriteBytes(data, burst * messagesPerBurst + i);
+                    BitConverter.TryWriteBytes(data, burstNumber * messagesPerBurst + p * perProducer + i);
                     while (!buffer.TryWrite(data))
-                        Thread.SpinWait(1);
-                }
-                producerDone = true;
-            });
+                    {
+                        if (deadline.Elapsed > TimeSpan.FromSeconds(30))
+                        {
+                            errors.Add($"Burst {burstNumber}: producer {p} blocked at message {i}");
+                            return;
+                        }
 
-            // Consumer
-            var consumer = Task.Run(() =>
+                        Thread.SpinWait(1);
+                    }
+                }
+            }));
+
+            // Consumers: wait for the full burst instead of giving up after a number of empty polls.
+            // That budget used to run out in microseconds when a consumer started before the
+            // producers, after which a producer spun forever on a full queue and the test hung.
+            var consumers = Enumerable.Range(0, consumerCount).Select(_ => DedicatedThread.Run(() =>
             {
                 var readBuf = new byte[64];
-                int emptyCount = 0;
-                while (received.Count < messagesPerBurst && emptyCount < 10000)
+                while (Volatile.Read(ref receivedCount) < messagesPerBurst)
                 {
+                    if (deadline.Elapsed > TimeSpan.FromSeconds(30))
+                        return;
+
                     var bytesRead = buffer.TryRead(readBuf);
                     if (bytesRead > 0)
                     {
                         received.Add(BitConverter.ToInt32(readBuf, 0));
-                        emptyCount = 0;
+                        Interlocked.Increment(ref receivedCount);
                     }
                     else
-                    {
-                        emptyCount++;
-                        if (producerDone && buffer.ApproximateCount == 0)
-                            break;
-                    }
+                        Thread.SpinWait(1);
                 }
-            });
+            }));
 
-            await Task.WhenAll(producer, consumer);
+            await Task.WhenAll(producers.Concat(consumers).ToArray());
             totalReceived += received.Count;
 
             if (received.Count != messagesPerBurst)
                 errors.Add($"Burst {burst}: expected {messagesPerBurst}, got {received.Count}");
+            else if (received.Distinct().Count() != messagesPerBurst)
+                errors.Add($"Burst {burst}: a message was delivered twice");
         }
 
         Assert.That(errors, Is.Empty, string.Join("\n", errors));
@@ -687,6 +703,7 @@ public class ExtremeStressTests
     [Test]
     [Timeout(150000)] // 2 minutes plus teardown/assertion headroom
     [Explicit("Long-running test")]
+    [Category("LongRunning")]
     public async Task Stability_MPMC_2Minutes_Continuous()
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("Stability_2min"), slotCount: 2048, slotSize: 128);

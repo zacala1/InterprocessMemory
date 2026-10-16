@@ -76,12 +76,26 @@ namespace InterprocessMemory
         /// <summary>
         /// Gets the available space in bytes for writing
         /// </summary>
-        public long Available => CalculateAvailable();
+        public long Available
+        {
+            get
+            {
+                ThrowIfDisposed();
+                return CalculateAvailable();
+            }
+        }
 
         /// <summary>
         /// Gets the used space in bytes (data ready for reading)
         /// </summary>
-        public long Used => CalculateUsed();
+        public long Used
+        {
+            get
+            {
+                ThrowIfDisposed();
+                return CalculateUsed();
+            }
+        }
 
         /// <summary>
         /// Gets performance statistics for the buffer
@@ -336,12 +350,17 @@ namespace InterprocessMemory
         /// <param name="destination">Buffer to read into</param>
         /// <param name="timeout">Maximum time to wait</param>
         /// <param name="cancellationToken">Token to cancel the wait</param>
-        /// <returns>Number of bytes read; 0 on timeout or cancellation</returns>
+        /// <returns>Number of bytes read; 0 on timeout, on cancellation, or when <paramref name="destination"/> is empty</returns>
         public int WaitRead(Span<byte> destination, TimeSpan timeout,
             CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
             TimeoutHelper.Validate(timeout, nameof(timeout));
+
+            // Nothing can be read into an empty buffer, so waiting would last until the timeout, which is
+            // for ever with Timeout.InfiniteTimeSpan.
+            if (destination.IsEmpty)
+                return 0;
 
             var sw = Stopwatch.StartNew();
             var spinner = new SpinWait();
@@ -424,35 +443,19 @@ namespace InterprocessMemory
         }
 
         /// <summary>
-        /// Releases all resources used by this buffer
+        /// Releases the underlying memory region. Stop and join every thread that uses this instance first:
+        /// calls that do not take a lock are not tracked, so one that is still running while the memory is
+        /// unmapped terminates the process (see <see cref="MemoryRegion.DisposeGracePeriod"/>).
         /// </summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
-            // MemoryHandle wraps an unmanaged pointer — safe to dispose anywhere.
+            // The MemoryHandle wraps an unmanaged pointer and owns nothing, so there is no finalizer
+            // here: if Dispose is never called, the MemoryRegion's own finalizer unmaps the memory.
             _memoryHandle.Dispose();
-            // _buffer (MemoryRegion) is a managed object with its OWN finalizer.
-            // We only proactively dispose it on the deterministic path; from our finalizer we
-            // let the GC handle it to avoid touching a possibly-already-finalized peer.
             _buffer?.Dispose();
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Releases unmanaged resources if Dispose was not called.
-        /// Skips the managed <c>_buffer.Dispose()</c> — its own finalizer reclaims it.
-        /// </summary>
-        ~SingleProducerByteStream()
-        {
-            // Guard against double-dispose if Dispose() already ran. _disposed is volatile so
-            // we observe its current value here.
-            if (Interlocked.Exchange(ref _disposed, 1) != 0)
-                return;
-            try
-            { _memoryHandle.Dispose(); }
-            catch { /* unmanaged release; best-effort */ }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]

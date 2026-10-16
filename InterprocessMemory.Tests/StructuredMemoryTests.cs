@@ -318,11 +318,14 @@ public class StructuredMemoryTests
         using var memory1 = new StructuredMemory<VersionedSchemaV1>(uniqueName, schemaV1, create: true);
         memory1.Write(VersionedSchemaV1.IntField, 42);
 
-        // Try to open with V2 in strict mode - should throw
+        // Try to open with V2 in strict mode - should throw, and because the VERSION differs. This used to
+        // throw InvalidDataException for the size of the region, which was checked before the version, so
+        // the test passed without the compatibility mode ever being consulted.
         var schemaV2 = new VersionedSchemaV2();
-        Assert.Throws<InvalidDataException>(() =>
+        var error = Assert.Throws<InvalidOperationException>(() =>
             new StructuredMemory<VersionedSchemaV2>(
                 uniqueName, schemaV2, create: false, compatibility: SchemaCompatibility.Strict));
+        Assert.That(error!.Message, Does.Contain("version mismatch"));
     }
 
     [Test]
@@ -946,6 +949,7 @@ public class StructuredMemoryTests
     #region Extended Type Concurrent Tests
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentGuid_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -985,6 +989,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentDateTime_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1022,6 +1027,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentDecimal_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1059,6 +1065,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentStruct_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new CustomStructSchema();
@@ -1096,6 +1103,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentEnum_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new EnumSchema();
@@ -1169,6 +1177,7 @@ public class StructuredMemoryTests
     #region Auto-Lock Tests
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentGuid_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         // This test verifies that 16-byte types are automatically locked
@@ -1201,6 +1210,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentDecimal_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1232,6 +1242,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentDateTimeOffset_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1263,6 +1274,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentLargeStruct_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         var schema = new CustomStructSchema();
@@ -1294,6 +1306,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentString_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         using var memory = new StructuredMemory<TestSchema>(TestBufferName + "_AutoString", new TestSchema());
@@ -1324,6 +1337,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentArray_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1460,12 +1474,10 @@ public class StructuredMemoryTests
         var schema = new TestSchema();
         using var memory = new StructuredMemory<TestSchema>(TestBufferName + "_LockDoubleDisp", schema);
 
+        // A ref struct cannot be captured by Assert.DoesNotThrow; an exception fails the test all the same.
         var lockObj = memory.AcquireWriteLock();
-        Assert.DoesNotThrow(() =>
-        {
-            lockObj.Dispose();
-            lockObj.Dispose();
-        });
+        lockObj.Dispose();
+        lockObj.Dispose();
     }
 
     [Test]
@@ -1475,11 +1487,8 @@ public class StructuredMemoryTests
         using var memory = new StructuredMemory<TestSchema>(TestBufferName + "_RLockDoubleDisp", schema);
 
         var lockObj = memory.AcquireReadLock();
-        Assert.DoesNotThrow(() =>
-        {
-            lockObj.Dispose();
-            lockObj.Dispose();
-        });
+        lockObj.Dispose();
+        lockObj.Dispose();
     }
 
     #endregion
@@ -1527,6 +1536,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task IPC_ConcurrentAccess_WithLocks_ShouldWork()
     {
         var schema = new TestSchema();
@@ -1624,6 +1634,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AtomicBoundary_Long_ConcurrentWithoutLock_ShouldWork()
     {
         // long (8 bytes) is atomic on x64, so concurrent access without lock should be safe
@@ -1960,6 +1971,7 @@ public class StructuredMemoryTests
     #region Lock Timeout Tests
 
     [Test]
+    [Timeout(120000)]
     public void WriteLock_Timeout_ShouldThrow()
     {
         var schema = new TestSchema();
@@ -1967,8 +1979,10 @@ public class StructuredMemoryTests
 
         using (memory.AcquireWriteLock())
         {
-            // Try to acquire another write lock from different thread with short timeout
-            var task = Task.Run(() =>
+            // Try to acquire another write lock from different thread with short timeout. The thread has to
+            // be a different one: Task.Run followed by Wait() may be run inline by the waiting thread, which
+            // owns the lock and would take it again (the lock is reentrant) instead of timing out.
+            var task = DedicatedThread.Run(() =>
             {
                 Assert.Throws<TimeoutException>(() =>
                     memory.AcquireWriteLock(TimeSpan.FromMilliseconds(50)));
@@ -2028,6 +2042,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task Struct_Over8Bytes_ConcurrentWithoutExplicitLock_ShouldAutoLock()
     {
         var schema = new Size9Schema();
@@ -2116,6 +2131,114 @@ public class StructuredMemoryTests
         memory.WriteString(TestSchema.StringField, "Hello");
         var read = memory.ReadString(TestSchema.StringField);
         Assert.That(read, Is.EqualTo("Hello"));
+    }
+
+    #endregion
+
+    #region Small values are never observed half written
+
+    public struct Rgb3 { public byte R, G, B; }
+
+    public struct Tag6 { public ushort A, B, C; }
+
+    public struct SmallSchema : IMemorySchema
+    {
+        public IEnumerable<FieldDefinition> GetFields()
+        {
+            yield return FieldDefinition.Scalar<short>("Short");
+            yield return FieldDefinition.Struct<Rgb3>("Rgb");
+            yield return FieldDefinition.Struct<Tag6>("Tag");
+            yield return FieldDefinition.Array<byte>("Bytes", 6);
+        }
+    }
+
+    [Test, Timeout(60000)]
+    public void SmallValues_AreNeverObservedHalfWritten_AcrossInstances()
+    {
+        // A two byte copy used to be a one byte store plus a two byte store, and 3, 5, 6 and 7 byte
+        // values and short arrays were written without the lock although they need several stores.
+        string name = $"{TestBufferName}_Small_{Guid.NewGuid():N}";
+        var schema = new SmallSchema();
+        using var writerMemory = StructuredMemory<SmallSchema>.CreateOrOpen(name, schema);
+        using var readerMemory = StructuredMemory<SmallSchema>.OpenExisting(name, schema);
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(1.2));
+
+        void WriteAll(byte pattern)
+        {
+            writerMemory.Write("Short", pattern == 0 ? (short)0 : (short)-1);
+            writerMemory.Write("Rgb", new Rgb3 { R = pattern, G = pattern, B = pattern });
+            writerMemory.Write("Tag", new Tag6 { A = pattern, B = pattern, C = pattern });
+            writerMemory.WriteArray<byte>("Bytes", new byte[] { pattern, pattern, pattern, pattern, pattern, pattern });
+        }
+
+        WriteAll(0);
+        long reads = 0;
+        var torn = new System.Collections.Concurrent.ConcurrentBag<string>();
+
+        var writer = Task.Factory.StartNew(() =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                WriteAll(0xFF);
+                WriteAll(0);
+            }
+        }, TaskCreationOptions.LongRunning);
+
+        var reader = Task.Factory.StartNew(() =>
+        {
+            var bytes = new byte[6];
+            while (!stop.IsCancellationRequested)
+            {
+                short s = readerMemory.Read<short>("Short");
+                if (s != 0 && s != -1) torn.Add($"Short={s:X4}");
+
+                var rgb = readerMemory.Read<Rgb3>("Rgb");
+                if (rgb.R != rgb.G || rgb.G != rgb.B) torn.Add($"Rgb={rgb.R:X2}{rgb.G:X2}{rgb.B:X2}");
+
+                var tag = readerMemory.Read<Tag6>("Tag");
+                if (tag.A != tag.B || tag.B != tag.C) torn.Add($"Tag={tag.A:X}/{tag.B:X}/{tag.C:X}");
+
+                readerMemory.ReadArray<byte>("Bytes", bytes);
+                if (bytes.Any(b => b != bytes[0])) torn.Add("Bytes=" + Convert.ToHexString(bytes));
+
+                reads++;
+            }
+        }, TaskCreationOptions.LongRunning);
+
+        Task.WaitAll(writer, reader);
+
+        Assert.That(reads, Is.GreaterThan(0));
+        Assert.That(torn, Is.Empty, $"{torn.Count} torn reads in {reads}, e.g. {torn.FirstOrDefault()}");
+    }
+
+    [Test]
+    [Timeout(120000)]
+    public void AtomicSizedScalars_RoundTripWithoutTheLock()
+    {
+        string name = $"{TestBufferName}_NoLock_{Guid.NewGuid():N}";
+        var schema = new SmallSchema();
+        using var memory = StructuredMemory<SmallSchema>.CreateOrOpen(name, schema);
+        using var peer = StructuredMemory<SmallSchema>.OpenExisting(name, schema);
+
+        // The scalar of a power-of-two size is one typed load/store: it does not wait for a writer.
+        using (memory.AcquireWriteLock())
+        {
+            var read = Task.Run(() => { peer.Write("Short", (short)1234); return peer.Read<short>("Short"); });
+            Assert.That(read.Wait(TimeSpan.FromSeconds(2)), Is.True);
+            Assert.That(read.Result, Is.EqualTo((short)1234));
+        }
+
+        // A three byte struct needs several stores, so its reader waits for the writer to finish.
+        memory.Write("Rgb", new Rgb3 { R = 1, G = 2, B = 3 });
+        Task<Rgb3> blocked;
+        using (memory.AcquireWriteLock())
+        {
+            blocked = Task.Run(() => peer.Read<Rgb3>("Rgb"));
+            Assert.That(blocked.Wait(TimeSpan.FromMilliseconds(300)), Is.False);
+        }
+
+        Assert.That(blocked.Wait(TimeSpan.FromSeconds(10)), Is.True);
+        Assert.That(blocked.Result.B, Is.EqualTo((byte)3));
     }
 
     #endregion

@@ -14,22 +14,34 @@ namespace InterprocessMemory
     /// All fields are declared upfront with fixed types, positions, and sizes.
     /// Provides zero-allocation access with full type safety.
     /// Cross-platform via the underlying <see cref="MemoryRegion"/> (Windows + Linux).
+    /// <para>
+    /// Values wider than eight bytes, strings, blobs and arrays are read and written under the shared
+    /// region lock automatically. Use <see cref="AcquireWriteLock()"/> / <see cref="AcquireReadLock()"/>
+    /// to group several fields into one transaction. The guards are <c>ref struct</c>s because a lock
+    /// belongs to the thread that took it: the compiler rejects holding one across an <c>await</c> and
+    /// handing it to another thread. <see cref="ForceResetLocks"/> clears a lock state left behind by a
+    /// crashed process.
+    /// </para>
     /// </summary>
-    public sealed class StructuredMemory<TSchema> : IDisposable where TSchema : struct, IMemorySchema
+    public sealed unsafe class StructuredMemory<TSchema> : IDisposable where TSchema : struct, IMemorySchema
     {
         private const int SchemaHeaderSize = 64; // Reserved for schema metadata
         private const uint SchemaMagic = 0x53504D49; // "IMPS"
-        // x86-64 guarantees atomic load/store for aligned values up to 8 bytes (MOV instruction).
-        // Types wider than this threshold require automatic locking to prevent torn reads/writes.
-        // Note: ARM64 supports 16-byte atomics (ldp/stp) but .NET on Windows ARM64 uses TSO
-        // emulation, so 8 bytes is the safe cross-platform limit for this Windows-only library.
-        private const int AtomicThreshold = 8;
+        // An aligned load or store of 1, 2, 4 or 8 bytes is atomic on every supported platform, and
+        // AtomicAccess performs exactly one. Every other scalar size (3, 5, 6, 7 and anything wider than
+        // 8 bytes) as well as arrays, strings and blobs (several stores) go through the shared lock.
+        // ARM64 has 16-byte atomics (ldp/stp), but not every supported platform guarantees them
+        // (e.g. x64 emulation on Windows ARM64), so 8 bytes is the safe cross-platform limit.
         private const int MaxStackAllocBytes = 1024; // Max bytes for stackalloc (prevent stack overflow)
 
         // Cached TimeSpan to avoid repeated allocations
         private static readonly TimeSpan DefaultLockTimeout = TimeSpan.FromSeconds(5);
 
         private readonly IMemoryRegion _buffer;
+        private readonly long _totalSize; // bytes the schema needs: header plus all fields
+        // Address of the first byte after the region header, valid until Dispose; used for the
+        // lock-free scalar path (AtomicAccess).
+        private readonly byte* _dataBase;
         private readonly TSchema _schema;
         private readonly Dictionary<string, FieldMetadata> _fields;
         private readonly SchemaCompatibility _compatibility;
@@ -39,6 +51,9 @@ namespace InterprocessMemory
         // Per-instance thread-local lock depth tracking (no boxing, no dictionary lookup)
         private readonly ThreadLocal<int> _writeLockDepth = new(() => 0);
         private readonly ThreadLocal<int> _readLockDepth = new(() => 0);
+
+        // A method group is converted to a new delegate on every use, which allocated on each
+        // automatically locked read or write. Convert once per instance instead.
 
         /// <summary>
         /// Gets the schema instance defining the memory layout
@@ -106,30 +121,32 @@ namespace InterprocessMemory
             _schemaHash = ComputeSchemaHash();
 
             long totalSize = SchemaHeaderSize + CalculateTotalSize(_fields);
+            _totalSize = totalSize;
+
+            // No statistics are exposed here, so skip the region's per-call counters.
+            var regionOptions = new MemoryRegionOptions { EnableStatistics = false };
 
             if (create)
             {
                 _buffer = MemoryRegion.CreateOrOpen(
-                    name, totalSize, options: null, RegionKind.StructuredMemory);
+                    name, totalSize, regionOptions, RegionKind.StructuredMemory);
             }
             else
             {
+                // The size is checked in ValidateSchemaCompatibility, once the stored schema version is
+                // known: a region written by a newer version of the schema is legitimately larger.
                 _buffer = MemoryRegion.OpenExisting(
-                    name, options: null, RegionKind.StructuredMemory);
-                if (_buffer.Capacity != totalSize)
-                {
-                    _buffer.Dispose();
-                    throw new InvalidDataException(
-                        $"Structured-memory size mismatch: schema requires {totalSize} bytes, " +
-                        $"but the region contains {_buffer.Capacity} bytes.");
-                }
+                    name, regionOptions, RegionKind.StructuredMemory);
             }
 
             try
             {
                 if (create && _buffer.IsOwner)
                 {
-                    InitializeMemory();
+                    // No InitializeMemory(): a new region is zero-filled by the operating system, and nothing
+                    // can write to it before its creator has published the header. Writing zeros anyway made
+                    // every page resident at once (about 5 s for a 1 GB region, and a sparse file in
+                    // /dev/shm became real memory) without changing a single byte.
                     WriteSchemaHeader();
                     StoredSchemaVersion = SchemaVersion;
                 }
@@ -143,11 +160,13 @@ namespace InterprocessMemory
                 _buffer.Dispose();
                 throw;
             }
+
+            _dataBase = AtomicAccess.GetPointer(_buffer, 0);
         }
 
         /// <summary>
         /// Writes a strictly-typed value to a named field.
-        /// For types larger than 8 bytes (non-atomic), automatic locking is applied.
+        /// Values that are not 1, 2, 4 or 8 bytes wide are written under the shared lock automatically.
         /// </summary>
         /// <exception cref="InvalidOperationException">
         /// Thrown when the caller holds only a read lock and attempts to write a non-atomic value
@@ -164,7 +183,7 @@ namespace InterprocessMemory
             EnsureScalarField(metadata);
             ValidateFieldType<T>(metadata);
 
-            bool isNonAtomic = Unsafe.SizeOf<T>() > AtomicThreshold;
+            bool isNonAtomic = !AtomicAccess.IsAtomicSize(Unsafe.SizeOf<T>());
             if (isNonAtomic && !IsHoldingWriteLock())
             {
                 ThrowIfHoldingReadLock();
@@ -180,6 +199,14 @@ namespace InterprocessMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void WriteInternal<T>(T value, FieldMetadata metadata) where T : unmanaged
         {
+            if (AtomicAccess.IsAtomicSize(sizeof(T)))
+            {
+                // One typed store. Span.CopyTo is not enough: a two byte copy is a one byte store plus a
+                // two byte store, which another process can see half done.
+                AtomicAccess.Write(_dataBase + SchemaHeaderSize + metadata.Offset, value);
+                return;
+            }
+
             // MemoryMarshal.CreateSpan + AsBytes avoids a stackalloc by reinterpreting
             // the local variable directly as bytes without any extra copy.
             _buffer.Write(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref value, 1)),
@@ -188,7 +215,7 @@ namespace InterprocessMemory
 
         /// <summary>
         /// Reads a strictly-typed value from a named field.
-        /// For types larger than 8 bytes (non-atomic), automatic locking is applied.
+        /// Values that are not 1, 2, 4 or 8 bytes wide are read under the shared lock automatically.
         /// </summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public T Read<T>(string fieldName) where T : unmanaged
@@ -201,8 +228,8 @@ namespace InterprocessMemory
             EnsureScalarField(metadata);
             ValidateFieldType<T>(metadata);
 
-            // Auto-lock for non-atomic types (>8 bytes) to prevent torn reads
-            bool needsAutoLock = Unsafe.SizeOf<T>() > AtomicThreshold && !IsHoldingAnyLock();
+            // Auto-lock for sizes that one load cannot cover, to prevent torn reads
+            bool needsAutoLock = !AtomicAccess.IsAtomicSize(Unsafe.SizeOf<T>()) && !IsHoldingAnyLock();
             if (needsAutoLock)
             {
                 using var _ = AcquireReadLock();
@@ -217,6 +244,9 @@ namespace InterprocessMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private T ReadInternal<T>(FieldMetadata metadata) where T : unmanaged
         {
+            if (AtomicAccess.IsAtomicSize(sizeof(T)))
+                return AtomicAccess.Read<T>(_dataBase + SchemaHeaderSize + metadata.Offset);
+
             T value = default;
             _buffer.Read(MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref value, 1)),
                 SchemaHeaderSize + metadata.Offset);
@@ -225,7 +255,7 @@ namespace InterprocessMemory
 
         /// <summary>
         /// Writes an array to a fixed-size array field.
-        /// For arrays larger than 8 bytes total, automatic locking is applied.
+        /// Automatic locking is applied: the elements and the zeroed tail are separate stores.
         /// </summary>
         public void WriteArray<T>(string fieldName, ReadOnlySpan<T> values) where T : unmanaged
         {
@@ -245,10 +275,10 @@ namespace InterprocessMemory
                     nameof(values));
 
             var bytes = MemoryMarshal.AsBytes(values);
-            bool isNonAtomic = metadata.Size > AtomicThreshold;
 
-            // Auto-lock for non-atomic operations (>8 bytes)
-            if (isNonAtomic && !IsHoldingWriteLock())
+            // Always lock: the data and the zeroed tail are separate stores, so even a field of a few
+            // bytes could be observed half written.
+            if (!IsHoldingWriteLock())
             {
                 ThrowIfHoldingReadLock();
                 using var _ = AcquireWriteLock();
@@ -289,7 +319,7 @@ namespace InterprocessMemory
 
         /// <summary>
         /// Reads an array from a fixed-size array field.
-        /// For arrays larger than 8 bytes total, automatic locking is applied.
+        /// Automatic locking is applied.
         /// </summary>
         public void ReadArray<T>(string fieldName, Span<T> destination) where T : unmanaged
         {
@@ -310,9 +340,7 @@ namespace InterprocessMemory
 
             var bytes = MemoryMarshal.AsBytes(destination);
 
-            // Auto-lock for non-atomic operations (>8 bytes)
-            using var _ = (bytes.Length > AtomicThreshold && !IsHoldingAnyLock())
-                ? AcquireReadLock() : default;
+            using var _ = !IsHoldingAnyLock() ? AcquireReadLock() : default;
             _buffer.Read(bytes, SchemaHeaderSize + metadata.Offset);
         }
 
@@ -607,36 +635,45 @@ namespace InterprocessMemory
         private void WriteUtf8StringInternal(string value, int byteCount, FieldMetadata metadata)
         {
             long baseOffset = SchemaHeaderSize + metadata.Offset;
+            int maxDataSize = metadata.ArrayLength - 4;
 
-            // Write 4-byte length prefix
+            // The previous value stays in the shared memory when a shorter one replaces it, and an empty
+            // string would leave all of it. Zero what the new value does not cover, but no more than the
+            // old value used: writing the whole capacity every time would make the cost and the time under
+            // the lock depend on the size of the field instead of the size of the data.
             Span<byte> lengthBuf = stackalloc byte[4];
+            _buffer.Read(lengthBuf, baseOffset);
+            int previousLength = BitConverter.ToInt32(lengthBuf);
+            if (previousLength < 0 || previousLength > maxDataSize)
+                previousLength = maxDataSize;   // damaged prefix: clear everything the field can hold
+
             BitConverter.TryWriteBytes(lengthBuf, byteCount);
             _buffer.Write(lengthBuf, baseOffset);
 
-            if (byteCount > 0)
+            int writeLength = Math.Max(byteCount, previousLength);
+            if (writeLength == 0)
+                return;
+
+            if (writeLength <= MaxStackAllocBytes)
             {
-                int totalSize = metadata.ArrayLength - 4;
-                if (totalSize <= MaxStackAllocBytes)
+                Span<byte> utf8Buf = stackalloc byte[writeLength];
+                utf8Buf.Clear();
+                System.Text.Encoding.UTF8.GetBytes(value, utf8Buf);
+                _buffer.Write(utf8Buf, baseOffset + 4);
+            }
+            else
+            {
+                byte[] rented = ArrayPool<byte>.Shared.Rent(writeLength);
+                try
                 {
-                    Span<byte> utf8Buf = stackalloc byte[totalSize];
-                    utf8Buf.Clear();
-                    System.Text.Encoding.UTF8.GetBytes(value, utf8Buf);
-                    _buffer.Write(utf8Buf, baseOffset + 4);
+                    var span = rented.AsSpan(0, writeLength);
+                    span.Clear();
+                    System.Text.Encoding.UTF8.GetBytes(value, span);
+                    _buffer.Write(span, baseOffset + 4);
                 }
-                else
+                finally
                 {
-                    byte[] rented = ArrayPool<byte>.Shared.Rent(totalSize);
-                    try
-                    {
-                        var span = rented.AsSpan(0, totalSize);
-                        span.Clear();
-                        System.Text.Encoding.UTF8.GetBytes(value, span);
-                        _buffer.Write(span, baseOffset + 4);
-                    }
-                    finally
-                    {
-                        ArrayPool<byte>.Shared.Return(rented);
-                    }
+                    ArrayPool<byte>.Shared.Return(rented);
                 }
             }
         }
@@ -720,6 +757,11 @@ namespace InterprocessMemory
         /// <param name="timeout">Lock acquisition timeout</param>
         /// <returns>A disposable lock guard that releases the lock on dispose</returns>
         /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
+        /// <exception cref="InvalidOperationException">The calling thread holds only a read lock (upgrading would deadlock)</exception>
+        /// <remarks>
+        /// The lock is owned by the calling thread. The guard is a <c>ref struct</c>, so it cannot be
+        /// held across an <c>await</c>: do the locked work in a synchronous method or block.
+        /// </remarks>
         public WriteLock AcquireWriteLock(TimeSpan timeout)
         {
             ThrowIfDisposed();
@@ -727,16 +769,19 @@ namespace InterprocessMemory
 
             // Reentrant: if already holding write lock, just increment depth
             if (_writeLockDepth.Value > 0)
-            {
-                IncrementWriteLockDepth();
-                return new WriteLock(null, DecrementWriteLockDepth);
-            }
+                return new WriteLock(this, null, ++_writeLockDepth.Value);
+
+            // The write lock waits for every reader to leave, and this thread is one of them. Waiting would
+            // block all other processes (new readers and writers queue behind the pending writer) until the
+            // timeout, or for good with Timeout.InfiniteTimeSpan.
+            if (_readLockDepth.Value > 0)
+                throw new InvalidOperationException(
+                    "Cannot take the write lock while holding only a read lock. Release the read lock first.");
 
             if (!_buffer.TryAcquireWriteLock(timeout))
                 throw new TimeoutException($"Failed to acquire write lock within {timeout}");
 
-            IncrementWriteLockDepth();
-            return new WriteLock(_buffer, DecrementWriteLockDepth);
+            return new WriteLock(this, _buffer, ++_writeLockDepth.Value);
         }
 
         /// <summary>
@@ -759,6 +804,10 @@ namespace InterprocessMemory
         /// <param name="timeout">Lock acquisition timeout</param>
         /// <returns>A disposable lock guard that releases the lock on dispose</returns>
         /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
+        /// <remarks>
+        /// The lock is owned by the calling thread. The guard is a <c>ref struct</c>, so it cannot be
+        /// held across an <c>await</c>: do the locked work in a synchronous method or block.
+        /// </remarks>
         public ReadLock AcquireReadLock(TimeSpan timeout)
         {
             ThrowIfDisposed();
@@ -766,16 +815,25 @@ namespace InterprocessMemory
 
             // Reentrant: if already holding any lock, just increment depth
             if (_readLockDepth.Value > 0 || _writeLockDepth.Value > 0)
-            {
-                IncrementReadLockDepth();
-                return new ReadLock(null, DecrementReadLockDepth);
-            }
+                return new ReadLock(this, null, ++_readLockDepth.Value);
 
             if (!_buffer.TryAcquireReadLock(timeout))
                 throw new TimeoutException($"Failed to acquire read lock within {timeout}");
 
-            IncrementReadLockDepth();
-            return new ReadLock(_buffer, DecrementReadLockDepth);
+            return new ReadLock(this, _buffer, ++_readLockDepth.Value);
+        }
+
+        /// <summary>
+        /// Unconditionally clears the cross-process write lock and read-lock count of this region.
+        /// A process that dies while holding a read lock leaves the shared reader count above zero
+        /// forever, which makes every later writer time out and, on Linux, survives reopening the region.
+        /// Call this only when no process is inside a critical section of the region.
+        /// See <see cref="MemoryRegion.ForceResetLocks"/>.
+        /// </summary>
+        public void ForceResetLocks()
+        {
+            ThrowIfDisposed();
+            ((MemoryRegion)_buffer).ForceResetLocks();
         }
 
         /// <summary>
@@ -807,6 +865,9 @@ namespace InterprocessMemory
             BitConverter.TryWriteBytes(header.Slice(12), _schemaHash);
 
             _buffer.Write(header, 0);
+
+            // Publish the magic last (see SharedArray.InitializeHeader).
+            Thread.MemoryBarrier();
             BitConverter.TryWriteBytes(header, SchemaMagic);
             _buffer.Write(header.Slice(0, sizeof(uint)), 0);
         }
@@ -814,11 +875,12 @@ namespace InterprocessMemory
         private void ValidateSchemaCompatibility()
         {
             Span<byte> header = stackalloc byte[SchemaHeaderSize];
+            Span<byte> magic = stackalloc byte[sizeof(uint)];
             var sw = Stopwatch.StartNew();
             while (true)
             {
-                _buffer.Read(header, 0);
-                if (BitConverter.ToUInt32(header) == SchemaMagic)
+                _buffer.Read(magic, 0);
+                if (BitConverter.ToUInt32(magic) == SchemaMagic)
                     break;
                 if (sw.Elapsed > TimeSpan.FromSeconds(5))
                     throw new InvalidDataException(
@@ -826,9 +888,22 @@ namespace InterprocessMemory
                 Thread.SpinWait(100);
             }
 
+            // Read the fields only after the magic has been seen (see SharedArray.ValidateAndLoadHeader).
+            Thread.MemoryBarrier();
+            _buffer.Read(header, 0);
+
             StoredSchemaVersion = BitConverter.ToInt32(header.Slice(4));
             int storedFieldCount = BitConverter.ToInt32(header.Slice(8));
             int storedHash = BitConverter.ToInt32(header.Slice(12));
+
+            long regionSize = _buffer.Capacity;
+
+            if (StoredSchemaVersion == SchemaVersion && regionSize != _totalSize)
+            {
+                throw new InvalidDataException(
+                    $"Structured-memory size mismatch: schema requires {_totalSize} bytes, " +
+                    $"but the region contains {regionSize} bytes.");
+            }
 
             if (StoredSchemaVersion == SchemaVersion && storedFieldCount != _fields.Count)
             {
@@ -853,6 +928,16 @@ namespace InterprocessMemory
                     throw new InvalidOperationException(
                         $"Schema version mismatch: expected {SchemaVersion}, found {StoredSchemaVersion}. " +
                         $"Compatibility mode: {_compatibility}");
+                }
+
+                // Whatever the versions are, the schema can only use what the region holds. A region written
+                // by a newer schema that appended fields is larger and an older reader uses its prefix;
+                // a region written by an older, smaller schema cannot hold the fields of this one.
+                if (regionSize < _totalSize)
+                {
+                    throw new InvalidDataException(
+                        $"Structured-memory size mismatch: schema version {SchemaVersion} requires {_totalSize} bytes, " +
+                        $"but the region (schema version {StoredSchemaVersion}) contains only {regionSize} bytes.");
                 }
 
                 // Schema-side veto: if the schema itself can declare incompatibility for this
@@ -969,6 +1054,16 @@ namespace InterprocessMemory
                     nameof(field.ElementSize),
                     $"Field '{field.Name}' element size must be positive");
 
+            // The accessors size their reads and writes from the type code (a string writes ArrayLength
+            // chars), the layout from ElementSize. A definition that disagrees with itself therefore writes
+            // over the next field.
+            int expectedElementSize = ExpectedElementSize(field.TypeCode);
+            if (expectedElementSize > 0 && field.ElementSize != expectedElementSize)
+                throw new ArgumentException(
+                    $"Field '{field.Name}' has type code {field.TypeCode}, whose elements are " +
+                    $"{expectedElementSize} bytes, but its element size is {field.ElementSize}",
+                    nameof(field.ElementSize));
+
             if (field.ArrayLength <= 0)
                 throw new ArgumentOutOfRangeException(
                     nameof(field.ArrayLength),
@@ -979,6 +1074,12 @@ namespace InterprocessMemory
                     $"Field '{field.Name}' alignment must be a positive power of 2",
                     nameof(field.Alignment));
 
+            // A blob or UTF-8 string is a 4 byte length prefix plus at least one byte of data.
+            if (field.TypeCode is FieldTypeCode.Blob or FieldTypeCode.Utf8String && field.ArrayLength <= 4)
+                throw new ArgumentOutOfRangeException(
+                    nameof(field.ArrayLength),
+                    $"Field '{field.Name}' is a {field.TypeCode} and needs a length of at least 5 (4 byte prefix plus data)");
+
             long size = (long)field.ElementSize * field.ArrayLength;
             if (size > int.MaxValue)
                 throw new ArgumentOutOfRangeException(
@@ -987,6 +1088,19 @@ namespace InterprocessMemory
 
             return (int)size;
         }
+
+        /// <summary>Size of one element of <paramref name="typeCode"/>, or 0 when it can be anything.</summary>
+        private static int ExpectedElementSize(FieldTypeCode typeCode) => typeCode switch
+        {
+            FieldTypeCode.Boolean or FieldTypeCode.Byte or FieldTypeCode.SByte => 1,
+            FieldTypeCode.Blob or FieldTypeCode.Utf8String => 1,
+            FieldTypeCode.Char or FieldTypeCode.Int16 or FieldTypeCode.UInt16 => 2,
+            FieldTypeCode.Int32 or FieldTypeCode.UInt32 or FieldTypeCode.Single => 4,
+            FieldTypeCode.Int64 or FieldTypeCode.UInt64 or FieldTypeCode.Double => 8,
+            FieldTypeCode.DateTime or FieldTypeCode.TimeSpan => 8,
+            FieldTypeCode.Decimal or FieldTypeCode.Guid or FieldTypeCode.DateTimeOffset => 16,
+            _ => 0   // Struct: the size of the struct
+        };
 
         private static long AlignUp(long value, long alignment)
         {
@@ -1009,26 +1123,6 @@ namespace InterprocessMemory
                     maxEnd = end;
             }
             return (maxEnd + 63) & ~63L;
-        }
-
-        private void InitializeMemory()
-        {
-            // Allocate only as much stack space as needed; avoids wasting 4096 bytes
-            // when the buffer is smaller (e.g. a schema with a single small field).
-            int chunkSize = (int)Math.Min(4096, _buffer.Capacity);
-            Span<byte> zeros = stackalloc byte[chunkSize];
-            zeros.Clear();
-
-            long offset = 0;
-            long remaining = _buffer.Capacity;
-
-            while (remaining > 0)
-            {
-                int write = (int)Math.Min(zeros.Length, remaining);
-                _buffer.Write(zeros.Slice(0, write), offset);
-                offset += write;
-                remaining -= write;
-            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1067,21 +1161,6 @@ namespace InterprocessMemory
         private int GetWriteLockDepth() => _writeLockDepth.Value;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void IncrementWriteLockDepth() => _writeLockDepth.Value++;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void DecrementWriteLockDepth() => _writeLockDepth.Value--;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private int GetReadLockDepth() => _readLockDepth.Value;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void IncrementReadLockDepth() => _readLockDepth.Value++;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void DecrementReadLockDepth() => _readLockDepth.Value--;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool IsHoldingAnyLock() => _writeLockDepth.Value > 0 || _readLockDepth.Value > 0;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1105,27 +1184,33 @@ namespace InterprocessMemory
         }
 
         /// <summary>
-        /// Releases all resources used by this shared memory region
+        /// Releases the underlying memory region. Stop and join every thread that uses this instance first:
+        /// calls that do not take a lock are not tracked, so one that is still running while the memory is
+        /// unmapped terminates the process (see <see cref="MemoryRegion.DisposeGracePeriod"/>).
         /// </summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
 
+            // A guard that is still open on this thread would otherwise leave the cross-process lock held
+            // until the process ends (its owner is alive, so no waiter would recover it). Guards held by
+            // other threads cannot be reached from here: stop and join those threads before disposing.
+            try
+            {
+                if (_writeLockDepth.Value > 0)
+                    _buffer.ReleaseWriteLock();
+                else if (_readLockDepth.Value > 0)
+                    _buffer.ReleaseReadLock();
+            }
+            catch (Exception ex) when (ex is SynchronizationLockException or ObjectDisposedException)
+            {
+                // The lock was taken over (orphan recovery or ForceResetLocks) or the region is gone.
+            }
+
             _buffer?.Dispose();
             _writeLockDepth.Dispose();
             _readLockDepth.Dispose();
-            GC.SuppressFinalize(this);
-        }
-
-        /// <summary>
-        /// Releases unmanaged resources if Dispose was not called
-        /// </summary>
-        ~StructuredMemory()
-        {
-            Interlocked.Exchange(ref _disposed, 1);
-            // MemoryRegion owns its unmanaged finalizer path. Avoid invoking
-            // managed Dispose logic from this finalizer.
         }
 
         private static void EnsureScalarField(FieldMetadata metadata)
@@ -1137,74 +1222,133 @@ namespace InterprocessMemory
             }
         }
 
-        /// <summary>
-        /// RAII wrapper for write lock with double-dispose and reentrant safety.
-        /// When acquired via reentrant path, buffer is null and Dispose only decrements the depth counter.
-        ///
-        /// <para><b>Do not copy this struct.</b> The double-dispose guard (an
-        /// <c>Interlocked.Exchange</c> on <c>_onDispose</c>) operates on the struct's own field,
-        /// not a shared one. Copying the struct duplicates the field, and each copy's
-        /// <c>Dispose()</c> will independently decrement the lock depth — corrupting the
-        /// reentrant depth counter and potentially releasing the underlying buffer lock twice.
-        /// Always consume via <c>using var ... = AcquireWriteLock(...)</c>, never <c>var copy = lock;</c>.</para>
-        /// </summary>
-        public struct WriteLock : IDisposable
+        internal void ExitWriteLock(IMemoryRegion? regionToRelease, int depth)
         {
-            private IMemoryRegion? _buffer;
-            private Action? _onDispose;
+            // Dispose() already released what this thread held.
+            if (_disposed != 0)
+                return;
 
-            internal WriteLock(IMemoryRegion? buffer, Action? onDispose = null)
+            if (_writeLockDepth.Value != depth)
+                throw new SynchronizationLockException(
+                    "A write lock guard was disposed twice or out of order. Nothing was released.");
+
+            // A read guard taken inside the write lock holds no region lock of its own; releasing the write
+            // lock under it would leave that guard reading without any protection.
+            if (regionToRelease != null && _readLockDepth.Value > 0)
+                throw new SynchronizationLockException(
+                    "The write lock cannot be released while a read lock guard taken inside it is still open. Nothing was released.");
+
+            try
             {
-                _buffer = buffer;
-                _onDispose = onDispose;
+                regionToRelease?.ReleaseWriteLock();
             }
-
-            /// <summary>
-            /// Releases the write lock if not already released
-            /// </summary>
-            public void Dispose()
+            finally
             {
-                var onDispose = Interlocked.Exchange(ref _onDispose, null);
-                if (onDispose != null)
-                {
-                    _buffer?.ReleaseWriteLock();
-                    _buffer = null;
-                    onDispose.Invoke();
-                }
+                _writeLockDepth.Value = depth - 1;
+            }
+        }
+
+        internal void ExitReadLock(IMemoryRegion? regionToRelease, int depth)
+        {
+            if (_disposed != 0)
+                return;
+
+            if (_readLockDepth.Value != depth)
+                throw new SynchronizationLockException(
+                    "A read lock guard was disposed twice or out of order. Nothing was released.");
+
+            try
+            {
+                regionToRelease?.ReleaseReadLock();
+            }
+            finally
+            {
+                _readLockDepth.Value = depth - 1;
             }
         }
 
         /// <summary>
-        /// RAII wrapper for read lock with double-dispose and reentrant safety.
-        /// When acquired via reentrant path, buffer is null and Dispose only decrements the depth counter.
+        /// Guard returned by <see cref="AcquireWriteLock()"/>; disposing it releases the lock. A reentrant
+        /// acquisition holds no region of its own and only decrements the depth when it is disposed.
         ///
-        /// <para><b>Do not copy this struct.</b> Same reasoning as <see cref="WriteLock"/> —
-        /// copies will each run <c>Dispose()</c>, double-decrementing the reentrant depth and
-        /// potentially releasing the underlying buffer lock twice.</para>
+        /// <para>It is a <c>ref struct</c> on purpose: the lock belongs to one thread, and the compiler
+        /// therefore rejects keeping the guard in an <c>async</c> method (CS4012, CS9104 for a
+        /// <c>using</c> resource), capturing it in a lambda (CS8175) and boxing it. Do the locked work in a
+        /// synchronous method or block.</para>
+        ///
+        /// <para>Disposing the same variable twice has no further effect. A <i>copy</i> of the guard is a
+        /// different matter: it remembers the depth at which the lock was taken, and disposing it after the
+        /// original (or in any other order than last-acquired-first-released) throws
+        /// <see cref="SynchronizationLockException"/> without touching the lock state, instead of silently
+        /// corrupting the depth counter of the thread. Consume it with <c>using var ... =
+        /// AcquireWriteLock(...)</c>.</para>
         /// </summary>
-        public struct ReadLock : IDisposable
+        public ref struct WriteLock
         {
-            private IMemoryRegion? _buffer;
-            private Action? _onDispose;
+            private StructuredMemory<TSchema>? _owner;
+            private readonly IMemoryRegion? _regionToRelease;
+            private readonly int _depth;
 
-            internal ReadLock(IMemoryRegion? buffer, Action? onDispose = null)
+            internal WriteLock(StructuredMemory<TSchema> owner, IMemoryRegion? regionToRelease, int depth)
             {
-                _buffer = buffer;
-                _onDispose = onDispose;
+                _owner = owner;
+                _regionToRelease = regionToRelease;
+                _depth = depth;
             }
 
             /// <summary>
-            /// Releases the read lock if not already released
+            /// Releases the write lock if not already released.
             /// </summary>
+            /// <exception cref="SynchronizationLockException">
+            /// Called on a copy of a guard that was already released, or out of order. Nothing is
+            /// released in these cases.
+            /// </exception>
             public void Dispose()
             {
-                var onDispose = Interlocked.Exchange(ref _onDispose, null);
-                if (onDispose != null)
-                {
-                    _buffer?.ReleaseReadLock();
-                    _buffer = null;
-                    onDispose.Invoke();
-                }
+                StructuredMemory<TSchema>? owner = _owner;
+                if (owner is null)
+                    return;
+
+                // A refused release (a copy, or an order that would leave a read guard unprotected) throws
+                // before anything changes, and the guard stays valid so that it can be released properly.
+                owner.ExitWriteLock(_regionToRelease, _depth);
+                _owner = null;
+            }
+        }
+
+        /// <summary>
+        /// Guard returned by <see cref="AcquireReadLock()"/>; disposing it releases the lock. A ref struct
+        /// for the same reason as <see cref="WriteLock"/>, which also describes the rules about copies and
+        /// order.
+        /// </summary>
+        public ref struct ReadLock
+        {
+            private StructuredMemory<TSchema>? _owner;
+            private readonly IMemoryRegion? _regionToRelease;
+            private readonly int _depth;
+
+            internal ReadLock(StructuredMemory<TSchema> owner, IMemoryRegion? regionToRelease, int depth)
+            {
+                _owner = owner;
+                _regionToRelease = regionToRelease;
+                _depth = depth;
+            }
+
+            /// <summary>
+            /// Releases the read lock if not already released.
+            /// </summary>
+            /// <exception cref="SynchronizationLockException">
+            /// Called on a copy of a guard that was already released, or out of order. Nothing is
+            /// released in these cases. See <see cref="WriteLock.Dispose"/>.
+            /// </exception>
+            public void Dispose()
+            {
+                StructuredMemory<TSchema>? owner = _owner;
+                if (owner is null)
+                    return;
+
+                owner.ExitReadLock(_regionToRelease, _depth);
+                _owner = null;
             }
         }
 

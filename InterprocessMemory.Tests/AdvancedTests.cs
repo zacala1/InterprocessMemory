@@ -287,6 +287,7 @@ public class AdvancedTests
     #region Multi-Threading Safety Tests
 
     [Test]
+    [Timeout(120000)]
     public async Task SharedArray_ConcurrentAccess_DifferentIndices_ShouldBeThreadSafe()
     {
         const int threadCount = 8;
@@ -334,13 +335,13 @@ public class AdvancedTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task SingleProducerByteStream_SPSC_HighContention()
     {
         using var buffer = new SingleProducerByteStream(GetUniqueName("SPSC_Contention"), 64 * 1024);
 
         const int messageCount = 100000;
         var errors = new ConcurrentBag<string>();
-        var producerDone = false;
 
         var producer = Task.Run(() =>
         {
@@ -359,7 +360,6 @@ public class AdvancedTests
                     }
                 }
             }
-            producerDone = true;
         });
 
         var consumer = Task.Run(() =>
@@ -380,18 +380,20 @@ public class AdvancedTests
                     }
                     expected++;
                 }
-                else if (bytesRead == 0 && !producerDone)
+                else if (bytesRead == 0)
                 {
+                    // Empty for now. The loop ends when every message has arrived, or when the producer
+                    // gave up (it reports that in errors). A read that is repeated "once more after the
+                    // producer finished" and whose result is dropped loses the message it reads: a consumer
+                    // that was descheduled between its empty read and the check of the flag did exactly that.
+                    if (!errors.IsEmpty)
+                        return;
                     Thread.SpinWait(1);
                 }
-                else if (bytesRead == 0 && producerDone)
+                else
                 {
-                    // Check again after seeing producerDone
-                    Thread.MemoryBarrier();
-                    if (buffer.TryRead(readBuffer) == 0 && expected < messageCount)
-                    {
-                        Thread.SpinWait(10);
-                    }
+                    errors.Add($"Partial read of {bytesRead} bytes at message {expected}");
+                    return;
                 }
             }
         });
@@ -401,6 +403,7 @@ public class AdvancedTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task MemoryRegion_ConcurrentReadWrite_WithLocks()
     {
         var options = new MemoryRegionOptions { Capacity = 4096 };
@@ -461,6 +464,7 @@ public class AdvancedTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task StructuredMemory_ConcurrentFieldAccess_WithLocks()
     {
         var schema = new TestSchema();
@@ -596,8 +600,9 @@ public class AdvancedTests
         var writeLock = memory.AcquireWriteLock();
         writeLock.Dispose();
 
-        // Second dispose should not throw or release lock again
-        Assert.DoesNotThrow(() => writeLock.Dispose());
+        // Second dispose should not throw or release lock again (the guard is a ref struct, so it
+        // cannot be captured by Assert.DoesNotThrow; an exception fails the test all the same)
+        writeLock.Dispose();
     }
 
     [Test]
@@ -610,7 +615,7 @@ public class AdvancedTests
         readLock.Dispose();
 
         // Second dispose should not throw or release lock again
-        Assert.DoesNotThrow(() => readLock.Dispose());
+        readLock.Dispose();
     }
 
     [Test]
@@ -915,6 +920,7 @@ public class AdvancedTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void MemoryRegion_ConcurrentTimeout_AllShouldComplete()
     {
         using var buffer = new MemoryRegion(GetUniqueName("ConcTimeout"), new MemoryRegionOptions { Capacity = 1024 });

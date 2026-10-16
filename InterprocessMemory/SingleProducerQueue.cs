@@ -23,6 +23,12 @@ namespace InterprocessMemory
 
     /// <summary>
     /// Fixed-size queue for exactly one producer and one consumer, which may live in separate processes.
+    /// <para>
+    /// Items are copied as raw bytes, padding included. The bytes between the fields of a struct are not
+    /// defined and may hold whatever the sender's stack held, so a struct with padding can pass such data
+    /// on to the receiving process. Use a type without padding (or zero it with <c>default</c> and
+    /// assign every field) when that matters.
+    /// </para>
     /// </summary>
     public sealed unsafe class SingleProducerQueue<T> : IDisposable where T : unmanaged
     {
@@ -71,7 +77,7 @@ namespace InterprocessMemory
 
             if (createOrOpen)
             {
-                _capacity = RoundUpToPowerOf2(capacity!.Value);
+                _capacity = PowerOfTwo.RoundUp(capacity!.Value, "capacity");
                 _capacityMask = _capacity - 1;
                 long regionCapacity = checked(HeaderSize + (long)_capacity * _elementSize);
                 if (regionCapacity > int.MaxValue)
@@ -132,10 +138,13 @@ namespace InterprocessMemory
                 _header->FingerprintHigh != _fingerprint.High)
                 throw new InvalidDataException("The queue has a different format or element type.");
 
-            if (requestedCapacity.HasValue &&
-                RoundUpToPowerOf2(requestedCapacity.Value) != storedCapacity)
-                throw new InvalidOperationException(
-                    $"Capacity mismatch: expected {RoundUpToPowerOf2(requestedCapacity.Value)}, found {storedCapacity}.");
+            if (requestedCapacity.HasValue)
+            {
+                int expectedCapacity = PowerOfTwo.RoundUp(requestedCapacity.Value, "capacity");
+                if (expectedCapacity != storedCapacity)
+                    throw new InvalidOperationException(
+                        $"Capacity mismatch: expected {expectedCapacity}, found {storedCapacity}.");
+            }
 
             long expectedRegionSize = checked(HeaderSize + (long)storedCapacity * _elementSize);
             if (_region.Capacity != expectedRegionSize)
@@ -224,19 +233,6 @@ namespace InterprocessMemory
             return true;
         }
 
-        private static int RoundUpToPowerOf2(int value)
-        {
-            if (value > 1 << 30)
-                throw new ArgumentOutOfRangeException(nameof(value));
-            value--;
-            value |= value >> 1;
-            value |= value >> 2;
-            value |= value >> 4;
-            value |= value >> 8;
-            value |= value >> 16;
-            return value + 1;
-        }
-
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private void ThrowIfDisposed()
         {
@@ -244,13 +240,17 @@ namespace InterprocessMemory
                 throw new ObjectDisposedException(nameof(SingleProducerQueue<T>));
         }
 
+        /// <summary>
+        /// Releases the underlying memory region. Stop and join every thread that uses this instance first:
+        /// calls that do not take a lock are not tracked, so one that is still running while the memory is
+        /// unmapped terminates the process (see <see cref="MemoryRegion.DisposeGracePeriod"/>).
+        /// </summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
             _memoryHandle.Dispose();
             _region.Dispose();
-            GC.SuppressFinalize(this);
         }
     }
 }

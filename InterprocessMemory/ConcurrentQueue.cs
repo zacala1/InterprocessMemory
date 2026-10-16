@@ -34,10 +34,27 @@ namespace InterprocessMemory
 
     /// <summary>
     /// Fixed-size lock-free queue for multiple producers and multiple consumers across processes.
+    /// <para>
+    /// A process that dies inside <see cref="TryEnqueue(in T)"/> or <see cref="TryDequeue(out T)"/>, after it
+    /// claimed a slot and before it published or released it, leaves that slot claimed for good: consumers see an
+    /// empty queue, or producers a full one, although other slots hold data. There is no automatic recovery;
+    /// stop all users and call <see cref="MemoryRegion.Remove"/>, which discards the queued items.
+    /// </para>
+    /// <para>
+    /// Items are copied as raw bytes, padding included. The bytes between the fields of a struct are not
+    /// defined and may hold whatever the sender's stack held, so a struct with padding can pass such data
+    /// on to the receiving process. Use a type without padding (or zero it with <c>default</c> and
+    /// assign every field) when that matters.
+    /// </para>
     /// </summary>
     public sealed unsafe class ConcurrentQueue<T> : IDisposable where T : unmanaged
     {
         private const int HeaderSize = 320;
+
+        // A slot's sequence is write+1 once it is published and read+capacity once it is free again.
+        // With a single slot those two values are the same, so a full queue looks empty to the next
+        // producer, which overwrites the item and then stalls the queue for good.
+        private const int MinimumCapacity = 2;
         private const int SlotHeaderSize = 8;
         private const int FormatVersion = 3;
         private const long HeaderMagic = 0x5143504D504953;
@@ -99,7 +116,7 @@ namespace InterprocessMemory
 
             if (createOrOpen)
             {
-                _capacity = RoundUpToPowerOf2(capacity!.Value);
+                _capacity = PowerOfTwo.RoundUp(capacity!.Value, "capacity", MinimumCapacity);
                 _capacityMask = _capacity - 1;
                 _slotStride = RoundUpToMultiple(checked(SlotHeaderSize + _elementSize), 8);
                 long regionCapacity = checked(HeaderSize + (long)_capacity * _slotStride);
@@ -171,18 +188,21 @@ namespace InterprocessMemory
             int storedCapacity = _header->Capacity;
             int storedStride = _header->SlotStride;
             if (_header->Version != FormatVersion ||
-                storedCapacity <= 0 ||
+                storedCapacity < MinimumCapacity ||
                 (storedCapacity & (storedCapacity - 1)) != 0 ||
                 _header->ElementSize != _elementSize ||
-                storedStride < SlotHeaderSize + _elementSize ||
+                storedStride != RoundUpToMultiple(SlotHeaderSize + _elementSize, 8) ||
                 _header->FingerprintLow != _fingerprint.Low ||
                 _header->FingerprintHigh != _fingerprint.High)
                 throw new InvalidDataException("The queue has a different format or element type.");
 
-            if (requestedCapacity.HasValue &&
-                RoundUpToPowerOf2(requestedCapacity.Value) != storedCapacity)
-                throw new InvalidOperationException(
-                    $"Capacity mismatch: expected {RoundUpToPowerOf2(requestedCapacity.Value)}, found {storedCapacity}.");
+            if (requestedCapacity.HasValue)
+            {
+                int expectedCapacity = PowerOfTwo.RoundUp(requestedCapacity.Value, "capacity", MinimumCapacity);
+                if (expectedCapacity != storedCapacity)
+                    throw new InvalidOperationException(
+                        $"Capacity mismatch: expected {expectedCapacity}, found {storedCapacity}.");
+            }
 
             long expectedRegionSize = checked(HeaderSize + (long)storedCapacity * storedStride);
             if (_region.Capacity != expectedRegionSize)
@@ -200,7 +220,11 @@ namespace InterprocessMemory
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static byte* GetSlotData(ConcurrentQueueSlot* slot) => (byte*)slot + SlotHeaderSize;
 
-        public bool TryEnqueue(in T item)
+        public bool TryEnqueue(in T item) => TryEnqueueCore(in item, countFailure: true);
+
+        // countFailure is false while a timeout overload polls: the call counts as one failed enqueue when
+        // it gives up, not once per poll (4 s of waiting used to add about 1,800 failed enqueues).
+        private bool TryEnqueueCore(in T item, bool countFailure)
         {
             ThrowIfDisposed();
             for (int spin = 0; spin < _maxSpins; spin++)
@@ -222,7 +246,7 @@ namespace InterprocessMemory
                 }
                 else if (difference < 0)
                 {
-                    if (_statisticsEnabled)
+                    if (_statisticsEnabled && countFailure)
                         Interlocked.Increment(ref _header->FailedEnqueues);
                     return false;
                 }
@@ -232,7 +256,9 @@ namespace InterprocessMemory
             return false;
         }
 
-        public bool TryDequeue(out T item)
+        public bool TryDequeue(out T item) => TryDequeueCore(out item, countFailure: true);
+
+        private bool TryDequeueCore(out T item, bool countFailure)
         {
             ThrowIfDisposed();
             for (int spin = 0; spin < _maxSpins; spin++)
@@ -254,7 +280,7 @@ namespace InterprocessMemory
                 }
                 else if (difference < 0)
                 {
-                    if (_statisticsEnabled)
+                    if (_statisticsEnabled && countFailure)
                         Interlocked.Increment(ref _header->FailedDequeues);
                     item = default;
                     return false;
@@ -273,12 +299,16 @@ namespace InterprocessMemory
             CancellationToken cancellationToken = default)
         {
             TimeoutHelper.Validate(timeout, nameof(timeout));
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
-            while (!TryEnqueue(in item))
+            while (!TryEnqueueCore(in item, countFailure: false))
             {
-                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(start, timeout))
+                {
+                    if (_statisticsEnabled)
+                        Interlocked.Increment(ref _header->FailedEnqueues);
                     return false;
+                }
                 spinner.SpinOnce();
             }
             return true;
@@ -290,12 +320,14 @@ namespace InterprocessMemory
             CancellationToken cancellationToken = default)
         {
             TimeoutHelper.Validate(timeout, nameof(timeout));
-            var sw = Stopwatch.StartNew();
+            long start = Stopwatch.GetTimestamp();
             var spinner = new SpinWait();
-            while (!TryDequeue(out item))
+            while (!TryDequeueCore(out item, countFailure: false))
             {
-                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(sw, timeout))
+                if (cancellationToken.IsCancellationRequested || TimeoutHelper.HasExpired(start, timeout))
                 {
+                    if (_statisticsEnabled)
+                        Interlocked.Increment(ref _header->FailedDequeues);
                     item = default;
                     return false;
                 }
@@ -314,19 +346,6 @@ namespace InterprocessMemory
                 Volatile.Read(ref _header->FailedDequeues));
         }
 
-        private static int RoundUpToPowerOf2(int value)
-        {
-            if (value > 1 << 30)
-                throw new ArgumentOutOfRangeException(nameof(value));
-            value--;
-            value |= value >> 1;
-            value |= value >> 2;
-            value |= value >> 4;
-            value |= value >> 8;
-            value |= value >> 16;
-            return value + 1;
-        }
-
         private static int RoundUpToMultiple(int value, int multiple) =>
             checked((value + multiple - 1) / multiple * multiple);
 
@@ -337,13 +356,17 @@ namespace InterprocessMemory
                 throw new ObjectDisposedException(nameof(ConcurrentQueue<T>));
         }
 
+        /// <summary>
+        /// Releases the underlying memory region. Stop and join every thread that uses this instance first:
+        /// calls that do not take a lock are not tracked, so one that is still running while the memory is
+        /// unmapped terminates the process (see <see cref="MemoryRegion.DisposeGracePeriod"/>).
+        /// </summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0)
                 return;
             _memoryHandle.Dispose();
             _region.Dispose();
-            GC.SuppressFinalize(this);
         }
     }
 }

@@ -4,8 +4,8 @@
     <OutputPath>..\bin\$(Configuration)\</OutputPath>
     <AssemblyName>InterprocessMemory</AssemblyName>
     <RootNamespace>InterprocessMemory</RootNamespace>
-    <DocumentationFile>..\bin\$(Configuration)\$(TargetFramework)\InterprocessMemory.xml</DocumentationFile>
     <TargetFramework>net8.0</TargetFramework>
+    <DocumentationFile>..\bin\$(Configuration)\$(TargetFramework)\InterprocessMemory.xml</DocumentationFile>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
@@ -20,7 +20,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>InterprocessMemory</PackageId>
-    <Version>3.0.0</Version>
+    <Version>4.0.0</Version>
     <Title>InterprocessMemory</Title>
     <Description>Typed queues, messages, arrays, structured data, and raw memory shared safely between .NET processes.</Description>
     <PackageTags>shared-memory;ipc;high-performance;simd;lock-free;zero-allocation</PackageTags>
@@ -32,7 +32,7 @@
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
-    <PackageReleaseNotes>Version 3 introduces the InterprocessMemory namespace, factory-based creation, typed queues, explicit byte-stream/message APIs, and a new incompatible memory format.</PackageReleaseNotes>
+    <PackageReleaseNotes>Version 4 fixes lock-owner detection on Linux (3.0.0 takes the write lock of live owners), torn reads of small values, region creation races and several crash and Dispose hazards. Breaking: the StructuredMemory lock guards are ref structs (no await inside a lock scope), and some defaults and limits changed. See CHANGELOG.md and MIGRATION.md. The region format is unchanged from version 3.</PackageReleaseNotes>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>

@@ -22,10 +22,16 @@ namespace InterprocessMemory
         private readonly T* _pointer;
         private readonly int _length;
 
-        public UnmanagedMemoryManager(T* pointer, int length)
+        // The object that owns the mapping the pointer points into. Holding it makes every Memory<T> keep
+        // it reachable: without this, a caller that drops the MemoryRegion and keeps only the Memory<T> lets
+        // the garbage collector finalize the region, which unmaps the memory under the Memory<T>.
+        private readonly object? _owner;
+
+        public UnmanagedMemoryManager(T* pointer, int length, object? owner = null)
         {
             _pointer = pointer;
             _length = length;
+            _owner = owner;
         }
 
         public override Span<T> GetSpan() => new(_pointer, _length);
@@ -42,6 +48,9 @@ namespace InterprocessMemory
         }
 
         public override void Unpin() { }
+
+        /// <summary>The object that owns the mapping behind the pointer, when it was given.</summary>
+        internal object? Owner => _owner;
 
         protected override void Dispose(bool disposing) { }
     }

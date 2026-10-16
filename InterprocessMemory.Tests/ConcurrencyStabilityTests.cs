@@ -46,7 +46,7 @@ public class ConcurrencyStabilityTests
         var errors = new ConcurrentBag<string>();
         var cts = new CancellationTokenSource(durationMs);
 
-        var writers = Enumerable.Range(0, writerCount).Select(w => Task.Run(() =>
+        var writers = Enumerable.Range(0, writerCount).Select(w => DedicatedThread.Run(() =>
         {
             Span<byte> stamp = stackalloc byte[4];
             BitConverter.TryWriteBytes(stamp, writerMagics[w]);
@@ -61,7 +61,7 @@ public class ConcurrencyStabilityTests
             }
         })).ToArray();
 
-        var readers = Enumerable.Range(0, readerCount).Select(r => Task.Run(() =>
+        var readers = Enumerable.Range(0, readerCount).Select(r => DedicatedThread.Run(() =>
         {
             Span<byte> rd = stackalloc byte[4];
             while (!cts.Token.IsCancellationRequested)
@@ -120,7 +120,12 @@ public class ConcurrencyStabilityTests
         var writeSuccess = new int[writerCount];
         var readSuccess = 0L;
 
-        var writers = Enumerable.Range(0, writerCount).Select(w => Task.Run(() =>
+        // Every loop spins until the token is cancelled, so each one gets its own thread
+        // (LongRunning). On the thread pool, 68 spinning tasks occupy every worker on a machine
+        // with few cores, the pool adds a thread only every ~500 ms, and the writers queued behind
+        // the readers start late or the cancellation timer callback itself waits behind them (the
+        // test then fails with a starved writer or runs into its timeout).
+        var writers = Enumerable.Range(0, writerCount).Select(w => Task.Factory.StartNew(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -132,9 +137,9 @@ public class ConcurrencyStabilityTests
                 // Brief pause so we're not pegging the lock continuously
                 Thread.SpinWait(50);
             }
-        })).ToArray();
+        }, TaskCreationOptions.LongRunning)).ToArray();
 
-        var readers = Enumerable.Range(0, readerCount).Select(_ => Task.Run(() =>
+        var readers = Enumerable.Range(0, readerCount).Select(_ => Task.Factory.StartNew(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -144,7 +149,7 @@ public class ConcurrencyStabilityTests
                     finally { buf.ReleaseReadLock(); }
                 }
             }
-        })).ToArray();
+        }, TaskCreationOptions.LongRunning)).ToArray();
 
         await Task.WhenAll(writers.Concat(readers));
 
@@ -242,7 +247,7 @@ public class ConcurrencyStabilityTests
         var checkCount = 0L;
         var holdCount = 0L;
 
-        var holder = Task.Run(() =>
+        var holder = DedicatedThread.Run(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -259,7 +264,7 @@ public class ConcurrencyStabilityTests
             }
         });
 
-        var checkers = Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        var checkers = Enumerable.Range(0, 8).Select(_ => DedicatedThread.Run(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -285,6 +290,7 @@ public class ConcurrencyStabilityTests
     [Test]
     [Timeout(150000)]
     [Explicit("Long-running test — 2 min sustained SPSC")]
+    [Category("LongRunning")]
     public async Task Stability_SPSC_2Minutes_OrderPreserved()
     {
         // The existing Stability_MPMC_2Minutes_Continuous covers MPMC. SPSC has different
@@ -350,6 +356,7 @@ public class ConcurrencyStabilityTests
     [Test]
     [Timeout(150000)]
     [Explicit("Long-running test — 2 min sustained Strict mixed access")]
+    [Category("LongRunning")]
     public async Task Stability_Strict_2Minutes_MixedAccessNoLockLeak()
     {
         // Strict's reentrant lock + auto-lock on >8-byte types is intricate. A long run with
@@ -440,7 +447,7 @@ public class ConcurrencyStabilityTests
         var maxWriterWaitMs = 0L;
         var writerAcquires = 0;
 
-        var readers = Enumerable.Range(0, 8).Select(_ => Task.Run(() =>
+        var readers = Enumerable.Range(0, 8).Select(_ => DedicatedThread.Run(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -453,7 +460,7 @@ public class ConcurrencyStabilityTests
             }
         })).ToArray();
 
-        var writer = Task.Run(() =>
+        var writer = DedicatedThread.Run(() =>
         {
             while (!cts.Token.IsCancellationRequested)
             {
@@ -491,53 +498,68 @@ public class ConcurrencyStabilityTests
     // that cannot tolerate writer starvation should cap reader threads, insert pauses
     // between reader cycles, or layer a higher-level coordination primitive on top.
 
-    // ── MPMC producer fairness ───────────────────────────────────────────────
+    // ── MPMC producers: none is locked out ───────────────────────────────────
 
+    // The queue promises that every producer eventually gets its messages through, not that producers get
+    // equal shares in a given time. How the shares compare depends on the core count and the scheduler: nine
+    // spinning threads (eight producers and the consumer) on a few cores let the producer that is running
+    // win the next slot again and again while the others wait for a time slice. A ratio limit tested the
+    // scheduler, and so did a rule that every producer writes at least once in two seconds: a Windows CI
+    // runner gave one producer no slot at all in that time. So every producer gets a fixed amount of work and
+    // the test asks that all of it arrives, in order per producer, within a generous deadline.
     [Test]
-    [Timeout(30000)]
-    public async Task Fairness_Mpmc_ProducersGetReasonableShare()
+    [Timeout(120000)]
+    public async Task Mpmc_NoProducerIsLockedOut()
     {
-        // Vyukov queue gives each producer an equal shot at the next free slot via the
-        // WriteSequence CAS. Fairness should be statistically uniform — no producer gets
-        // catastrophically less than the others. We assert min/max producer count differs by
-        // less than 3x. The exact ratio depends on scheduler whims, so we keep it loose.
         using var buf = new ConcurrentMessageQueue(N("FairProd"), slotCount: 256, slotSize: 128);
 
         const int producerCount = 8;
-        const int durationMs = 2000;
-        var counts = new long[producerCount];
-        var cts = new CancellationTokenSource(durationMs);
+        const int perProducer = 20000;
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(90));
 
-        var producers = Enumerable.Range(0, producerCount).Select(p => Task.Run(() =>
+        var producers = Enumerable.Range(0, producerCount).Select(p => DedicatedThread.Run(() =>
         {
-            Span<byte> data = stackalloc byte[16];
-            BitConverter.TryWriteBytes(data, p);
-            while (!cts.Token.IsCancellationRequested)
+            var data = new byte[16];
+            for (int i = 0; i < perProducer; i++)
             {
-                if (buf.TryWrite(data))
-                    Interlocked.Increment(ref counts[p]);
+                BitConverter.TryWriteBytes(data.AsSpan(0, 4), p);
+                BitConverter.TryWriteBytes(data.AsSpan(4, 4), i);
+                while (!buf.TryWrite(data))
+                {
+                    if (deadline.IsCancellationRequested)
+                        return;   // the test reports the missing messages
+                }
             }
         })).ToArray();
 
-        // Single consumer drains continuously so producers don't all jam on full-buffer.
-        var consumer = Task.Run(() =>
+        var received = new int[producerCount];
+        var inOrder = true;
+        var consumer = DedicatedThread.Run(() =>
         {
-            Span<byte> rd = stackalloc byte[128];
-            while (!cts.Token.IsCancellationRequested)
+            var rd = new byte[128];
+            int total = 0;
+            while (total < producerCount * perProducer && !deadline.IsCancellationRequested)
             {
-                buf.TryRead(rd);
+                int length = buf.TryRead(rd);
+                if (length == 0)
+                    continue;
+
+                int producer = BitConverter.ToInt32(rd, 0);
+                int sequence = BitConverter.ToInt32(rd, 4);
+                // One consumer sees the messages of one producer in the order that producer wrote them.
+                if (sequence != received[producer])
+                    inOrder = false;
+                received[producer]++;
+                total++;
             }
         });
 
         await Task.WhenAll(producers.Append(consumer));
 
-        long min = counts.Min();
-        long max = counts.Max();
-        TestContext.Out.WriteLine($"Producer counts: [{string.Join(", ", counts)}], min={min}, max={max}");
-
-        Assert.That(min, Is.GreaterThan(0), "Some producer wrote zero messages — total starvation");
-        Assert.That((double)max / min, Is.LessThan(3.0),
-            "Max/min producer ratio > 3x — possible fairness regression");
+        TestContext.Out.WriteLine($"Messages received per producer: [{string.Join(", ", received)}]");
+        for (int p = 0; p < producerCount; p++)
+            Assert.That(received[p], Is.EqualTo(perProducer), $"producer {p} did not get its messages through");
+        Assert.That(inOrder, Is.True, "messages of one producer arrived out of order");
     }
 
     // ── Helper schema ─────────────────────────────────────────────────────────

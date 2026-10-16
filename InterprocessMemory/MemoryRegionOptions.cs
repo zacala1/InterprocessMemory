@@ -20,12 +20,19 @@ namespace InterprocessMemory
         public static readonly TimeSpan DefaultLockTimeout = TimeSpan.FromSeconds(5);
 
         /// <summary>
-        /// Default orphan lock timeout: 30 seconds
+        /// A reasonable value to pass as <see cref="OrphanLockTimeout"/> when you opt in to
+        /// time-based lock takeover (30 seconds). It is NOT the default: <see cref="OrphanLockTimeout"/>
+        /// is <see cref="TimeSpan.Zero"/> (disabled) unless you set it.
         /// </summary>
         public static readonly TimeSpan DefaultOrphanLockTimeout = TimeSpan.FromSeconds(30);
 
         /// <summary>
-        /// Gets or sets the default lock acquisition timeout
+        /// Gets or sets the default lock acquisition timeout.
+        /// <para>
+        /// Currently only validated: <see cref="IMemoryRegion"/> and the containers take the timeout as an
+        /// argument of each lock call (or use their own default of five seconds), and none of them reads
+        /// this value.
+        /// </para>
         /// </summary>
         public TimeSpan LockTimeout { get; set; } = DefaultLockTimeout;
 
@@ -35,7 +42,11 @@ namespace InterprocessMemory
         public bool EnableSimd { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets the memory alignment (must be power of 2)
+        /// Gets or sets the memory alignment (must be power of 2).
+        /// <para>
+        /// Currently only validated: it does not change how the region is mapped or copied (the mapping is
+        /// page aligned and the header is 128 bytes). It is a value for code that wants to align its own offsets.
+        /// </para>
         /// </summary>
         public int Alignment { get; set; } = 64; // Cache line size
 
@@ -45,14 +56,35 @@ namespace InterprocessMemory
         public string? FilePath { get; set; }
 
         /// <summary>
-        /// Gets or sets whether to enable orphan lock detection and recovery
+        /// Linux and macOS: the permissions of the backing file when this process creates it (the file under
+        /// <c>/dev/shm</c>, or the <see cref="FilePath"/> file). <c>null</c> (the default) keeps the platform
+        /// default, which is 0666 less the umask of the process and therefore usually 0644: every user can
+        /// read the region, only the owner can write it. Use <see cref="System.IO.UnixFileMode.UserRead"/> |
+        /// <see cref="System.IO.UnixFileMode.UserWrite"/> to keep other users out, or add the group bits when processes
+        /// of a group share the region; the umask still applies to what you ask for. It is ignored on Windows
+        /// and has no effect on a file that already exists.
+        /// </summary>
+        public System.IO.UnixFileMode? UnixCreateMode { get; set; }
+
+        /// <summary>
+        /// Gets or sets whether a waiting process recovers a write lock whose owner process has exited
+        /// (or whose PID was reused by another process)
         /// </summary>
         public bool EnableOrphanLockDetection { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets the timeout after which a lock is considered orphaned
+        /// Gets or sets the time after which a write lock held by a process that is still ALIVE is
+        /// also treated as orphaned, so that a waiter may take it over. <see cref="TimeSpan.Zero"/>
+        /// (the default) disables this.
+        /// <para>
+        /// A lock whose owner process has exited is always recovered while
+        /// <see cref="EnableOrphanLockDetection"/> is on. A time limit additionally breaks mutual
+        /// exclusion for a healthy owner that simply holds the lock for longer than the limit (a long
+        /// transaction, a paused debugger), so enable it only when every critical section is known to
+        /// be shorter than the value you choose.
+        /// </para>
         /// </summary>
-        public TimeSpan OrphanLockTimeout { get; set; } = DefaultOrphanLockTimeout;
+        public TimeSpan OrphanLockTimeout { get; set; } = TimeSpan.Zero;
 
         /// <summary>
         /// Gets or sets whether to enable checksum verification

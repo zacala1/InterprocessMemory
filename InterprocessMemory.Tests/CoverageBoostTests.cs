@@ -769,6 +769,7 @@ public class CoverageBoostTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void WriteLock_Timeout_ShouldThrow()
     {
         var schema = new ReentrantTestSchema();
@@ -796,6 +797,7 @@ public class CoverageBoostTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void ReadLock_Timeout_ShouldThrow()
     {
         var schema = new ReentrantTestSchema();
@@ -1302,6 +1304,7 @@ public class CoverageBoostTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void ReadLock_Timeout_DueToWriterContention_ShouldReturnFalse()
     {
         var options = new MemoryRegionOptions { Capacity = 4096 };
