@@ -143,7 +143,10 @@ namespace InterprocessMemory
             {
                 if (create && _buffer.IsOwner)
                 {
-                    InitializeMemory();
+                    // No InitializeMemory(): a new region is zero-filled by the operating system, and nothing
+                    // can write to it before its creator has published the header. Writing zeros anyway made
+                    // every page resident at once (about 5 s for a 1 GB region, and a sparse file in
+                    // /dev/shm became real memory) without changing a single byte.
                     WriteSchemaHeader();
                     StoredSchemaVersion = SchemaVersion;
                 }
@@ -632,36 +635,45 @@ namespace InterprocessMemory
         private void WriteUtf8StringInternal(string value, int byteCount, FieldMetadata metadata)
         {
             long baseOffset = SchemaHeaderSize + metadata.Offset;
+            int maxDataSize = metadata.ArrayLength - 4;
 
-            // Write 4-byte length prefix
+            // The previous value stays in the shared memory when a shorter one replaces it, and an empty
+            // string would leave all of it. Zero what the new value does not cover, but no more than the
+            // old value used: writing the whole capacity every time would make the cost and the time under
+            // the lock depend on the size of the field instead of the size of the data.
             Span<byte> lengthBuf = stackalloc byte[4];
+            _buffer.Read(lengthBuf, baseOffset);
+            int previousLength = BitConverter.ToInt32(lengthBuf);
+            if (previousLength < 0 || previousLength > maxDataSize)
+                previousLength = maxDataSize;   // damaged prefix: clear everything the field can hold
+
             BitConverter.TryWriteBytes(lengthBuf, byteCount);
             _buffer.Write(lengthBuf, baseOffset);
 
-            if (byteCount > 0)
+            int writeLength = Math.Max(byteCount, previousLength);
+            if (writeLength == 0)
+                return;
+
+            if (writeLength <= MaxStackAllocBytes)
             {
-                int totalSize = metadata.ArrayLength - 4;
-                if (totalSize <= MaxStackAllocBytes)
+                Span<byte> utf8Buf = stackalloc byte[writeLength];
+                utf8Buf.Clear();
+                System.Text.Encoding.UTF8.GetBytes(value, utf8Buf);
+                _buffer.Write(utf8Buf, baseOffset + 4);
+            }
+            else
+            {
+                byte[] rented = ArrayPool<byte>.Shared.Rent(writeLength);
+                try
                 {
-                    Span<byte> utf8Buf = stackalloc byte[totalSize];
-                    utf8Buf.Clear();
-                    System.Text.Encoding.UTF8.GetBytes(value, utf8Buf);
-                    _buffer.Write(utf8Buf, baseOffset + 4);
+                    var span = rented.AsSpan(0, writeLength);
+                    span.Clear();
+                    System.Text.Encoding.UTF8.GetBytes(value, span);
+                    _buffer.Write(span, baseOffset + 4);
                 }
-                else
+                finally
                 {
-                    byte[] rented = ArrayPool<byte>.Shared.Rent(totalSize);
-                    try
-                    {
-                        var span = rented.AsSpan(0, totalSize);
-                        span.Clear();
-                        System.Text.Encoding.UTF8.GetBytes(value, span);
-                        _buffer.Write(span, baseOffset + 4);
-                    }
-                    finally
-                    {
-                        ArrayPool<byte>.Shared.Return(rented);
-                    }
+                    ArrayPool<byte>.Shared.Return(rented);
                 }
             }
         }
@@ -1042,6 +1054,16 @@ namespace InterprocessMemory
                     nameof(field.ElementSize),
                     $"Field '{field.Name}' element size must be positive");
 
+            // The accessors size their reads and writes from the type code (a string writes ArrayLength
+            // chars), the layout from ElementSize. A definition that disagrees with itself therefore writes
+            // over the next field.
+            int expectedElementSize = ExpectedElementSize(field.TypeCode);
+            if (expectedElementSize > 0 && field.ElementSize != expectedElementSize)
+                throw new ArgumentException(
+                    $"Field '{field.Name}' has type code {field.TypeCode}, whose elements are " +
+                    $"{expectedElementSize} bytes, but its element size is {field.ElementSize}",
+                    nameof(field.ElementSize));
+
             if (field.ArrayLength <= 0)
                 throw new ArgumentOutOfRangeException(
                     nameof(field.ArrayLength),
@@ -1052,6 +1074,12 @@ namespace InterprocessMemory
                     $"Field '{field.Name}' alignment must be a positive power of 2",
                     nameof(field.Alignment));
 
+            // A blob or UTF-8 string is a 4 byte length prefix plus at least one byte of data.
+            if (field.TypeCode is FieldTypeCode.Blob or FieldTypeCode.Utf8String && field.ArrayLength <= 4)
+                throw new ArgumentOutOfRangeException(
+                    nameof(field.ArrayLength),
+                    $"Field '{field.Name}' is a {field.TypeCode} and needs a length of at least 5 (4 byte prefix plus data)");
+
             long size = (long)field.ElementSize * field.ArrayLength;
             if (size > int.MaxValue)
                 throw new ArgumentOutOfRangeException(
@@ -1060,6 +1088,19 @@ namespace InterprocessMemory
 
             return (int)size;
         }
+
+        /// <summary>Size of one element of <paramref name="typeCode"/>, or 0 when it can be anything.</summary>
+        private static int ExpectedElementSize(FieldTypeCode typeCode) => typeCode switch
+        {
+            FieldTypeCode.Boolean or FieldTypeCode.Byte or FieldTypeCode.SByte => 1,
+            FieldTypeCode.Blob or FieldTypeCode.Utf8String => 1,
+            FieldTypeCode.Char or FieldTypeCode.Int16 or FieldTypeCode.UInt16 => 2,
+            FieldTypeCode.Int32 or FieldTypeCode.UInt32 or FieldTypeCode.Single => 4,
+            FieldTypeCode.Int64 or FieldTypeCode.UInt64 or FieldTypeCode.Double => 8,
+            FieldTypeCode.DateTime or FieldTypeCode.TimeSpan => 8,
+            FieldTypeCode.Decimal or FieldTypeCode.Guid or FieldTypeCode.DateTimeOffset => 16,
+            _ => 0   // Struct: the size of the struct
+        };
 
         private static long AlignUp(long value, long alignment)
         {
@@ -1082,26 +1123,6 @@ namespace InterprocessMemory
                     maxEnd = end;
             }
             return (maxEnd + 63) & ~63L;
-        }
-
-        private void InitializeMemory()
-        {
-            // Allocate only as much stack space as needed; avoids wasting 4096 bytes
-            // when the buffer is smaller (e.g. a schema with a single small field).
-            int chunkSize = (int)Math.Min(4096, _buffer.Capacity);
-            Span<byte> zeros = stackalloc byte[chunkSize];
-            zeros.Clear();
-
-            long offset = 0;
-            long remaining = _buffer.Capacity;
-
-            while (remaining > 0)
-            {
-                int write = (int)Math.Min(zeros.Length, remaining);
-                _buffer.Write(zeros.Slice(0, write), offset);
-                offset += write;
-                remaining -= write;
-            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
