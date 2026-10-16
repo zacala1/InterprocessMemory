@@ -596,8 +596,9 @@ public class AdvancedTests
         var writeLock = memory.AcquireWriteLock();
         writeLock.Dispose();
 
-        // Second dispose should not throw or release lock again
-        Assert.DoesNotThrow(() => writeLock.Dispose());
+        // Second dispose should not throw or release lock again (the guard is a ref struct, so it
+        // cannot be captured by Assert.DoesNotThrow; an exception fails the test all the same)
+        writeLock.Dispose();
     }
 
     [Test]
@@ -610,7 +611,7 @@ public class AdvancedTests
         readLock.Dispose();
 
         // Second dispose should not throw or release lock again
-        Assert.DoesNotThrow(() => readLock.Dispose());
+        readLock.Dispose();
     }
 
     [Test]

@@ -8,11 +8,22 @@ including one that runs a later version. Update all processes that use a region 
 
 ## Unreleased
 
+### Breaking changes
+
+- `StructuredMemory<T>.WriteLock` and `StructuredMemory<T>.ReadLock` (the guards returned by
+  `AcquireWriteLock()` and `AcquireReadLock()`) are `ref struct`s now; they were plain structs implementing
+  `IDisposable`. A lock belongs to the thread that took it, so an `await` inside a lock scope (the thread
+  that resumes releases nothing and the lock stays held by the thread-pool thread that took it) used to
+  compile and fail when the guard was disposed. It is a compile error now. `using var guard = ...` and
+  `using (...)` in synchronous code compile unchanged. What no longer compiles: a guard that is a local or
+  a `using` resource of an `async` method, one captured by a lambda or stored in a field, and one converted
+  to `IDisposable`. Do the locked work in a synchronous method and call that. Assemblies compiled against
+  3.0.0 must be recompiled. `SharedArray<T>` guards are `ref struct`s from the start.
+
 ### Behavior changes
 
 - `MemoryRegion.ReleaseWriteLock` throws `SynchronizationLockException` when the calling thread does
-  not own the lock (it used to be ignored). The `StructuredMemory<T>` lock guards do the same when they
-  are disposed on another thread, which is what an `await` inside a lock scope causes.
+  not own the lock (it used to be ignored).
 - `MemoryRegionOptions.OrphanLockTimeout` defaults to `TimeSpan.Zero` (disabled) instead of 30 seconds.
   A lock whose owner process has exited is still recovered by default; a lock held by a live process is
   taken over only if you set a timeout. `DefaultOrphanLockTimeout` keeps its value as a suggestion.

@@ -1463,12 +1463,10 @@ public class StructuredMemoryTests
         var schema = new TestSchema();
         using var memory = new StructuredMemory<TestSchema>(TestBufferName + "_LockDoubleDisp", schema);
 
+        // A ref struct cannot be captured by Assert.DoesNotThrow; an exception fails the test all the same.
         var lockObj = memory.AcquireWriteLock();
-        Assert.DoesNotThrow(() =>
-        {
-            lockObj.Dispose();
-            lockObj.Dispose();
-        });
+        lockObj.Dispose();
+        lockObj.Dispose();
     }
 
     [Test]
@@ -1478,11 +1476,8 @@ public class StructuredMemoryTests
         using var memory = new StructuredMemory<TestSchema>(TestBufferName + "_RLockDoubleDisp", schema);
 
         var lockObj = memory.AcquireReadLock();
-        Assert.DoesNotThrow(() =>
-        {
-            lockObj.Dispose();
-            lockObj.Dispose();
-        });
+        lockObj.Dispose();
+        lockObj.Dispose();
     }
 
     #endregion

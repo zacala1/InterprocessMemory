@@ -226,12 +226,14 @@ using (memory.AcquireWriteLock())
 UTF-8 strings, and arrays to prevent torn reads and writes. Use an explicit lock when several
 fields form one transaction.
 
-The lock guards returned by `AcquireWriteLock()` and `AcquireReadLock()` must be disposed on the
-thread that acquired them. Keep the guarded scope synchronous: an `await` inside it lets the guard
-be disposed on another thread, which throws `SynchronizationLockException`. So does disposing a *copy* of
-a guard after the original, or releasing the guards in another order than last-taken-first-released: the
-lock state is left untouched and the guard stays valid, so it can still be released properly. Disposing
-the instance while one of its guards is open on the calling thread releases that lock.
+The lock guards returned by `AcquireWriteLock()` and `AcquireReadLock()` are `ref struct`s, because a
+lock belongs to one thread and must never be held across an `await`: the compiler rejects a guard that is
+a local or a `using` resource of an `async` method, captures it in a lambda or boxes it. Do the locked work
+in a small synchronous method and call that. Disposing a *copy* of a guard after the original, or
+releasing the guards in another order than last-taken-first-released, throws
+`SynchronizationLockException`: the lock state is left untouched and the guard stays valid, so it can
+still be released properly. Disposing the instance while one of its guards is open on the calling thread
+releases that lock.
 
 ### Schema versions
 
@@ -284,9 +286,9 @@ using (reader.AcquireReadLock())
 The locks are shared by every process and thread that uses a lock, reentrant for the calling thread
 (the indexer inside a lock does not take it again), and time out with `TimeoutException`. Taking the
 write lock while the thread holds only a read lock throws `InvalidOperationException`. The guards are
-`ref struct`s, because a lock belongs to one thread and must never be held across an `await`: the
-compiler rejects a guard as a `using` resource in an `async` method (error CS9104), so do the locked
-work in a small synchronous method and call that. `array.ForceResetLocks()` clears a lock state left
+`ref struct`s, like those of `StructuredMemory<TSchema>`: the compiler rejects a guard that is a local or a
+`using` resource of an `async` method (errors CS4012 and CS9104), so do the locked work in a small
+synchronous method and call that. `array.ForceResetLocks()` clears a lock state left
 behind by a crash (see below). Processes still running a version without
 this locking do not take part in it.
 

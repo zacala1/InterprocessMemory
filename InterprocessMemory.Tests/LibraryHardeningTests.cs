@@ -156,57 +156,18 @@ public class LibraryHardeningTests
     }
 
     [Test]
-    public void StructuredMemory_WriteLockGuard_DisposedOnAnotherThread_ThrowsAndStaysHeld()
+    public void LockGuards_AreRefStructs_SoTheyCannotCrossAnAwaitOrAThread()
     {
-        string name = N("WriteGuardThread");
-        using var memory = StructuredMemory<SimpleSchema>.CreateOrOpen(name, new SimpleSchema());
-        using var peer = StructuredMemory<SimpleSchema>.OpenExisting(name, new SimpleSchema());
-
-        // What `await` inside a lock scope does: the guard is disposed on a different thread.
-        var guard = memory.AcquireWriteLock();
-        Exception? error = null;
-        Task.Run(() =>
+        // The compiler enforces the rest: a ref struct cannot be a local of an async method (CS4012), a using
+        // resource in one (CS9104), captured by a lambda (CS8175) or boxed (CS0029). That is what
+        // an await inside a lock scope used to turn into a lock that stayed held by a thread-pool thread.
+        Assert.Multiple(() =>
         {
-            try
-            { guard.Dispose(); }
-            catch (Exception ex) { error = ex; }
-        }).Wait();
-
-        Assert.That(error, Is.InstanceOf<SynchronizationLockException>());
-
-        // Nothing was released or unbalanced: the lock still belongs to the acquiring thread...
-        Assert.Throws<TimeoutException>(() => peer.AcquireWriteLock(TimeSpan.FromMilliseconds(100)));
-
-        // ...which can still release it properly, after which other holders get in.
-        guard.Dispose();
-        using (peer.AcquireWriteLock(TimeSpan.FromSeconds(1)))
-        {
-        }
-    }
-
-    [Test]
-    public void StructuredMemory_ReadLockGuard_DisposedOnAnotherThread_ThrowsAndStaysHeld()
-    {
-        string name = N("ReadGuardThread");
-        using var memory = StructuredMemory<SimpleSchema>.CreateOrOpen(name, new SimpleSchema());
-        using var peer = StructuredMemory<SimpleSchema>.OpenExisting(name, new SimpleSchema());
-
-        var guard = memory.AcquireReadLock();
-        Exception? error = null;
-        Task.Run(() =>
-        {
-            try
-            { guard.Dispose(); }
-            catch (Exception ex) { error = ex; }
-        }).Wait();
-
-        Assert.That(error, Is.InstanceOf<SynchronizationLockException>());
-        Assert.Throws<TimeoutException>(() => peer.AcquireWriteLock(TimeSpan.FromMilliseconds(100)));
-
-        guard.Dispose();
-        using (peer.AcquireWriteLock(TimeSpan.FromSeconds(1)))
-        {
-        }
+            Assert.That(typeof(StructuredMemory<SimpleSchema>.WriteLock).IsByRefLike, Is.True);
+            Assert.That(typeof(StructuredMemory<SimpleSchema>.ReadLock).IsByRefLike, Is.True);
+            Assert.That(typeof(SharedArray<int>.WriteLock).IsByRefLike, Is.True);
+            Assert.That(typeof(SharedArray<int>.ReadLock).IsByRefLike, Is.True);
+        });
     }
 
     [Test]
@@ -980,7 +941,12 @@ public class LibraryHardeningTests
             var copy = inner;
             inner.Dispose();
 
-            Assert.Throws<SynchronizationLockException>(() => copy.Dispose());
+            // (a ref struct cannot be captured by Assert.Throws)
+            SynchronizationLockException? refused = null;
+            try
+            { copy.Dispose(); }
+            catch (SynchronizationLockException ex) { refused = ex; }
+            Assert.That(refused, Is.Not.Null, "disposing a copy of a released guard must be refused");
 
             // Still inside the outer guard: an automatic lock must not try to take the region lock again.
             memory.Write("Value", Guid.NewGuid());
@@ -999,7 +965,11 @@ public class LibraryHardeningTests
         var write = memory.AcquireWriteLock();
         var read = memory.AcquireReadLock();
 
-        Assert.Throws<SynchronizationLockException>(() => write.Dispose());
+        SynchronizationLockException? refused = null;
+        try
+        { write.Dispose(); }
+        catch (SynchronizationLockException ex) { refused = ex; }
+        Assert.That(refused, Is.Not.Null, "the write guard must not be released under the read guard");
         Assert.That(Task.Run(() => peer.Read<Guid>("Value")).Wait(TimeSpan.FromMilliseconds(300)), Is.False,
             "the write lock must still be held");
 
@@ -1021,7 +991,8 @@ public class LibraryHardeningTests
         Assert.That(Task.Run(() => { using (peer.AcquireWriteLock(TimeSpan.FromSeconds(2))) { } }).Wait(TimeSpan.FromSeconds(5)), Is.True,
             "the lock was still held after the instance was disposed");
 
-        Assert.DoesNotThrow(() => guard.Dispose(), "a guard that outlives its instance is harmless");
+        // A guard that outlives its instance is harmless to dispose (an exception fails the test).
+        guard.Dispose();
     }
 
     // A 16 byte field: written and read under the shared lock, which is what the guard tests need.

@@ -17,10 +17,10 @@ namespace InterprocessMemory
     /// <para>
     /// Values wider than eight bytes, strings, blobs and arrays are read and written under the shared
     /// region lock automatically. Use <see cref="AcquireWriteLock()"/> / <see cref="AcquireReadLock()"/>
-    /// to group several fields into one transaction. The guards belong to the calling thread: dispose
-    /// them on the thread that acquired them (do not <c>await</c> inside the guarded scope), otherwise
-    /// <see cref="SynchronizationLockException"/> is thrown. <see cref="ForceResetLocks"/> clears a lock
-    /// state left behind by a crashed process.
+    /// to group several fields into one transaction. The guards are <c>ref struct</c>s because a lock
+    /// belongs to the thread that took it: the compiler rejects holding one across an <c>await</c> and
+    /// handing it to another thread. <see cref="ForceResetLocks"/> clears a lock state left behind by a
+    /// crashed process.
     /// </para>
     /// </summary>
     public sealed unsafe class StructuredMemory<TSchema> : IDisposable where TSchema : struct, IMemorySchema
@@ -747,9 +747,8 @@ namespace InterprocessMemory
         /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
         /// <exception cref="InvalidOperationException">The calling thread holds only a read lock (upgrading would deadlock)</exception>
         /// <remarks>
-        /// The lock is owned by the calling thread. Dispose the guard on that same thread; do not
-        /// <c>await</c> inside the guarded scope, or <see cref="WriteLock.Dispose"/> throws
-        /// <see cref="SynchronizationLockException"/>.
+        /// The lock is owned by the calling thread. The guard is a <c>ref struct</c>, so it cannot be
+        /// held across an <c>await</c>: do the locked work in a synchronous method or block.
         /// </remarks>
         public WriteLock AcquireWriteLock(TimeSpan timeout)
         {
@@ -794,8 +793,8 @@ namespace InterprocessMemory
         /// <returns>A disposable lock guard that releases the lock on dispose</returns>
         /// <exception cref="TimeoutException">Thrown when the lock cannot be acquired within the timeout</exception>
         /// <remarks>
-        /// Dispose the guard on the thread that acquired it; do not <c>await</c> inside the guarded
-        /// scope, or <see cref="ReadLock.Dispose"/> throws <see cref="SynchronizationLockException"/>.
+        /// The lock is owned by the calling thread. The guard is a <c>ref struct</c>, so it cannot be
+        /// held across an <c>await</c>: do the locked work in a synchronous method or block.
         /// </remarks>
         public ReadLock AcquireReadLock(TimeSpan timeout)
         {
@@ -1210,7 +1209,7 @@ namespace InterprocessMemory
 
             if (_writeLockDepth.Value != depth)
                 throw new SynchronizationLockException(
-                    "A write lock guard was disposed twice, out of order or on another thread. Nothing was released.");
+                    "A write lock guard was disposed twice or out of order. Nothing was released.");
 
             // A read guard taken inside the write lock holds no region lock of its own; releasing the write
             // lock under it would leave that guard reading without any protection.
@@ -1235,7 +1234,7 @@ namespace InterprocessMemory
 
             if (_readLockDepth.Value != depth)
                 throw new SynchronizationLockException(
-                    "A read lock guard was disposed twice, out of order or on another thread. Nothing was released.");
+                    "A read lock guard was disposed twice or out of order. Nothing was released.");
 
             try
             {
@@ -1248,8 +1247,13 @@ namespace InterprocessMemory
         }
 
         /// <summary>
-        /// RAII wrapper for the write lock. A reentrant acquisition holds no region of its own and only
-        /// decrements the depth when it is disposed.
+        /// Guard returned by <see cref="AcquireWriteLock()"/>; disposing it releases the lock. A reentrant
+        /// acquisition holds no region of its own and only decrements the depth when it is disposed.
+        ///
+        /// <para>It is a <c>ref struct</c> on purpose: the lock belongs to one thread, and the compiler
+        /// therefore rejects keeping the guard in an <c>async</c> method (CS4012, CS9104 for a
+        /// <c>using</c> resource), capturing it in a lambda (CS8175) and boxing it. Do the locked work in a
+        /// synchronous method or block.</para>
         ///
         /// <para>Disposing the same variable twice has no further effect. A <i>copy</i> of the guard is a
         /// different matter: it remembers the depth at which the lock was taken, and disposing it after the
@@ -1258,41 +1262,31 @@ namespace InterprocessMemory
         /// corrupting the depth counter of the thread. Consume it with <c>using var ... =
         /// AcquireWriteLock(...)</c>.</para>
         /// </summary>
-        public struct WriteLock : IDisposable
+        public ref struct WriteLock
         {
             private StructuredMemory<TSchema>? _owner;
             private readonly IMemoryRegion? _regionToRelease;
             private readonly int _depth;
-            private readonly int _ownerThreadId;
 
             internal WriteLock(StructuredMemory<TSchema> owner, IMemoryRegion? regionToRelease, int depth)
             {
                 _owner = owner;
                 _regionToRelease = regionToRelease;
                 _depth = depth;
-                _ownerThreadId = Environment.CurrentManagedThreadId;
             }
 
             /// <summary>
             /// Releases the write lock if not already released.
             /// </summary>
             /// <exception cref="SynchronizationLockException">
-            /// Called on a different thread than the one that acquired the lock, which is what happens
-            /// when the guarded scope contains an <c>await</c>, or called on a copy of a guard that was
-            /// already released, or out of order. Nothing is released in these cases.
+            /// Called on a copy of a guard that was already released, or out of order. Nothing is
+            /// released in these cases.
             /// </exception>
             public void Dispose()
             {
                 StructuredMemory<TSchema>? owner = _owner;
                 if (owner is null)
                     return;
-
-                // The lock and its reentrancy depth belong to the acquiring thread. Releasing from
-                // another thread would leave that thread believing it still holds the lock.
-                if (Environment.CurrentManagedThreadId != _ownerThreadId)
-                    throw new SynchronizationLockException(
-                        "A write lock guard must be disposed on the thread that acquired it. " +
-                        "Do not await inside a lock scope.");
 
                 // A refused release (a copy, or an order that would leave a read guard unprotected) throws
                 // before anything changes, and the guard stays valid so that it can be released properly.
@@ -1302,41 +1296,35 @@ namespace InterprocessMemory
         }
 
         /// <summary>
-        /// RAII wrapper for the read lock; see <see cref="WriteLock"/> for the rules about copies and order.
+        /// Guard returned by <see cref="AcquireReadLock()"/>; disposing it releases the lock. A ref struct
+        /// for the same reason as <see cref="WriteLock"/>, which also describes the rules about copies and
+        /// order.
         /// </summary>
-        public struct ReadLock : IDisposable
+        public ref struct ReadLock
         {
             private StructuredMemory<TSchema>? _owner;
             private readonly IMemoryRegion? _regionToRelease;
             private readonly int _depth;
-            private readonly int _ownerThreadId;
 
             internal ReadLock(StructuredMemory<TSchema> owner, IMemoryRegion? regionToRelease, int depth)
             {
                 _owner = owner;
                 _regionToRelease = regionToRelease;
                 _depth = depth;
-                _ownerThreadId = Environment.CurrentManagedThreadId;
             }
 
             /// <summary>
             /// Releases the read lock if not already released.
             /// </summary>
             /// <exception cref="SynchronizationLockException">
-            /// Called on a different thread than the one that acquired the lock, or on a copy of a guard that
-            /// was already released, or out of order. Nothing is released in these cases.
-            /// See <see cref="WriteLock.Dispose"/>.
+            /// Called on a copy of a guard that was already released, or out of order. Nothing is
+            /// released in these cases. See <see cref="WriteLock.Dispose"/>.
             /// </exception>
             public void Dispose()
             {
                 StructuredMemory<TSchema>? owner = _owner;
                 if (owner is null)
                     return;
-
-                if (Environment.CurrentManagedThreadId != _ownerThreadId)
-                    throw new SynchronizationLockException(
-                        "A read lock guard must be disposed on the thread that acquired it. " +
-                        "Do not await inside a lock scope.");
 
                 owner.ExitReadLock(_regionToRelease, _depth);
                 _owner = null;
