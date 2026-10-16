@@ -500,21 +500,20 @@ public class ConcurrencyStabilityTests
 
     // ── MPMC producer fairness ───────────────────────────────────────────────
 
-    // The ratio depends on the core count and the scheduler. Nine spinning threads (eight producers and the
-    // consumer) on a machine with fewer cores let the producer that is running win the next slot again and
-    // again while the others wait for a time slice: on 2 cores a ratio in the thousands was measured. The
-    // threads are dedicated, so a failure is that scheduling effect and not thread-pool starvation (which
-    // made the consumer never run, and every producer but one write nothing). CI runs this separately and
-    // reports a failure as a warning instead of failing the build.
+    // The queue promises that every producer eventually gets a slot, not that producers get equal shares.
+    // How far apart the shares are depends on the core count and the scheduler: nine spinning threads
+    // (eight producers and the consumer) on a machine with fewer cores let the producer that is running win
+    // the next slot again and again while the others wait for a time slice (a ratio of 3.5 was measured on
+    // a Linux CI runner, 31 on Windows, and in the thousands on 2 cores). A ratio limit therefore tests the
+    // scheduler and not the library, so the ratio is only reported. What is asserted is that no producer
+    // is locked out completely. The threads are dedicated: thread-pool starvation made the consumer never
+    // run, and every producer but one write nothing.
     [Test]
     [Category("TimingSensitive")]
     [Timeout(30000)]
-    public async Task Fairness_Mpmc_ProducersGetReasonableShare()
+    public async Task Mpmc_NoProducerIsLockedOut()
     {
-        // Vyukov queue gives each producer an equal shot at the next free slot via the
-        // WriteSequence CAS. Fairness should be statistically uniform — no producer gets
-        // catastrophically less than the others. We assert min/max producer count differs by
-        // less than 3x. The exact ratio depends on scheduler whims, so we keep it loose.
+        // Every producer retries the CAS on WriteSequence, so each one wins eventually; none is excluded.
         using var buf = new ConcurrentMessageQueue(N("FairProd"), slotCount: 256, slotSize: 128);
 
         const int producerCount = 8;
@@ -547,11 +546,10 @@ public class ConcurrencyStabilityTests
 
         long min = counts.Min();
         long max = counts.Max();
-        TestContext.Out.WriteLine($"Producer counts: [{string.Join(", ", counts)}], min={min}, max={max}");
+        TestContext.Out.WriteLine(
+            $"Producer counts: [{string.Join(", ", counts)}], min={min}, max={max}, max/min={(min > 0 ? (double)max / min : double.PositiveInfinity):F1} (reported, not asserted)");
 
         Assert.That(min, Is.GreaterThan(0), "Some producer wrote zero messages — total starvation");
-        Assert.That((double)max / min, Is.LessThan(3.0),
-            "Max/min producer ratio > 3x — possible fairness regression");
     }
 
     // ── Helper schema ─────────────────────────────────────────────────────────
