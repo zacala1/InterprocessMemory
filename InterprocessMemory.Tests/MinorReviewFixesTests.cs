@@ -271,6 +271,7 @@ public unsafe class MinorReviewFixesTests
     }
 
     [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void UnixCreateMode_SetsThePermissionsOfTheBackingFile()
     {
         if (!OperatingSystem.IsLinux())
@@ -284,6 +285,7 @@ public unsafe class MinorReviewFixesTests
     }
 
     [Test]
+    [System.Runtime.Versioning.SupportedOSPlatform("linux")]
     public void UnixCreateMode_AppliesToAFilePathRegionToo()
     {
         if (!OperatingSystem.IsLinux())

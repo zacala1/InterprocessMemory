@@ -1979,8 +1979,10 @@ public class StructuredMemoryTests
 
         using (memory.AcquireWriteLock())
         {
-            // Try to acquire another write lock from different thread with short timeout
-            var task = Task.Run(() =>
+            // Try to acquire another write lock from different thread with short timeout. The thread has to
+            // be a different one: Task.Run followed by Wait() may be run inline by the waiting thread, which
+            // owns the lock and would take it again (the lock is reentrant) instead of timing out.
+            var task = DedicatedThread.Run(() =>
             {
                 Assert.Throws<TimeoutException>(() =>
                     memory.AcquireWriteLock(TimeSpan.FromMilliseconds(50)));
