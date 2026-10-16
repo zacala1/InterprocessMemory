@@ -39,15 +39,15 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up .NET
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: 8.0.x
 
       - name: Cache NuGet packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.nuget/packages
           key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
@@ -102,9 +102,24 @@ jobs:
             echo "These tests depend on scheduling and do not fail the job, but a failure is still a result to read: see the log of the step above and the test-results artifact."
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # The test and build steps above turn package generation off. Pack once, on Linux (the assembly is the
+      # same on both platforms), so that a broken package definition (readme, symbols, metadata) fails the
+      # build instead of the release.
+      - name: Pack
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: dotnet pack InterprocessMemory/InterprocessMemory.csproj --configuration Release --no-build --no-restore --output artifacts/packages
+
+      - name: Upload package
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: package
+          path: artifacts/packages
+          if-no-files-found: error
+
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-${{ matrix.os }}
           path: TestResults
