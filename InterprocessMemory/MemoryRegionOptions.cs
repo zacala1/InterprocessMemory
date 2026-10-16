@@ -59,8 +59,8 @@ namespace InterprocessMemory
         /// Linux and macOS: the permissions of the backing file when this process creates it (the file under
         /// <c>/dev/shm</c>, or the <see cref="FilePath"/> file). <c>null</c> (the default) keeps the platform
         /// default, which is 0666 less the umask of the process and therefore usually 0644: every user can
-        /// read the region, only the owner can write it. Use <see cref="UnixFileMode.UserRead"/> |
-        /// <see cref="UnixFileMode.UserWrite"/> to keep other users out, or add the group bits when processes
+        /// read the region, only the owner can write it. Use <see cref="System.IO.UnixFileMode.UserRead"/> |
+        /// <see cref="System.IO.UnixFileMode.UserWrite"/> to keep other users out, or add the group bits when processes
         /// of a group share the region; the umask still applies to what you ask for. It is ignored on Windows
         /// and has no effect on a file that already exists.
         /// </summary>

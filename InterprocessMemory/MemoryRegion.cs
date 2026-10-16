@@ -521,13 +521,15 @@ namespace InterprocessMemory
             // that overload grows an existing file to the requested capacity before anything has checked that
             // it is the region the caller meant, which left a file of the wrong size permanently resized, and
             // it does not share the file with a second process on Windows.
-            var file = new FileStream(fullPath, new FileStreamOptions
+            var fileOptions = new FileStreamOptions
             {
                 Mode = _createOrOpen ? FileMode.OpenOrCreate : FileMode.Open,
                 Access = FileAccess.ReadWrite,
-                Share = FileShare.ReadWrite,
-                UnixCreateMode = CreateModeForNewFile()
-            });
+                Share = FileShare.ReadWrite
+            };
+            if (_createOrOpen)
+                ApplyCreateMode(fileOptions);
+            var file = new FileStream(fullPath, fileOptions);
             try
             {
                 if (_createOrOpen)
@@ -696,20 +698,29 @@ namespace InterprocessMemory
             _backingFile = null;                // ownership transferred — don't double-dispose
         }
 
-        private FileStreamOptions CreateNewFileOptions() => new()
+        private FileStreamOptions CreateNewFileOptions()
         {
-            Mode = FileMode.CreateNew,
-            Access = FileAccess.ReadWrite,
-            Share = FileShare.ReadWrite,
-            UnixCreateMode = CreateModeForNewFile()
-        };
+            var options = new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.ReadWrite,
+                Share = FileShare.ReadWrite
+            };
+            ApplyCreateMode(options);
+            return options;
+        }
 
         /// <summary>
-        /// The permissions a newly created backing file gets, or null for the platform default (0666 less the
-        /// umask, so usually 0644). Ignored on Windows, where the option does not exist.
+        /// Gives a file that is about to be created the permissions asked for in
+        /// <see cref="MemoryRegionOptions.UnixCreateMode"/>; without a request it keeps the platform default
+        /// (0666 less the umask, so usually 0644). The property is only touched when there is something to
+        /// set: on Windows its setter throws <see cref="PlatformNotSupportedException"/> even for null.
         /// </summary>
-        private UnixFileMode? CreateModeForNewFile() =>
-            OperatingSystem.IsWindows() ? null : _options.UnixCreateMode;
+        private void ApplyCreateMode(FileStreamOptions options)
+        {
+            if (!OperatingSystem.IsWindows() && _options.UnixCreateMode.HasValue)
+                options.UnixCreateMode = _options.UnixCreateMode;
+        }
 
         private static void WaitForLength(FileStream file, int timeoutMs)
         {
