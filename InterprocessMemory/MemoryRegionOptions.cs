@@ -27,7 +27,12 @@ namespace InterprocessMemory
         public static readonly TimeSpan DefaultOrphanLockTimeout = TimeSpan.FromSeconds(30);
 
         /// <summary>
-        /// Gets or sets the default lock acquisition timeout
+        /// Gets or sets the default lock acquisition timeout.
+        /// <para>
+        /// Currently only validated: <see cref="IMemoryRegion"/> and the containers take the timeout as an
+        /// argument of each lock call (or use their own default of five seconds), and none of them reads
+        /// this value.
+        /// </para>
         /// </summary>
         public TimeSpan LockTimeout { get; set; } = DefaultLockTimeout;
 
@@ -37,7 +42,11 @@ namespace InterprocessMemory
         public bool EnableSimd { get; set; } = true;
 
         /// <summary>
-        /// Gets or sets the memory alignment (must be power of 2)
+        /// Gets or sets the memory alignment (must be power of 2).
+        /// <para>
+        /// Currently only validated: it does not change how the region is mapped or copied (the mapping is
+        /// page aligned and the header is 128 bytes). It is a value for code that wants to align its own offsets.
+        /// </para>
         /// </summary>
         public int Alignment { get; set; } = 64; // Cache line size
 
@@ -45,6 +54,17 @@ namespace InterprocessMemory
         /// Gets or sets the file path for persistent storage (null for anonymous)
         /// </summary>
         public string? FilePath { get; set; }
+
+        /// <summary>
+        /// Linux and macOS: the permissions of the backing file when this process creates it (the file under
+        /// <c>/dev/shm</c>, or the <see cref="FilePath"/> file). <c>null</c> (the default) keeps the platform
+        /// default, which is 0666 less the umask of the process and therefore usually 0644: every user can
+        /// read the region, only the owner can write it. Use <see cref="UnixFileMode.UserRead"/> |
+        /// <see cref="UnixFileMode.UserWrite"/> to keep other users out, or add the group bits when processes
+        /// of a group share the region; the umask still applies to what you ask for. It is ignored on Windows
+        /// and has no effect on a file that already exists.
+        /// </summary>
+        public System.IO.UnixFileMode? UnixCreateMode { get; set; }
 
         /// <summary>
         /// Gets or sets whether a waiting process recovers a write lock whose owner process has exited

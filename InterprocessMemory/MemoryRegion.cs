@@ -96,6 +96,7 @@ namespace InterprocessMemory
 
         // Ticks. See DisposeGracePeriod.
         private static long s_disposeGraceTicks = TimeSpan.FromMilliseconds(10).Ticks;
+        private static readonly TimeSpan MaxDisposeGracePeriod = TimeSpan.FromMilliseconds(int.MaxValue);
 
         /// <summary>
         /// How long <see cref="Dispose"/> keeps the memory mapped after the region has been marked
@@ -111,7 +112,10 @@ namespace InterprocessMemory
         /// protection is to stop and join every thread that uses an instance before disposing it.
         /// </para>
         /// </summary>
-        /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// The value is negative or longer than <see cref="int.MaxValue"/> milliseconds (about 24.8 days), which is
+        /// the longest a thread can sleep.
+        /// </exception>
         public static TimeSpan DisposeGracePeriod
         {
             get => TimeSpan.FromTicks(Interlocked.Read(ref s_disposeGraceTicks));
@@ -119,6 +123,9 @@ namespace InterprocessMemory
             {
                 if (value < TimeSpan.Zero)
                     throw new ArgumentOutOfRangeException(nameof(value), "DisposeGracePeriod must not be negative.");
+                if (value > MaxDisposeGracePeriod)
+                    throw new ArgumentOutOfRangeException(
+                        nameof(value), "DisposeGracePeriod must not be longer than int.MaxValue milliseconds.");
 
                 Interlocked.Exchange(ref s_disposeGraceTicks, value.Ticks);
             }
@@ -256,7 +263,7 @@ namespace InterprocessMemory
         /// to prevent false sharing when multiple processes or threads contend concurrently.
         /// </summary>
         [StructLayout(LayoutKind.Explicit, Size = 128)]
-        private struct SharedHeader
+        internal struct SharedHeader
         {
             public const uint MagicNumber = 0x524D5049; // "IPMR"
             // Intermediate value written by the winner of the init CAS before it has finished writing
@@ -514,8 +521,13 @@ namespace InterprocessMemory
             // that overload grows an existing file to the requested capacity before anything has checked that
             // it is the region the caller meant, which left a file of the wrong size permanently resized, and
             // it does not share the file with a second process on Windows.
-            var file = new FileStream(fullPath, _createOrOpen ? FileMode.OpenOrCreate : FileMode.Open,
-                FileAccess.ReadWrite, FileShare.ReadWrite);
+            var file = new FileStream(fullPath, new FileStreamOptions
+            {
+                Mode = _createOrOpen ? FileMode.OpenOrCreate : FileMode.Open,
+                Access = FileAccess.ReadWrite,
+                Share = FileShare.ReadWrite,
+                UnixCreateMode = CreateModeForNewFile()
+            });
             try
             {
                 if (_createOrOpen)
@@ -620,8 +632,7 @@ namespace InterprocessMemory
                 {
                     try
                     {
-                        _backingFile = new FileStream(_backingFilePath,
-                            FileMode.CreateNew, FileAccess.ReadWrite, FileShare.ReadWrite);
+                        _backingFile = new FileStream(_backingFilePath, CreateNewFileOptions());
                         _createdBackingFile = true;
                         break;
                     }
@@ -684,6 +695,21 @@ namespace InterprocessMemory
                 leaveOpen: false);              // MMF takes ownership of the FileStream
             _backingFile = null;                // ownership transferred — don't double-dispose
         }
+
+        private FileStreamOptions CreateNewFileOptions() => new()
+        {
+            Mode = FileMode.CreateNew,
+            Access = FileAccess.ReadWrite,
+            Share = FileShare.ReadWrite,
+            UnixCreateMode = CreateModeForNewFile()
+        };
+
+        /// <summary>
+        /// The permissions a newly created backing file gets, or null for the platform default (0666 less the
+        /// umask, so usually 0644). Ignored on Windows, where the option does not exist.
+        /// </summary>
+        private UnixFileMode? CreateModeForNewFile() =>
+            OperatingSystem.IsWindows() ? null : _options.UnixCreateMode;
 
         private static void WaitForLength(FileStream file, int timeoutMs)
         {
@@ -1275,12 +1301,29 @@ namespace InterprocessMemory
                 // A writer acquired between our reader check and our increment. Roll back.
                 // The writer's drain loop will briefly see ReaderCount > 0 and spin once or
                 // twice extra.
-                Interlocked.Decrement(ref header->ReaderCount);
+                RollBackReaderIncrement(header);
 
                 if (TimeoutHelper.HasExpired(start, timeout))
                     return false;
 
                 spinner.SpinOnce();
+            }
+        }
+
+        /// <summary>
+        /// Takes back a reader increment that did not become a lock because a writer got in. A plain decrement
+        /// would drive the count to -1 if <see cref="ForceResetLocks"/> cleared it in between, and a negative
+        /// count is never corrected by anyone.
+        /// </summary>
+        internal static void RollBackReaderIncrement(SharedHeader* header)
+        {
+            while (true)
+            {
+                int current = Volatile.Read(ref header->ReaderCount);
+                if (current <= 0)
+                    return;
+                if (Interlocked.CompareExchange(ref header->ReaderCount, current - 1, current) == current)
+                    return;
             }
         }
 
@@ -1316,13 +1359,21 @@ namespace InterprocessMemory
             if (Volatile.Read(ref header->WriterLockState) == 0)
                 return false;
 
-            int ownerPid = header->LockOwnerProcessId;
+            // The owner fields are separate words and are not written atomically. Read them as one snapshot:
+            // a pid taken from one owner combined with the start time of the next one (the lock changed hands
+            // between the reads) would look like a recycled pid and report a healthy owner as gone.
+            int ownerPid = Volatile.Read(ref header->LockOwnerProcessId);
             if (ownerPid == 0)
                 return false;
 
+            long storedStartTime = Volatile.Read(ref header->LockOwnerProcessStartTime);
+            long ownerNamespace = Volatile.Read(ref header->LockOwnerPidNamespace);
+            Thread.MemoryBarrier();
+            if (Volatile.Read(ref header->LockOwnerProcessId) != ownerPid)
+                return false;   // the lock changed hands while it was looked at
+
             // A pid recorded in another PID namespace says nothing about whether the owner is alive here.
-            if (!IsOtherPidNamespace(Volatile.Read(ref header->LockOwnerPidNamespace)) &&
-                OwnerProcessIsGone(header, ownerPid))
+            if (!IsOtherPidNamespace(ownerNamespace) && OwnerProcessIsGone(ownerPid, storedStartTime))
                 return true;
 
             // The owner process is alive. Only the opt-in time limit (OrphanLockTimeout, disabled
@@ -1351,7 +1402,7 @@ namespace InterprocessMemory
         /// True when the process that recorded itself as the lock owner no longer exists: it has exited, or
         /// its pid now belongs to a process that started later (pid reuse).
         /// </summary>
-        private bool OwnerProcessIsGone(SharedHeader* header, int ownerPid)
+        private bool OwnerProcessIsGone(int ownerPid, long storedStartTime)
         {
             try
             {
@@ -1368,7 +1419,6 @@ namespace InterprocessMemory
                 // PID-reuse defense: even when a process with this PID exists, it might be an
                 // unrelated process that the OS recycled the PID for after the real owner died.
                 // Compare the captured start time; mismatch ⇒ impostor ⇒ orphan.
-                long storedStartTime = header->LockOwnerProcessStartTime;
                 if (storedStartTime != 0)
                 {
                     try

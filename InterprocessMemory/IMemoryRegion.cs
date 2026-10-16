@@ -107,13 +107,21 @@ namespace InterprocessMemory
 
         /// <summary>
         /// Writes data from a span to the buffer at the specified offset.
-        /// Zero-allocation, SIMD-optimized when aligned.
+        /// Zero-allocation. Spans of at least one vector are copied with vector instructions (see
+        /// <see cref="MemoryRegionOptions.EnableSimd"/>); alignment does not matter.
+        /// <para>
+        /// The copy is <b>not atomic</b>: another process that reads the same bytes while they are written can
+        /// see a mixture of old and new, whatever the length (a two byte copy is two stores). Hold the write
+        /// lock for values that are read concurrently, or use <see cref="SharedArray{T}"/> or
+        /// <see cref="StructuredMemory{TSchema}"/>, which do.
+        /// </para>
         /// </summary>
         int Write(ReadOnlySpan<byte> source, long offset);
 
         /// <summary>
         /// Reads data from the buffer into a span at the specified offset.
-        /// Zero-allocation, SIMD-optimized when aligned.
+        /// Zero-allocation. Spans of at least one vector are copied with vector instructions; alignment does
+        /// not matter. Like <see cref="Write"/>, the copy is not atomic with respect to a concurrent writer.
         /// </summary>
         int Read(Span<byte> destination, long offset);
 
