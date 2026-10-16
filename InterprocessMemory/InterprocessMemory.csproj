@@ -4,8 +4,8 @@
     <OutputPath>..\bin\$(Configuration)\</OutputPath>
     <AssemblyName>InterprocessMemory</AssemblyName>
     <RootNamespace>InterprocessMemory</RootNamespace>
-    <DocumentationFile>..\bin\$(Configuration)\$(TargetFramework)\InterprocessMemory.xml</DocumentationFile>
     <TargetFramework>net8.0</TargetFramework>
+    <DocumentationFile>..\bin\$(Configuration)\$(TargetFramework)\InterprocessMemory.xml</DocumentationFile>
     <LangVersion>latest</LangVersion>
     <Nullable>enable</Nullable>
     <ImplicitUsings>disable</ImplicitUsings>
