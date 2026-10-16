@@ -47,6 +47,7 @@ public class LibraryHardeningTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void InfiniteWriteLockTimeout_WaitsUntilReaderReleases()
     {
         using var buffer = new MemoryRegion(
@@ -74,6 +75,7 @@ public class LibraryHardeningTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void WriteLock_CannotBeReleasedByDifferentThread()
     {
         using var buffer = new MemoryRegion(
@@ -397,6 +399,7 @@ public class LibraryHardeningTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void ReadLock_DoubleRelease_DoesNotBreakWriterExclusion()
     {
         using var buffer = new MemoryRegion(

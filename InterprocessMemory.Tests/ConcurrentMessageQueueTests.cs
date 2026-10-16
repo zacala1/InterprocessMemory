@@ -230,6 +230,7 @@ public class ConcurrentMessageQueueTests
     #region Multi-Producer Tests
 
     [Test]
+    [Timeout(120000)]
     public async Task MultipleProducers_SingleConsumer_ShouldNotLoseMessages()
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("MPSC"), slotCount: 1024, slotSize: 64);
@@ -292,6 +293,7 @@ public class ConcurrentMessageQueueTests
     #region Multi-Consumer Tests
 
     [Test]
+    [Timeout(120000)]
     public async Task SingleProducer_MultipleConsumers_ShouldNotDuplicateMessages()
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("SPMC"), slotCount: 1024, slotSize: 64);
@@ -357,6 +359,7 @@ public class ConcurrentMessageQueueTests
     #region MPMC Stress Test
 
     [Test]
+    [Timeout(120000)]
     public async Task MPMC_HighContention_ShouldMaintainIntegrity()
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("MPMC_Stress"), slotCount: 256, slotSize: 64);

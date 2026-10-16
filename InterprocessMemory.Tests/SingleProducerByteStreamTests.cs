@@ -170,6 +170,7 @@ public class SingleProducerByteStreamTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task ConcurrentProducerConsumer_SPSC_ShouldWork()
     {
         using var buffer = new SingleProducerByteStream(TestBufferName + "_SPSC", 64 * 1024);

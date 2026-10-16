@@ -120,60 +120,71 @@ public class ExtremeStressTests
     {
         using var buffer = new ConcurrentMessageQueue(GetUniqueName("MPMC_Burst"), slotCount: 1024, slotSize: 64);
 
+        // Several producers and several consumers per burst: the point of an MPMC queue is that they race.
         const int burstCount = 10;
-        const int messagesPerBurst = 10000;
+        const int producerCount = 4;
+        const int consumerCount = 4;
+        const int perProducer = 2500;
+        const int messagesPerBurst = producerCount * perProducer;
         var errors = new ConcurrentBag<string>();
         var totalReceived = 0;
 
         for (int burst = 0; burst < burstCount; burst++)
         {
+            int burstNumber = burst;
             var received = new ConcurrentBag<int>();
+            int receivedCount = 0;
             var deadline = System.Diagnostics.Stopwatch.StartNew();
 
-            // Burst producer
-            var producer = Task.Run(() =>
+            // Dedicated threads: eight spinning loops would otherwise starve the thread pool.
+            var producers = Enumerable.Range(0, producerCount).Select(p => DedicatedThread.Run(() =>
             {
                 var data = new byte[32];
-                for (int i = 0; i < messagesPerBurst; i++)
+                for (int i = 0; i < perProducer; i++)
                 {
-                    BitConverter.TryWriteBytes(data, burst * messagesPerBurst + i);
+                    BitConverter.TryWriteBytes(data, burstNumber * messagesPerBurst + p * perProducer + i);
                     while (!buffer.TryWrite(data))
                     {
                         if (deadline.Elapsed > TimeSpan.FromSeconds(30))
                         {
-                            errors.Add($"Burst {burst}: producer blocked at message {i}");
+                            errors.Add($"Burst {burstNumber}: producer {p} blocked at message {i}");
                             return;
                         }
 
                         Thread.SpinWait(1);
                     }
                 }
-            });
+            }));
 
-            // Consumer: wait for the full burst instead of giving up after a number of empty polls.
-            // That budget used to run out in microseconds when the consumer started before the
-            // producer, after which the producer spun forever on a full queue and the test hung.
-            var consumer = Task.Run(() =>
+            // Consumers: wait for the full burst instead of giving up after a number of empty polls.
+            // That budget used to run out in microseconds when a consumer started before the
+            // producers, after which a producer spun forever on a full queue and the test hung.
+            var consumers = Enumerable.Range(0, consumerCount).Select(_ => DedicatedThread.Run(() =>
             {
                 var readBuf = new byte[64];
-                while (received.Count < messagesPerBurst)
+                while (Volatile.Read(ref receivedCount) < messagesPerBurst)
                 {
                     if (deadline.Elapsed > TimeSpan.FromSeconds(30))
                         return;
 
                     var bytesRead = buffer.TryRead(readBuf);
                     if (bytesRead > 0)
+                    {
                         received.Add(BitConverter.ToInt32(readBuf, 0));
+                        Interlocked.Increment(ref receivedCount);
+                    }
                     else
                         Thread.SpinWait(1);
                 }
-            });
+            }));
 
-            await Task.WhenAll(producer, consumer);
+            await Task.WhenAll(producers.Concat(consumers).ToArray());
             totalReceived += received.Count;
 
             if (received.Count != messagesPerBurst)
                 errors.Add($"Burst {burst}: expected {messagesPerBurst}, got {received.Count}");
+            else if (received.Distinct().Count() != messagesPerBurst)
+                errors.Add($"Burst {burst}: a message was delivered twice");
         }
 
         Assert.That(errors, Is.Empty, string.Join("\n", errors));

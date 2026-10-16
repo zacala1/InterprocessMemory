@@ -517,6 +517,7 @@ public class MemoryRegionTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void ConcurrentDispose_ShouldNotThrow()
     {
         var options = new MemoryRegionOptions { Capacity = 4096 };
@@ -551,6 +552,7 @@ public class MemoryRegionTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void LockTimeout_ShouldReturnFalse()
     {
         var options = new MemoryRegionOptions { Capacity = 4096 };

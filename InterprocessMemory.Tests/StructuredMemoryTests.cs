@@ -949,6 +949,7 @@ public class StructuredMemoryTests
     #region Extended Type Concurrent Tests
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentGuid_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -988,6 +989,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentDateTime_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1025,6 +1027,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentDecimal_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1062,6 +1065,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentStruct_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new CustomStructSchema();
@@ -1099,6 +1103,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task ExtendedTypes_ConcurrentEnum_WithLocks_ShouldBeThreadSafe()
     {
         var schema = new EnumSchema();
@@ -1172,6 +1177,7 @@ public class StructuredMemoryTests
     #region Auto-Lock Tests
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentGuid_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         // This test verifies that 16-byte types are automatically locked
@@ -1204,6 +1210,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentDecimal_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1235,6 +1242,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentDateTimeOffset_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1266,6 +1274,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentLargeStruct_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         var schema = new CustomStructSchema();
@@ -1297,6 +1306,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentString_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         using var memory = new StructuredMemory<TestSchema>(TestBufferName + "_AutoString", new TestSchema());
@@ -1327,6 +1337,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AutoLock_ConcurrentArray_WithoutExplicitLock_ShouldBeThreadSafe()
     {
         var schema = new ExtendedTypeSchema();
@@ -1525,6 +1536,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task IPC_ConcurrentAccess_WithLocks_ShouldWork()
     {
         var schema = new TestSchema();
@@ -1622,6 +1634,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task AtomicBoundary_Long_ConcurrentWithoutLock_ShouldWork()
     {
         // long (8 bytes) is atomic on x64, so concurrent access without lock should be safe
@@ -1958,6 +1971,7 @@ public class StructuredMemoryTests
     #region Lock Timeout Tests
 
     [Test]
+    [Timeout(120000)]
     public void WriteLock_Timeout_ShouldThrow()
     {
         var schema = new TestSchema();
@@ -2026,6 +2040,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task Struct_Over8Bytes_ConcurrentWithoutExplicitLock_ShouldAutoLock()
     {
         var schema = new Size9Schema();
@@ -2195,6 +2210,7 @@ public class StructuredMemoryTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void AtomicSizedScalars_RoundTripWithoutTheLock()
     {
         string name = $"{TestBufferName}_NoLock_{Guid.NewGuid():N}";

@@ -287,6 +287,7 @@ public class AdvancedTests
     #region Multi-Threading Safety Tests
 
     [Test]
+    [Timeout(120000)]
     public async Task SharedArray_ConcurrentAccess_DifferentIndices_ShouldBeThreadSafe()
     {
         const int threadCount = 8;
@@ -334,6 +335,7 @@ public class AdvancedTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task SingleProducerByteStream_SPSC_HighContention()
     {
         using var buffer = new SingleProducerByteStream(GetUniqueName("SPSC_Contention"), 64 * 1024);
@@ -401,6 +403,7 @@ public class AdvancedTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task MemoryRegion_ConcurrentReadWrite_WithLocks()
     {
         var options = new MemoryRegionOptions { Capacity = 4096 };
@@ -461,6 +464,7 @@ public class AdvancedTests
     }
 
     [Test]
+    [Timeout(120000)]
     public async Task StructuredMemory_ConcurrentFieldAccess_WithLocks()
     {
         var schema = new TestSchema();
@@ -916,6 +920,7 @@ public class AdvancedTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void MemoryRegion_ConcurrentTimeout_AllShouldComplete()
     {
         using var buffer = new MemoryRegion(GetUniqueName("ConcTimeout"), new MemoryRegionOptions { Capacity = 1024 });

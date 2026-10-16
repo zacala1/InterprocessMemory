@@ -131,6 +131,7 @@ public class ChangeVerificationTests
     }
 
     [Test]
+    [Timeout(120000)]
     public void LockFree_WaitWrite_CancelMidWait_StopsBlocking()
     {
         using var buf = new SingleProducerByteStream(N("LFMidW"), 64);
@@ -927,6 +928,7 @@ public class ChangeVerificationTests
     // ── OPT-8: Optimistic reader-lock contention test ────────────────────────
 
     [Test]
+    [Timeout(120000)]
     public void Opt8_OptimisticReaderLock_ManyReadersAllSucceed()
     {
         // Spawn N readers acquiring the lock simultaneously. The optimistic-increment design
