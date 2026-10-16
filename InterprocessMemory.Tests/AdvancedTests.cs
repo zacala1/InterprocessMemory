@@ -342,7 +342,6 @@ public class AdvancedTests
 
         const int messageCount = 100000;
         var errors = new ConcurrentBag<string>();
-        var producerDone = false;
 
         var producer = Task.Run(() =>
         {
@@ -361,7 +360,6 @@ public class AdvancedTests
                     }
                 }
             }
-            producerDone = true;
         });
 
         var consumer = Task.Run(() =>
@@ -382,18 +380,20 @@ public class AdvancedTests
                     }
                     expected++;
                 }
-                else if (bytesRead == 0 && !producerDone)
+                else if (bytesRead == 0)
                 {
+                    // Empty for now. The loop ends when every message has arrived, or when the producer
+                    // gave up (it reports that in errors). A read that is repeated "once more after the
+                    // producer finished" and whose result is dropped loses the message it reads: a consumer
+                    // that was descheduled between its empty read and the check of the flag did exactly that.
+                    if (!errors.IsEmpty)
+                        return;
                     Thread.SpinWait(1);
                 }
-                else if (bytesRead == 0 && producerDone)
+                else
                 {
-                    // Check again after seeing producerDone
-                    Thread.MemoryBarrier();
-                    if (buffer.TryRead(readBuffer) == 0 && expected < messageCount)
-                    {
-                        Thread.SpinWait(10);
-                    }
+                    errors.Add($"Partial read of {bytesRead} bytes at message {expected}");
+                    return;
                 }
             }
         });
