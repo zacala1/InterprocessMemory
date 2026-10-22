@@ -26,7 +26,7 @@ including one that runs a later version. Update all processes that use a region 
   on the fingerprint instead of reading each other's fields from the wrong places. Types that the marshaller
   accepts keep their fingerprint, and the generic fallback has not been released.
 
-## 4.0.0 (not released yet)
+## 4.0.0 - 2026-10-22
 
 Changes since the 3.0.0 release. The memory format is unchanged (format version 3).
 
