@@ -32,11 +32,14 @@
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
 
+  <!-- The worker is a net8.0 program that loads the net8.0 build of the library. It gets a folder of its own
+       ("worker"): next to the tests of the net10.0 build it would find the net10.0 build of the library, which
+       a net8.0 runtime cannot load. -->
   <Target Name="CopyTestWorker" AfterTargets="Build">
     <ItemGroup>
       <TestWorkerFiles Include="$(MSBuildThisFileDirectory)..\InterprocessMemory.TestWorker\bin\$(Configuration)\net8.0\*.*" />
     </ItemGroup>
-    <Copy SourceFiles="@(TestWorkerFiles)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(TestWorkerFiles)" DestinationFolder="$(OutputPath)worker\" SkipUnchangedFiles="true" />
   </Target>
 
 </Project>

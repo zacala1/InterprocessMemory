@@ -78,6 +78,13 @@ jobs:
           --logger "trx;LogFileName=test-results-net8.0.trx"
           --results-directory TestResults
 
+      # On Linux a region outlives the process that created it (a file in /dev/shm), and a number of tests use
+      # fixed region names. Both frameworks run in this job one after the other, so the second would find what
+      # the first left behind.
+      - name: Remove the regions left by the net8.0 tests
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: find /dev/shm -maxdepth 1 -type f -delete
+
       # A failure of the net8.0 step does not hide the net10.0 result: both are worth reading.
       - name: Test (net10.0)
         if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
@@ -93,6 +100,10 @@ jobs:
       #
       # Tests whose outcome depends on the core count and the scheduler. They still run and show up
       # in the log and the artifact, but a failure here does not fail the job.
+      - name: Remove the regions left by the net10.0 tests
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
+        run: find /dev/shm -maxdepth 1 -type f -delete
+
       - name: Test (timing sensitive, informational)
         id: timing
         if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
