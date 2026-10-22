@@ -22,8 +22,11 @@ namespace InterprocessMemory.Tests;
 [Category("CrossProcess")]
 public class CrossProcessTests
 {
+    // The worker is a net8.0 program with the net8.0 build of the library next to it, in its own folder (see the
+    // CopyTestWorker target of the test project); the tests of the net10.0 build start the same worker.
     private static readonly string HelperDll = Path.Combine(
         AppContext.BaseDirectory,
+        "worker",
         "InterprocessMemory.TestWorker.dll");
 
     [OneTimeSetUp]

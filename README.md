@@ -5,7 +5,7 @@ arrays, and structured records through named shared memory.
 
 - Windows: named `MemoryMappedFile`
 - Linux: named files in `/dev/shm`
-- .NET 8 or later
+- .NET 8 or later (the package contains builds for `net8.0` and `net10.0`)
 - Process-wide reader/writer synchronization with orphan-lock recovery
 - Allocation-free `Span<T>` and `unmanaged` typed-queue hot paths
 
@@ -375,6 +375,10 @@ dotnet restore InterprocessMemory.sln
 dotnet build InterprocessMemory.sln --configuration Release
 dotnet test InterprocessMemory.sln --configuration Release
 ```
+
+The library and its tests target `net8.0` and `net10.0`, so building needs a .NET 10 SDK and running every
+test needs both runtimes (the cross-process tests start a `net8.0` worker). Add `--framework net8.0` or
+`--framework net10.0` to `dotnet test` to run one of them.
 
 The test suite includes real child-process transfer, multi-process typed MPMC delivery,
 cross-process lock exclusion, and orphan-lock recovery.

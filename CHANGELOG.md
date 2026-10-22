@@ -10,6 +10,9 @@ including one that runs a later version. Update all processes that use a region 
 
 ### Added
 
+- The package contains a `net10.0` build next to the `net8.0` one. The tests run on both frameworks in CI. The
+  cross-process tests keep starting a `net8.0` worker, so a `net10.0` test run also exercises a `net10.0` and a
+  `net8.0` process sharing one region.
 - Region names may start with `Global\` or `Local\`, the Windows kernel namespaces (all sessions, or the session of
   the process). A service and a desktop process can share a region through `Global\name`. What follows the prefix
   must be flat. On Linux the prefix is dropped (there are no sessions), so `Global\x`, `Local\x` and `x` are one
