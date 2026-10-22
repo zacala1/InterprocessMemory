@@ -78,15 +78,20 @@ do not `await` between acquiring and releasing a lock, because the continuation 
 different thread. Disposing a region while another thread is waiting for one of its locks releases
 that thread with an `ObjectDisposedException`.
 
-A lock is remembered by the instance that took it. Opening the same region twice in one process and
-taking the lock through both instances on one thread therefore waits for itself until the timeout (the
-second instance cannot tell that the lock belongs to its own thread). Open a region once per process and
-share the instance, or keep the two instances in different threads.
+A lock is remembered by the instance that took it: it is reentrant through that instance only. Open a
+region once per process and share the instance. If one thread does use two instances of a region, then while
+it holds the **write** lock through one of them the other throws `InvalidOperationException` at once instead of
+waiting for its timeout. A thread that holds a **read** lock through one instance and asks for the write lock
+through the other cannot be recognised (read locks have no owner) and still waits for the timeout.
 
-On Windows a region name lives in the namespace of the session of the process that creates it. A
-service (session 0) and a process of a logged-on user do not see each other's regions, and names with a
-`Global\` or `Local\` prefix are rejected (names must be flat identifiers); sharing across sessions is not
-supported yet.
+On Windows a name without a prefix lives in the namespace of the session of the process that creates it, so
+a service (session 0) and a process of a logged-on user do not see each other's regions. A name that starts
+with `Global\` is visible to every session; `Local\` says "this session" explicitly. What follows the prefix
+must be a flat identifier. Creating a section in the `Global\` namespace needs the `SeCreateGlobalPrivilege`
+(services and elevated processes have it; an ordinary user session can open one but not create one), and
+the section gets the default access control of its creator, so processes under other accounts may be refused
+access: run both sides under the same account for now. Linux has no sessions: the prefix is dropped there, and
+`Global\x`, `Local\x` and `x` are one region, so the same name works on both platforms.
 
 On Linux and macOS a new backing file gets the platform default permissions (usually 0644: readable by every
 user, writable by the owner). Set `MemoryRegionOptions.UnixCreateMode` to restrict it (for example to owner

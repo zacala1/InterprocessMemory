@@ -6,6 +6,26 @@ Migrating from 3.0.0 or 2.x: see [MIGRATION.md](MIGRATION.md).
 `Process.StartTime`, which differs between observers, so it takes the write lock away from every live owner,
 including one that runs a later version. Update all processes that use a region together.
 
+## 4.1.0 (not released yet)
+
+### Added
+
+- Region names may start with `Global\` or `Local\`, the Windows kernel namespaces (all sessions, or the session of
+  the process). A service and a desktop process can share a region through `Global\name`. What follows the prefix
+  must be flat. On Linux the prefix is dropped (there are no sessions), so `Global\x`, `Local\x` and `x` are one
+  region and the same name works on both platforms. Names with any other backslash are still rejected.
+
+### Fixed
+
+- A thread that holds the write lock through one instance of a region used to wait for the whole timeout (for ever
+  with an infinite one) when it asked for a lock through another instance of the same region. `StructuredMemory<T>`
+  and `SharedArray<T>` now throw `InvalidOperationException` at once. A read lock held through another instance
+  cannot be recognised and still waits.
+- The fingerprint of a generic struct (`ValueTuple`, `KeyValuePair<,>`) includes the offsets the runtime gave its
+  fields, which matters for `LayoutKind.Auto`: processes on runtimes that lay a type out differently now disagree
+  on the fingerprint instead of reading each other's fields from the wrong places. Types that the marshaller
+  accepts keep their fingerprint, and the generic fallback has not been released.
+
 ## 4.0.0 - 2026-10-22
 
 Changes since the 3.0.0 release. The memory format is unchanged (format version 3).

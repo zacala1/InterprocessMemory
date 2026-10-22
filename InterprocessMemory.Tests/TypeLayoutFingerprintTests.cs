@@ -1,5 +1,8 @@
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using NUnit.Framework;
 using InterprocessMemory;
 
@@ -42,6 +45,63 @@ public class TypeLayoutFingerprintTests
         Assert.That(tupleA, Is.Not.EqualTo(differentArgument));
         Assert.That(tupleA, Is.Not.EqualTo(differentShape));
         Assert.That(tupleA, Is.Not.EqualTo(pair));
+    }
+
+    [StructLayout(LayoutKind.Auto)]
+    private struct AutoMixed
+    {
+        public byte A;
+        public long B;
+        public short C;
+        public int D;
+    }
+
+    [StructLayout(LayoutKind.Explicit, Size = 24)]
+    private struct ExplicitFields
+    {
+        [FieldOffset(0)] public int First;
+        [FieldOffset(16)] public long Second;
+    }
+
+    private static int[] OffsetsOf<T>() where T : unmanaged
+    {
+        var fields = typeof(T)
+            .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+            .OrderBy(f => f.MetadataToken)
+            .ToArray();
+        return TypeLayoutFingerprint.ManagedFieldOffsets(typeof(T), fields);
+    }
+
+    [Test]
+    public void ManagedFieldOffsets_AreTheOffsetsTheRuntimeChose()
+    {
+        // (int, int): two 4 byte fields, whatever order the runtime picks.
+        int[] pair = OffsetsOf<(int, int)>();
+        Assert.That(pair.OrderBy(x => x).ToArray(), Is.EqualTo(new[] { 0, 4 }));
+
+        // Explicit layout: the offsets of the attribute.
+        Assert.That(OffsetsOf<ExplicitFields>(), Is.EqualTo(new[] { 0, 16 }));
+
+        // Auto layout: every field has its own bytes inside the struct (no overlap, nothing past the end).
+        int[] offsets = OffsetsOf<AutoMixed>();
+        int[] sizes = { 1, 8, 2, 4 };
+        int total = System.Runtime.CompilerServices.Unsafe.SizeOf<AutoMixed>();
+        var spans = offsets.Zip(sizes, (offset, size) => (offset, size)).OrderBy(x => x.offset).ToArray();
+        Assert.That(spans[0].offset, Is.GreaterThanOrEqualTo(0));
+        for (int i = 1; i < spans.Length; i++)
+            Assert.That(spans[i].offset, Is.GreaterThanOrEqualTo(spans[i - 1].offset + spans[i - 1].size));
+        Assert.That(spans[^1].offset + spans[^1].size, Is.LessThanOrEqualTo(total));
+    }
+
+    [Test]
+    public void AutoLayoutStructs_AreDescribedByTheirOffsets()
+    {
+        // The descriptor of a type that the marshaller rejects contains the measured offsets. A type that the
+        // marshaller accepts keeps its 3.0.0 descriptor (see MarshallableTypes_KeepTheirRelease300Fingerprint),
+        // so only the generic fallback changed, and it has never been released.
+        var first = TypeLayoutFingerprint.Create<(byte, long)>();
+        Assert.That(TypeLayoutFingerprint.Create<(byte, long)>(), Is.EqualTo(first), "stable within a process");
+        Assert.That(TypeLayoutFingerprint.Create<(long, byte)>(), Is.Not.EqualTo(first));
     }
 
     [Test]

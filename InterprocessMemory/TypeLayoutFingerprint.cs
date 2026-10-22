@@ -2,7 +2,9 @@ using System;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Linq;
+using System.Collections.Concurrent;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -12,7 +14,13 @@ namespace InterprocessMemory
 {
     internal readonly record struct TypeLayoutFingerprint(ulong Low, ulong High)
     {
-        public static TypeLayoutFingerprint Create<T>() where T : unmanaged
+        // A fingerprint depends on the type only, and the managed descriptor measures offsets with dynamic methods.
+        private static readonly ConcurrentDictionary<Type, TypeLayoutFingerprint> s_cache = new();
+
+        public static TypeLayoutFingerprint Create<T>() where T : unmanaged =>
+            s_cache.GetOrAdd(typeof(T), static _ => Compute<T>());
+
+        private static TypeLayoutFingerprint Compute<T>() where T : unmanaged
         {
             var descriptor = new StringBuilder(256);
             try
@@ -114,21 +122,56 @@ namespace InterprocessMemory
             if (type.IsPrimitive || type.IsEnum || !active.Add(type))
                 return;
 
-            // Declaration order (metadata token), explicit FieldOffset values, the total size and the
-            // layout kind together pin down the memory layout without Marshal.OffsetOf.
-            var fields = type
+            // Declaration order (metadata token), the offset of every field as the runtime laid the type out,
+            // the total size and the layout kind together pin down the memory layout without Marshal.OffsetOf.
+            // The offsets matter for LayoutKind.Auto, where the runtime chooses them: two processes on
+            // runtimes that choose differently would otherwise agree on a fingerprint and read each other's
+            // fields from the wrong places.
+            FieldInfo[] fields = type
                 .GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                .OrderBy(field => field.MetadataToken);
+                .OrderBy(field => field.MetadataToken)
+                .ToArray();
+            int[] offsets = ManagedFieldOffsets(type, fields);
 
-            foreach (var field in fields)
+            for (int i = 0; i < fields.Length; i++)
             {
+                FieldInfo field = fields[i];
                 int? explicitOffset = field.GetCustomAttribute<FieldOffsetAttribute>()?.Value;
                 target.Append(";f:").Append(field.Name).Append('@')
-                    .Append(explicitOffset?.ToString() ?? "-").Append(':');
+                    .Append(explicitOffset?.ToString() ?? "-").Append('=').Append(offsets[i]).Append(':');
                 AppendManagedType(target, field.FieldType, active);
             }
 
             active.Remove(type);
+        }
+
+        /// <summary>The offset of each field of <paramref name="type"/> inside the type, as the runtime laid it out.</summary>
+        internal static int[] ManagedFieldOffsets(Type type, FieldInfo[] fields)
+        {
+            var offsets = new int[fields.Length];
+            for (int i = 0; i < fields.Length; i++)
+                offsets[i] = MeasureFieldOffset(type, fields[i]);
+            return offsets;
+        }
+
+        // There is no API for the offset of a field of an auto layout type (Marshal.OffsetOf rejects them), so
+        // it is measured: a dynamic method takes the address of the field of a local and of the local itself
+        // and returns the difference.
+        private static int MeasureFieldOffset(Type type, FieldInfo field)
+        {
+            var method = new DynamicMethod(
+                "FieldOffset", typeof(int), Type.EmptyTypes, typeof(TypeLayoutFingerprint).Module, skipVisibility: true);
+            ILGenerator il = method.GetILGenerator();
+            LocalBuilder local = il.DeclareLocal(type);
+            il.Emit(OpCodes.Ldloca, local);
+            il.Emit(OpCodes.Ldflda, field);
+            il.Emit(OpCodes.Conv_U);
+            il.Emit(OpCodes.Ldloca, local);
+            il.Emit(OpCodes.Conv_U);
+            il.Emit(OpCodes.Sub);
+            il.Emit(OpCodes.Conv_I4);
+            il.Emit(OpCodes.Ret);
+            return ((Func<int>)method.CreateDelegate(typeof(Func<int>)))();
         }
     }
 }

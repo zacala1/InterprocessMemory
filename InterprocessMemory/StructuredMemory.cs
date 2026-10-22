@@ -778,6 +778,7 @@ namespace InterprocessMemory
                 throw new InvalidOperationException(
                     "Cannot take the write lock while holding only a read lock. Release the read lock first.");
 
+            MemoryRegion.ThrowIfWriteLockHeldByCurrentThread(_buffer, nameof(StructuredMemory<TSchema>));
             if (!_buffer.TryAcquireWriteLock(timeout))
                 throw new TimeoutException($"Failed to acquire write lock within {timeout}");
 
@@ -817,6 +818,7 @@ namespace InterprocessMemory
             if (_readLockDepth.Value > 0 || _writeLockDepth.Value > 0)
                 return new ReadLock(this, null, ++_readLockDepth.Value);
 
+            MemoryRegion.ThrowIfWriteLockHeldByCurrentThread(_buffer, nameof(StructuredMemory<TSchema>));
             if (!_buffer.TryAcquireReadLock(timeout))
                 throw new TimeoutException($"Failed to acquire read lock within {timeout}");
 
