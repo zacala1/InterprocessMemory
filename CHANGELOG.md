@@ -6,7 +6,7 @@ Migrating from 3.0.0 or 2.x: see [MIGRATION.md](MIGRATION.md).
 `Process.StartTime`, which differs between observers, so it takes the write lock away from every live owner,
 including one that runs a later version. Update all processes that use a region together.
 
-## 4.0.0 (not released yet)
+## 4.0.0 - 2026-10-22
 
 Changes since the 3.0.0 release. The memory format is unchanged (format version 3).
 
