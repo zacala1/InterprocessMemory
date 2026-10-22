@@ -83,7 +83,7 @@ jobs:
       # the first left behind.
       - name: Remove the regions left by the net8.0 tests
         if: ${{ !cancelled() && runner.os == 'Linux' }}
-        run: find /dev/shm -maxdepth 1 -type f -delete
+        run: find /dev/shm -maxdepth 1 -type f -user "$(id -u)" -delete
 
       # A failure of the net8.0 step does not hide the net10.0 result: both are worth reading.
       - name: Test (net10.0)
@@ -102,7 +102,7 @@ jobs:
       # in the log and the artifact, but a failure here does not fail the job.
       - name: Remove the regions left by the net10.0 tests
         if: ${{ !cancelled() && runner.os == 'Linux' }}
-        run: find /dev/shm -maxdepth 1 -type f -delete
+        run: find /dev/shm -maxdepth 1 -type f -user "$(id -u)" -delete
 
       - name: Test (timing sensitive, informational)
         id: timing
