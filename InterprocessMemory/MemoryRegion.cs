@@ -1636,6 +1636,38 @@ namespace InterprocessMemory
             };
         }
 
+        /// <summary>
+        /// True when the calling thread of this process holds the write lock of the region, whichever instance
+        /// took it. The lock records its owner by process and thread, so a second instance of the same region
+        /// in one process can tell that the lock it is about to wait for belongs to its own thread, which it
+        /// would never get (locks are reentrant only through the instance that took them).
+        /// </summary>
+        internal bool IsWriteLockHeldByCurrentThread()
+        {
+            var header = (SharedHeader*)_basePtr;
+            if (_basePtr == null || Volatile.Read(ref header->WriterLockState) == 0)
+                return false;
+
+            return Volatile.Read(ref header->LockOwnerProcessId) == Environment.ProcessId
+                && Volatile.Read(ref header->LockOwnerThreadId) == Environment.CurrentManagedThreadId
+                && !IsOtherPidNamespace(Volatile.Read(ref header->LockOwnerPidNamespace));
+        }
+
+        /// <summary>
+        /// Called by a container before it waits for the region lock. Waiting for a write lock that the calling
+        /// thread itself holds through another instance of the region cannot succeed; this reports it at once
+        /// instead of after the whole timeout (which is for ever with <see cref="Timeout.InfiniteTimeSpan"/>).
+        /// A read lock held through another instance cannot be recognised: read locks have no owner.
+        /// </summary>
+        internal static void ThrowIfWriteLockHeldByCurrentThread(IMemoryRegion region, string container)
+        {
+            if (region is MemoryRegion memoryRegion && memoryRegion.IsWriteLockHeldByCurrentThread())
+                throw new InvalidOperationException(
+                    $"This thread already holds the write lock of the region through another instance of {container}. " +
+                    "A lock is reentrant only through the instance that took it, so waiting for it here would never " +
+                    "end. Share one instance per region in a process, or release the lock first.");
+        }
+
         /// <inheritdoc/>
         public uint CalculateChecksum(long offset, int length)
         {

@@ -564,6 +564,7 @@ namespace InterprocessMemory
             bool tookRegionLock = false;
             if (_writeLockDepth.Value == 0)
             {
+                MemoryRegion.ThrowIfWriteLockHeldByCurrentThread(_buffer, nameof(SharedArray<T>));
                 if (!_buffer.TryAcquireWriteLock(timeout))
                     throw new TimeoutException($"Failed to acquire write lock within {timeout}");
                 tookRegionLock = true;
@@ -607,6 +608,7 @@ namespace InterprocessMemory
             bool tookRegionLock = false;
             if (_readLockDepth.Value == 0 && _writeLockDepth.Value == 0)
             {
+                MemoryRegion.ThrowIfWriteLockHeldByCurrentThread(_buffer, nameof(SharedArray<T>));
                 if (!_buffer.TryAcquireReadLock(timeout))
                     throw new TimeoutException($"Failed to acquire read lock within {timeout}");
                 tookRegionLock = true;
