@@ -401,7 +401,7 @@ namespace InterprocessMemory
                     throw new PlatformNotSupportedException(
                         "MemoryRegion requires Windows or Linux unless MemoryRegionOptions.FilePath is used.");
 
-                path = "/dev/shm/" + name;
+                path = "/dev/shm/" + FileNameOf(name);
             }
 
             if (!File.Exists(path))
@@ -621,7 +621,7 @@ namespace InterprocessMemory
         /// </summary>
         private void CreateMmfFromLinuxDevShm(long totalSize)
         {
-            _backingFilePath = "/dev/shm/" + _name;
+            _backingFilePath = "/dev/shm/" + FileNameOf(_name);
 
             // FileMode.CreateNew lets the kernel decide who creates the file. Two processes that both saw an
             // empty file used to take the creator's role, and the one that then failed (another capacity,
@@ -772,18 +772,43 @@ namespace InterprocessMemory
                     "(docker run --shm-size, or a larger memory-backed emptyDir in Kubernetes).");
         }
 
+        private const string GlobalPrefix = "Global\\";
+        private const string LocalPrefix = "Local\\";
+
         /// <summary>
-        /// Validates the cross-platform flat identifier used for the named region.
+        /// The length of the Windows kernel namespace prefix (<c>Global\</c> or <c>Local\</c>, in any case) at the
+        /// start of <paramref name="name"/>, or 0 when there is none.
+        /// </summary>
+        private static int NamespacePrefixLength(string name) =>
+            name.StartsWith(GlobalPrefix, StringComparison.OrdinalIgnoreCase) ? GlobalPrefix.Length
+            : name.StartsWith(LocalPrefix, StringComparison.OrdinalIgnoreCase) ? LocalPrefix.Length
+            : 0;
+
+        /// <summary>
+        /// The name of the backing file of a region on Linux: the name without its namespace prefix. Linux has
+        /// no sessions, so <c>Global\x</c>, <c>Local\x</c> and <c>x</c> are one region there.
+        /// </summary>
+        private static string FileNameOf(string name) => name.Substring(NamespacePrefixLength(name));
+
+        /// <summary>
+        /// Validates the cross-platform flat identifier used for the named region. A name may start with
+        /// <c>Global\</c> or <c>Local\</c>, which Windows reads as the namespace of the kernel object (all sessions
+        /// or the session of the process); what follows must be flat.
         /// </summary>
         private static string ValidateFlatName(string name)
         {
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("Name cannot be empty.", nameof(name));
 
-            if (name.Contains('/') || name.Contains('\\') || name == "." || name == "..")
+            string flat = FileNameOf(name);
+            if (string.IsNullOrWhiteSpace(flat))
+                throw new ArgumentException(
+                    $"Name '{name}' has nothing after its namespace prefix.", nameof(name));
+
+            if (flat.Contains('/') || flat.Contains('\\') || flat == "." || flat == "..")
                 throw new ArgumentException(
                     $"Name '{name}' contains path separators or traversal fragments; " +
-                    $"use a flat identifier for cross-platform compatibility.",
+                    $"use a flat identifier for cross-platform compatibility (a leading Global\\ or Local\\ is allowed).",
                     nameof(name));
 
             if (name.Contains('\0'))

@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using NUnit.Framework;
@@ -117,6 +118,98 @@ public class RemainingLimitationsTests
             }).Wait();
 
             Assert.That(error, Is.InstanceOf<TimeoutException>());
+        }
+    }
+
+    // ── Windows namespace prefixes in names ──────────────────────────────────
+
+    [Test]
+    public void Names_MayStartWithGlobalOrLocal_ButMustBeFlatAfterThat()
+    {
+        string unique = Guid.NewGuid().ToString("N");
+
+        foreach (string bad in new[]
+        {
+            "Global\\",                 // nothing after the prefix
+            "Local\\ ",                 // only white space after it
+            "Global\\a\\b",           // not flat after the prefix
+            "Global\\Local\\" + unique,
+            "Other\\" + unique,         // only Global and Local are namespaces
+            "Global\\..",
+            "Local\\a/b",
+        })
+        {
+            Assert.Throws<ArgumentException>(
+                () => MemoryRegion.CreateOrOpen(bad, 1024),
+                $"'{bad}' must be rejected");
+        }
+    }
+
+    [Test]
+    public void PrefixedAndPlainNames_AreOneRegionOnLinux()
+    {
+        if (!OperatingSystem.IsLinux())
+            Assert.Ignore("Linux has no sessions: the prefix is dropped from the file name there.");
+
+        string flat = N("Prefix");
+        using var global = MemoryRegion.CreateOrOpen("Global\\" + flat, 4096);
+        global.Write(new byte[] { 1, 2, 3, 4 }, 0);
+
+        using var plain = MemoryRegion.OpenExisting(flat);
+        using var local = MemoryRegion.OpenExisting("local\\" + flat);   // the prefix is not case sensitive
+
+        var read = new byte[4];
+        plain.Read(read, 0);
+        Assert.That(read, Is.EqualTo(new byte[] { 1, 2, 3, 4 }));
+        local.Read(read, 0);
+        Assert.That(read, Is.EqualTo(new byte[] { 1, 2, 3, 4 }));
+        Assert.That(global.Name, Is.EqualTo("Global\\" + flat), "Name keeps what the caller passed");
+
+        Assert.That(MemoryRegion.Remove("Local\\" + flat), Is.True);
+        Assert.That(File.Exists("/dev/shm/" + flat), Is.False);
+    }
+
+    [Test]
+    public void LocalNamespace_WorksOnWindows()
+    {
+        if (!OperatingSystem.IsWindows())
+            Assert.Ignore("The kernel namespaces exist on Windows only.");
+
+        string name = "Local\\" + N("WinLocal");
+        using var creator = MemoryRegion.CreateOrOpen(name, 4096);
+        creator.Write(new byte[] { 9, 8, 7 }, 0);
+
+        using var opener = MemoryRegion.OpenExisting(name);
+        var read = new byte[3];
+        opener.Read(read, 0);
+        Assert.That(read, Is.EqualTo(new byte[] { 9, 8, 7 }));
+    }
+
+    [Test]
+    public void GlobalNamespace_WorksOnWindowsWithThePrivilege()
+    {
+        if (!OperatingSystem.IsWindows())
+            Assert.Ignore("The kernel namespaces exist on Windows only.");
+
+        string name = "Global\\" + N("WinGlobal");
+        MemoryRegion creator;
+        try
+        {
+            creator = MemoryRegion.CreateOrOpen(name, 4096);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            Assert.Ignore("Creating a section in the Global namespace needs SeCreateGlobalPrivilege.");
+            return;
+        }
+
+        using (creator)
+        {
+            creator.Write(new byte[] { 5, 6 }, 0);
+            using var opener = MemoryRegion.OpenExisting(name);
+            var read = new byte[2];
+            opener.Read(read, 0);
+            Assert.That(read, Is.EqualTo(new byte[] { 5, 6 }));
         }
     }
 }
