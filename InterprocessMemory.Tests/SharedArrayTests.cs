@@ -571,6 +571,19 @@ public class SharedArrayTests
         Assert.That(blockedRead.Wait(TimeSpan.FromSeconds(5)), Is.True);
     }
 
+    // Runs the action on a thread of its own and returns what it threw, or null.
+    private static Exception? OnAnotherThread(Action action)
+    {
+        Exception? error = null;
+        DedicatedThread.Run(() =>
+        {
+            try
+            { action(); }
+            catch (Exception ex) { error = ex; }
+        }).Wait();
+        return error;
+    }
+
     [Test, Timeout(30000)]
     public void ExplicitWriteLock_ExcludesOtherInstances_ForAnyElementType()
     {
@@ -580,8 +593,12 @@ public class SharedArrayTests
 
         using (owner.AcquireWriteLock())
         {
-            Assert.Throws<TimeoutException>(() => other.AcquireWriteLock(TimeSpan.FromMilliseconds(100)));
-            Assert.Throws<TimeoutException>(() => other.AcquireReadLock(TimeSpan.FromMilliseconds(100)));
+            // Another thread is the contender: this thread owns the lock, and asking for it again through a
+            // second instance would be reported at once instead of timing out (see RemainingLimitationsTests).
+            Assert.That(OnAnotherThread(() => other.AcquireWriteLock(TimeSpan.FromMilliseconds(100))),
+                Is.InstanceOf<TimeoutException>());
+            Assert.That(OnAnotherThread(() => other.AcquireReadLock(TimeSpan.FromMilliseconds(100))),
+                Is.InstanceOf<TimeoutException>());
         }
 
         using (other.AcquireWriteLock(TimeSpan.FromSeconds(1)))
@@ -617,7 +634,8 @@ public class SharedArrayTests
             }
 
             // The inner guards released only their own level: the outer lock is still exclusive.
-            Assert.Throws<TimeoutException>(() => peer.AcquireReadLock(TimeSpan.FromMilliseconds(100)));
+            Assert.That(OnAnotherThread(() => peer.AcquireReadLock(TimeSpan.FromMilliseconds(100))),
+                Is.InstanceOf<TimeoutException>());
         }
 
         using (peer.AcquireWriteLock(TimeSpan.FromSeconds(1)))
