@@ -41,10 +41,14 @@ jobs:
       - name: Check out
         uses: actions/checkout@v7
 
+      # The library and its tests target net8.0 and net10.0. Both runtimes are needed: the tests of each
+      # framework start the net8.0 test worker as a child process.
       - name: Set up .NET
         uses: actions/setup-dotnet@v6
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: |
+            8.0.x
+            10.0.x
 
       - name: Cache NuGet packages
         uses: actions/cache@v6
@@ -65,13 +69,24 @@ jobs:
       # The blame collector (enabled by --blame-hang-timeout) names the running test when the test host
       # dies, which is what an AccessViolationException from a memory-mapped region looks like; the hang
       # timeout stops a stuck test from holding the runner until the job timeout.
-      - name: Test
+      - name: Test (net8.0)
         run: >
           dotnet test InterprocessMemory.Tests/InterprocessMemory.Tests.csproj
-          --configuration Release --no-build
+          --configuration Release --no-build --framework net8.0
           --filter "Category!=TimingSensitive&Category!=LongRunning"
           --blame-hang-timeout 10m --blame-hang-dump-type none
-          --logger "trx;LogFileName=test-results.trx"
+          --logger "trx;LogFileName=test-results-net8.0.trx"
+          --results-directory TestResults
+
+      # A failure of the net8.0 step does not hide the net10.0 result: both are worth reading.
+      - name: Test (net10.0)
+        if: ${{ !cancelled() && steps.build.conclusion == 'success' }}
+        run: >
+          dotnet test InterprocessMemory.Tests/InterprocessMemory.Tests.csproj
+          --configuration Release --no-build --framework net10.0
+          --filter "Category!=TimingSensitive&Category!=LongRunning"
+          --blame-hang-timeout 10m --blame-hang-dump-type none
+          --logger "trx;LogFileName=test-results-net10.0.trx"
           --results-directory TestResults
 
       # Tests marked LongRunning (minutes each) are explicit-only and are left to manual runs.
@@ -87,7 +102,7 @@ jobs:
           --configuration Release --no-build
           --filter "Category=TimingSensitive"
           --blame-hang-timeout 5m --blame-hang-dump-type none
-          --logger "trx;LogFileName=timing-sensitive-results.trx"
+          --logger "trx;LogFilePrefix=timing-sensitive-results"
           --results-directory TestResults
 
       # continue-on-error shows a failed step as a success, so say it out loud: a warning annotation on the
@@ -95,7 +110,7 @@ jobs:
       - name: Report timing sensitive failures
         if: ${{ !cancelled() && steps.timing.outcome == 'failure' }}
         run: |
-          echo "::warning title=Timing sensitive tests failed on ${{ matrix.os }}::This step does not fail the job. See the step log and timing-sensitive-results.trx in the test-results artifact."
+          echo "::warning title=Timing sensitive tests failed on ${{ matrix.os }}::This step does not fail the job. See the step log and the timing-sensitive-results*.trx files in the test-results artifact."
           {
             echo "### Timing sensitive tests failed on ${{ matrix.os }}"
             echo ""

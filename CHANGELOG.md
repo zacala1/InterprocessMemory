@@ -6,6 +6,14 @@ Migrating from 3.0.0 or 2.x: see [MIGRATION.md](MIGRATION.md).
 `Process.StartTime`, which differs between observers, so it takes the write lock away from every live owner,
 including one that runs a later version. Update all processes that use a region together.
 
+## 4.1.0 (not released yet)
+
+### Added
+
+- The package contains a `net10.0` build next to the `net8.0` one. The tests run on both frameworks in CI. The
+  cross-process tests keep starting a `net8.0` worker, so a `net10.0` test run also exercises a `net10.0` and a
+  `net8.0` process sharing one region.
+
 ## 4.0.0 (not released yet)
 
 Changes since the 3.0.0 release. The memory format is unchanged (format version 3).
