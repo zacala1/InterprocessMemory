@@ -20,7 +20,7 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>InterprocessMemory</PackageId>
-    <Version>4.0.0</Version>
+    <Version>4.1.0</Version>
     <Title>InterprocessMemory</Title>
     <Description>Typed queues, messages, arrays, structured data, and raw memory shared safely between .NET processes.</Description>
     <PackageTags>shared-memory;ipc;high-performance;simd;lock-free;zero-allocation</PackageTags>
@@ -32,7 +32,7 @@
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
-    <PackageReleaseNotes>Version 4 fixes lock-owner detection on Linux (3.0.0 takes the write lock of live owners), torn reads of small values, region creation races and several crash and Dispose hazards. Breaking: the StructuredMemory lock guards are ref structs (no await inside a lock scope), and some defaults and limits changed. See CHANGELOG.md and MIGRATION.md. The region format is unchanged from version 3.</PackageReleaseNotes>
+    <PackageReleaseNotes>Adds a net10.0 build next to net8.0, allows the Windows Global\ and Local\ prefixes in region names, makes StructuredMemory and SharedArray throw instead of waiting for their whole timeout when the calling thread already holds the write lock through another instance of the region, and includes field offsets in the fingerprint of generic structs with automatic layout. The region format is unchanged from version 3. See CHANGELOG.md.</PackageReleaseNotes>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
