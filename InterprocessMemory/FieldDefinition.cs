@@ -27,6 +27,13 @@ namespace InterprocessMemory
         /// <summary>Gets the total size of the field in bytes</summary>
         public int Size => ElementSize * ArrayLength;
 
+        // Identity of the struct type of a Struct or StructArray field. It only goes into the stored schema
+        // descriptor (diagnostics); it is deliberately not part of the schema hash, which would change the hash
+        // of every existing schema. The fingerprint is computed on demand: it costs a layout walk of the type.
+        internal string? StructTypeName { get; init; }
+
+        internal Func<TypeLayoutFingerprint>? StructFingerprint { get; init; }
+
         /// <summary>
         /// Validates the field name. Empty/whitespace names produce schemas that crash with
         /// confusing downstream errors (duplicate-empty-key conflicts, "field '' not found"
@@ -120,7 +127,9 @@ namespace InterprocessMemory
                 TypeCode = FieldTypeCode.Struct,
                 ElementSize = Unsafe.SizeOf<T>(),
                 ArrayLength = 1,
-                Alignment = IntPtr.Size
+                Alignment = IntPtr.Size,
+                StructTypeName = typeof(T).FullName,
+                StructFingerprint = static () => TypeLayoutFingerprint.Create<T>()
             };
         }
 
@@ -144,7 +153,9 @@ namespace InterprocessMemory
                 TypeCode = FieldTypeCode.Struct,
                 ElementSize = Unsafe.SizeOf<T>(),
                 ArrayLength = length,
-                Alignment = IntPtr.Size
+                Alignment = IntPtr.Size,
+                StructTypeName = typeof(T).FullName,
+                StructFingerprint = static () => TypeLayoutFingerprint.Create<T>()
             };
         }
 

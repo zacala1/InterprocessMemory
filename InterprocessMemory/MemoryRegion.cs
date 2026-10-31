@@ -34,6 +34,11 @@ namespace InterprocessMemory
     {
         private readonly string _name;
         private long _capacity;
+        // Set by the structured-memory constructor only (see CreateOrOpen with minAcceptedCapacityBytes): an
+        // existing region of any capacity from _minCapacity up is accepted and its declared capacity is
+        // adopted. The caller then checks the exact size itself.
+        private readonly bool _flexibleCapacity;
+        private readonly long _minCapacity;
         private readonly bool _isOwner;
         private readonly MemoryRegionOptions _options;
         private readonly ILogger? _logger;
@@ -357,6 +362,25 @@ namespace InterprocessMemory
             RegionKind regionKind) =>
             new(name, capacityBytes, options, createOrOpen: true, regionKind);
 
+        /// <summary>
+        /// Like <see cref="CreateOrOpen(string, long, MemoryRegionOptions?, RegionKind)"/>, but an existing region
+        /// is accepted when it declares at least <paramref name="minAcceptedCapacityBytes"/> bytes; the region
+        /// then reports the capacity it declares. A new region is created with <paramref name="capacityBytes"/>.
+        /// The caller has to validate the capacity it adopted.
+        /// </summary>
+        internal static MemoryRegion CreateOrOpen(
+            string name,
+            long capacityBytes,
+            long minAcceptedCapacityBytes,
+            MemoryRegionOptions? options,
+            RegionKind regionKind)
+        {
+            if (minAcceptedCapacityBytes <= 0 || minAcceptedCapacityBytes > capacityBytes)
+                throw new ArgumentOutOfRangeException(
+                    nameof(minAcceptedCapacityBytes), "The minimum capacity must be positive and at most the capacity");
+            return new(name, capacityBytes, options, createOrOpen: true, regionKind, minAcceptedCapacityBytes);
+        }
+
         internal static MemoryRegion OpenExisting(
             string name,
             MemoryRegionOptions? options,
@@ -428,7 +452,8 @@ namespace InterprocessMemory
             long? capacityBytes,
             MemoryRegionOptions? options,
             bool createOrOpen,
-            RegionKind regionKind)
+            RegionKind regionKind,
+            long? minAcceptedCapacityBytes = null)
         {
             _name = ValidateFlatName(name);
             if (capacityBytes is <= 0)
@@ -444,6 +469,8 @@ namespace InterprocessMemory
             _regionKind = regionKind;
 
             _capacity = capacityBytes ?? 0;
+            _flexibleCapacity = createOrOpen && minAcceptedCapacityBytes.HasValue;
+            _minCapacity = minAcceptedCapacityBytes ?? _capacity;
 
             _logger?.LogDebug("Creating shared buffer '{Name}' with capacity {Capacity}", name, _capacity);
 
@@ -490,9 +517,10 @@ namespace InterprocessMemory
                         "macOS/other POSIX is not currently supported in the anonymous-named mode; " +
                         "set MemoryRegionOptions.FilePath to use file-backed mode instead.");
 
+                // A flexible region maps whatever the section holds: an existing one may be larger than totalSize.
                 _accessor = _mmf!.CreateViewAccessor(
                     0,
-                    _createOrOpen ? totalSize : 0,
+                    _createOrOpen && !_flexibleCapacity ? totalSize : 0,
                     MemoryMappedFileAccess.ReadWrite);
                 _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _basePtr);
 
@@ -540,7 +568,7 @@ namespace InterprocessMemory
                         EnsureFreeSpace(Path.GetDirectoryName(fullPath) ?? fullPath, totalSize, _name);
                         file.SetLength(totalSize);
                     }
-                    else if (length != totalSize)
+                    else if (!ExistingSizeIsAcceptable(length, totalSize))
                     {
                         ThrowForExistingFileOfAnotherSize(file, fullPath, length, totalSize);
                     }
@@ -549,7 +577,7 @@ namespace InterprocessMemory
                 _mmf = MemoryMappedFile.CreateFromFile(
                     file,
                     mapName,
-                    _createOrOpen ? totalSize : 0,
+                    _createOrOpen && !_flexibleCapacity ? totalSize : 0,
                     MemoryMappedFileAccess.ReadWrite,
                     HandleInheritability.None,
                     leaveOpen: false);          // the MMF takes ownership of the FileStream
@@ -677,7 +705,7 @@ namespace InterprocessMemory
                         "If its creator crashed, stop every user of the region and call MemoryRegion.Remove(name).");
                 }
 
-                if (_createOrOpen && actualLen != totalSize)
+                if (_createOrOpen && !ExistingSizeIsAcceptable(actualLen, totalSize))
                 {
                     // Mirror the Windows behavior where capacity mismatch on open throws.
                     _backingFile.Dispose();
@@ -691,12 +719,22 @@ namespace InterprocessMemory
             _mmf = MemoryMappedFile.CreateFromFile(
                 _backingFile,
                 mapName: null,                  // Linux ignores/rejects non-null mapName
-                _createOrOpen ? totalSize : 0,
+                _createOrOpen && !_flexibleCapacity ? totalSize : 0,
                 MemoryMappedFileAccess.ReadWrite,
                 HandleInheritability.None,
                 leaveOpen: false);              // MMF takes ownership of the FileStream
             _backingFile = null;                // ownership transferred — don't double-dispose
         }
+
+        /// <summary>
+        /// Whether an existing backing file of <paramref name="actualLength"/> bytes may be opened by a caller that
+        /// asked for <paramref name="totalSize"/> bytes: the same size, or, for a flexible region, at least the
+        /// minimum.
+        /// </summary>
+        private bool ExistingSizeIsAcceptable(long actualLength, long totalSize) =>
+            _flexibleCapacity
+                ? actualLength >= checked(HeaderSize + _minCapacity)
+                : actualLength == totalSize;
 
         private FileStreamOptions CreateNewFileOptions()
         {
@@ -845,11 +883,19 @@ namespace InterprocessMemory
             //            only then read the rest of the header, guaranteeing they never see
             //            partially-initialized state (e.g. Magic=MagicNumber but Capacity=0,
             //            which would falsely report a capacity mismatch).
-            uint prev = _createOrOpen
+            //
+            // A flexible region (see CreateOrOpen with a minimum capacity) accepts a mapping of another size than the
+            // one it asked for. Only a process whose request fits the mapping may initialize it: the capacity it
+            // writes into the header must be the capacity of the mapping, or the creator of the mapping, which asked
+            // for a different size, and every later opener would disagree with the header, and this process could
+            // write past the end of the mapping. Any other process waits for the process that created the mapping.
+            bool mayInitialize = _createOrOpen && (!_flexibleCapacity || MappingIsValidFor(_capacity));
+
+            uint prev = mayInitialize
                 ? Interlocked.CompareExchange(ref header->Magic, SharedHeader.MagicInitializing, 0)
                 : Volatile.Read(ref header->Magic);
 
-            if (_createOrOpen && prev == 0)
+            if (mayInitialize && prev == 0)
             {
                 header->Version = SharedHeader.FormatVersion;
                 header->Capacity = _capacity;
@@ -886,7 +932,7 @@ namespace InterprocessMemory
                 {
                     // OpenExisting can arrive after the creator made the file but before its first header
                     // write. That is not a corrupt header: wait for the creator.
-                    if (observed == 0 && !_createOrOpen && sw.ElapsedMilliseconds < OpenerWaitMs)
+                    if (observed == 0 && !mayInitialize && sw.ElapsedMilliseconds < OpenerWaitMs)
                     {
                         Thread.Sleep(1);
                         continue;
@@ -917,10 +963,9 @@ namespace InterprocessMemory
                 throw new InvalidDataException(
                     $"Memory region '{_name}' declares invalid capacity {declaredCapacity}.");
 
-            long expectedMappingSize;
             try
             {
-                expectedMappingSize = checked(HeaderSize + declaredCapacity);
+                _ = checked(HeaderSize + declaredCapacity);
             }
             catch (OverflowException ex)
             {
@@ -929,24 +974,54 @@ namespace InterprocessMemory
                     ex);
             }
 
+            if (!MappingIsValidFor(declaredCapacity))
+                throw new InvalidDataException(
+                    $"Memory region '{_name}' declares {declaredCapacity} payload bytes, but its " +
+                    $"mapping contains {_accessor!.Capacity - HeaderSize} payload bytes.");
+
+            if (!_createOrOpen)
+            {
+                _capacity = declaredCapacity;
+            }
+            else if (_flexibleCapacity)
+            {
+                if (declaredCapacity < _minCapacity)
+                    throw new InvalidOperationException(
+                        $"Capacity mismatch: expected at least {_minCapacity}, found {declaredCapacity}");
+                _capacity = declaredCapacity;
+            }
+            else if (declaredCapacity != _capacity)
+            {
+                throw new InvalidOperationException(
+                    $"Capacity mismatch: expected {_capacity}, found {declaredCapacity}");
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Whether the mapping can hold a region that declares <paramref name="payloadCapacity"/> bytes: it has
+        /// exactly that size, or, for a Windows named section, whose view is rounded up to whole pages, at least
+        /// that size.
+        /// </summary>
+        private bool MappingIsValidFor(long payloadCapacity)
+        {
+            long expectedMappingSize;
+            try
+            {
+                expectedMappingSize = checked(HeaderSize + payloadCapacity);
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
+
             long mappedCapacity = _accessor!.Capacity;
             bool isWindowsNamedRegion =
                 OperatingSystem.IsWindows() && string.IsNullOrEmpty(_options.FilePath);
-            bool mappingSizeIsInvalid = isWindowsNamedRegion
-                ? mappedCapacity < expectedMappingSize
-                : mappedCapacity != expectedMappingSize;
-            if (mappingSizeIsInvalid)
-                throw new InvalidDataException(
-                    $"Memory region '{_name}' declares {declaredCapacity} payload bytes, but its " +
-                    $"mapping contains {mappedCapacity - HeaderSize} payload bytes.");
-
-            if (!_createOrOpen)
-                _capacity = declaredCapacity;
-            else if (declaredCapacity != _capacity)
-                throw new InvalidOperationException(
-                    $"Capacity mismatch: expected {_capacity}, found {declaredCapacity}");
-
-            return false;
+            return isWindowsNamedRegion
+                ? mappedCapacity >= expectedMappingSize
+                : mappedCapacity == expectedMappingSize;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
