@@ -76,6 +76,14 @@ namespace InterprocessMemory
         public int StoredSchemaVersion { get; private set; }
 
         /// <summary>
+        /// Gets whether the region stores the list of its fields (see
+        /// <see cref="StructuredMemoryOptions.StoreSchemaDescriptor"/>). It is <c>false</c> for a region that
+        /// was created without that option, including every region created by version 4.0 and 4.1, even when
+        /// this instance asked for the option: only the process that creates a region can store it.
+        /// </summary>
+        public bool HasStoredDescriptor { get; private set; }
+
+        /// <summary>
         /// Creates or opens structured interprocess memory.
         /// </summary>
         public static StructuredMemory<TSchema> CreateOrOpen(
@@ -83,6 +91,29 @@ namespace InterprocessMemory
             TSchema schema,
             SchemaCompatibility compatibility = SchemaCompatibility.Strict) =>
             new(name, schema, create: true, compatibility);
+
+        /// <summary>
+        /// Creates or opens structured interprocess memory with <paramref name="options"/>.
+        /// </summary>
+        public static StructuredMemory<TSchema> CreateOrOpen(
+            string name,
+            TSchema schema,
+            StructuredMemoryOptions options) =>
+            CreateOrOpen(name, schema, SchemaCompatibility.Strict, options);
+
+        /// <summary>
+        /// Creates or opens structured interprocess memory with <paramref name="options"/>.
+        /// </summary>
+        public static StructuredMemory<TSchema> CreateOrOpen(
+            string name,
+            TSchema schema,
+            SchemaCompatibility compatibility,
+            StructuredMemoryOptions options)
+        {
+            if (options is null)
+                throw new ArgumentNullException(nameof(options));
+            return new(name, schema, create: true, compatibility, options);
+        }
 
         /// <summary>
         /// Opens existing structured memory and validates it against the supplied schema.
@@ -102,7 +133,8 @@ namespace InterprocessMemory
             string name,
             TSchema schema,
             bool create,
-            SchemaCompatibility compatibility)
+            SchemaCompatibility compatibility,
+            StructuredMemoryOptions? options = null)
         {
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("Name cannot be empty", nameof(name));
@@ -126,10 +158,16 @@ namespace InterprocessMemory
             // No statistics are exposed here, so skip the region's per-call counters.
             var regionOptions = new MemoryRegionOptions { EnableStatistics = false };
 
+            // Built before the region exists, so that a name or a size the descriptor cannot hold fails
+            // without leaving a region behind.
+            byte[]? descriptor = create && options?.StoreSchemaDescriptor == true ? BuildDescriptor() : null;
+
             if (create)
             {
+                // An existing region may be larger than the fields: its creator may have stored the descriptor.
+                // The exact size is checked in ValidateSchemaCompatibility, once the header can be read.
                 _buffer = MemoryRegion.CreateOrOpen(
-                    name, totalSize, regionOptions, RegionKind.StructuredMemory);
+                    name, totalSize + (descriptor?.Length ?? 0), totalSize, regionOptions, RegionKind.StructuredMemory);
             }
             else
             {
@@ -147,12 +185,13 @@ namespace InterprocessMemory
                     // can write to it before its creator has published the header. Writing zeros anyway made
                     // every page resident at once (about 5 s for a 1 GB region, and a sparse file in
                     // /dev/shm became real memory) without changing a single byte.
-                    WriteSchemaHeader();
+                    WriteSchemaHeader(descriptor);
                     StoredSchemaVersion = SchemaVersion;
+                    HasStoredDescriptor = descriptor != null;
                 }
                 else
                 {
-                    ValidateSchemaCompatibility();
+                    ValidateSchemaCompatibility(exactCapacity: create);
                 }
             }
             catch
@@ -854,7 +893,23 @@ namespace InterprocessMemory
             return _fields.Keys;
         }
 
-        private void WriteSchemaHeader()
+        private byte[] BuildDescriptor()
+        {
+            var ordered = new List<FieldMetadata>(_fields.Values);
+            ordered.Sort((a, b) => a.Offset.CompareTo(b.Offset));
+
+            var fields = new List<DescriptorField>(ordered.Count);
+            foreach (var field in ordered)
+            {
+                fields.Add(new DescriptorField(
+                    field.Name, field.TypeCode, field.ElementSize, field.ArrayLength, field.Alignment, field.Offset,
+                    field.StructTypeName, field.StructFingerprint?.Invoke()));
+            }
+
+            return SchemaDescriptor.Encode(SchemaVersion, _schemaHash, fields);
+        }
+
+        private void WriteSchemaHeader(byte[]? descriptor)
         {
             Span<byte> header = stackalloc byte[SchemaHeaderSize];
             header.Clear();
@@ -866,6 +921,15 @@ namespace InterprocessMemory
             // Write schema hash for quick compatibility check
             BitConverter.TryWriteBytes(header.Slice(12), _schemaHash);
 
+            if (descriptor != null)
+            {
+                // Behind the field data, written before the header that points to it; the magic below publishes both.
+                _buffer.Write(descriptor, _totalSize);
+                SchemaDescriptor.WriteLocation(
+                    header,
+                    new DescriptorLocation(_totalSize, descriptor.Length, SchemaDescriptor.ComputeCrc32(descriptor)));
+            }
+
             _buffer.Write(header, 0);
 
             // Publish the magic last (see SharedArray.InitializeHeader).
@@ -874,7 +938,11 @@ namespace InterprocessMemory
             _buffer.Write(header.Slice(0, sizeof(uint)), 0);
         }
 
-        private void ValidateSchemaCompatibility()
+        /// <param name="exactCapacity">
+        /// True for <c>CreateOrOpen</c>, which has always required the region to be exactly as large as the
+        /// schema needs (plus the descriptor, if the region has one); <c>OpenExisting</c> adapts to the region.
+        /// </param>
+        private void ValidateSchemaCompatibility(bool exactCapacity)
         {
             Span<byte> header = stackalloc byte[SchemaHeaderSize];
             Span<byte> magic = stackalloc byte[sizeof(uint)];
@@ -900,11 +968,33 @@ namespace InterprocessMemory
 
             long regionSize = _buffer.Capacity;
 
-            if (StoredSchemaVersion == SchemaVersion && regionSize != _totalSize)
+            // A descriptor sits behind the field data of the schema that wrote the region, so the region is
+            // that much larger than the fields need. Regions written before the descriptor existed carry no
+            // marker, and the part of the header that holds it is zero.
+            bool hasDescriptor = SchemaDescriptor.TryReadLocation(header, regionSize, out DescriptorLocation descriptor);
+            bool sizeMatches = hasDescriptor
+                ? descriptor.Offset == _totalSize && regionSize == _totalSize + descriptor.Length
+                : regionSize == _totalSize;
+
+            // The fields of the schema that wrote the region end where its descriptor starts. Counting the descriptor
+            // as room for fields would let a schema that grew into it read and overwrite it.
+            long fieldAreaSize = hasDescriptor ? descriptor.Offset : regionSize;
+
+            if (exactCapacity && !sizeMatches)
+            {
+                throw new InvalidOperationException(
+                    $"Capacity mismatch: expected {_totalSize}, found {regionSize}");
+            }
+
+            if (StoredSchemaVersion == SchemaVersion && !sizeMatches)
             {
                 throw new InvalidDataException(
-                    $"Structured-memory size mismatch: schema requires {_totalSize} bytes, " +
-                    $"but the region contains {regionSize} bytes.");
+                    hasDescriptor
+                        ? $"Structured-memory size mismatch: schema requires {_totalSize} bytes before the stored schema " +
+                          $"descriptor, which starts at {descriptor.Offset} and is {descriptor.Length} bytes long, " +
+                          $"but the region contains {regionSize} bytes."
+                        : $"Structured-memory size mismatch: schema requires {_totalSize} bytes, " +
+                          $"but the region contains {regionSize} bytes.");
             }
 
             if (StoredSchemaVersion == SchemaVersion && storedFieldCount != _fields.Count)
@@ -935,11 +1025,14 @@ namespace InterprocessMemory
                 // Whatever the versions are, the schema can only use what the region holds. A region written
                 // by a newer schema that appended fields is larger and an older reader uses its prefix;
                 // a region written by an older, smaller schema cannot hold the fields of this one.
-                if (regionSize < _totalSize)
+                if (fieldAreaSize < _totalSize)
                 {
                     throw new InvalidDataException(
                         $"Structured-memory size mismatch: schema version {SchemaVersion} requires {_totalSize} bytes, " +
-                        $"but the region (schema version {StoredSchemaVersion}) contains only {regionSize} bytes.");
+                        (hasDescriptor
+                            ? $"but the region (schema version {StoredSchemaVersion}) holds only {fieldAreaSize} bytes " +
+                              "of fields before its stored schema descriptor."
+                            : $"but the region (schema version {StoredSchemaVersion}) contains only {regionSize} bytes."));
                 }
 
                 // Schema-side veto: if the schema itself can declare incompatibility for this
@@ -961,6 +1054,8 @@ namespace InterprocessMemory
                 throw new InvalidOperationException(
                     "Schema hash mismatch - the schema structure has changed");
             }
+
+            HasStoredDescriptor = hasDescriptor;
         }
 
         private int ComputeSchemaHash()
@@ -1033,7 +1128,9 @@ namespace InterprocessMemory
                         && field.TypeCode != FieldTypeCode.Utf8String,
                     IsString = field.TypeCode == FieldTypeCode.Char && field.ArrayLength > 1,
                     IsBlob = field.TypeCode == FieldTypeCode.Blob,
-                    IsUtf8String = field.TypeCode == FieldTypeCode.Utf8String
+                    IsUtf8String = field.TypeCode == FieldTypeCode.Utf8String,
+                    StructTypeName = field.StructTypeName,
+                    StructFingerprint = field.StructFingerprint
                 };
 
                 metadata[field.Name] = meta;
@@ -1367,6 +1464,8 @@ namespace InterprocessMemory
             public bool IsString { get; set; }
             public bool IsBlob { get; set; }
             public bool IsUtf8String { get; set; }
+            public string? StructTypeName { get; set; }
+            public Func<TypeLayoutFingerprint>? StructFingerprint { get; set; }
         }
     }
 

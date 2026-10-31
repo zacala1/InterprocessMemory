@@ -263,6 +263,33 @@ only append fields), `Backward` a region written by an older version, `Full` bot
 than the schema that opens it. The library does not compare the field layout of two different versions; a schema
 that changes more than appended fields has to say so in `IVersionedSchema.IsCompatibleWith`.
 
+### Storing the field list in the region
+
+A region holds the field values and a hash of the schema, so every process that opens it needs the schema in
+its code. The process that creates a region can also store the list of fields (name, type, size and offset of
+each) behind the field data, for tools that have to find out what a region holds:
+
+```csharp
+using var memory = StructuredMemory<SensorSchema>.CreateOrOpen(
+    "sensor.state",
+    new SensorSchema(),
+    new StructuredMemoryOptions { StoreSchemaDescriptor = true });
+
+Console.WriteLine(memory.HasStoredDescriptor);   // true: this process created the region
+```
+
+- The option is off by default. Only the creator can store the list, because the size of an existing region
+  cannot change; for a region that already exists the option does nothing, and `HasStoredDescriptor` says whether
+  the region has one.
+- Processes that have the schema are not affected. Every way of opening a region accepts it, whether the
+  opener asks for the option or not, and the schema hash is the same with and without it. The list is
+  read through the library in a later version; its layout is described in `SchemaDescriptor.cs`.
+- The region is larger than the fields need (a few hundred bytes for a small schema; names and the struct type
+  names are limited to 1024 UTF-8 bytes and the list to 1 MiB). **Version 4.0 and 4.1 refuse such a region** with a
+  "size mismatch" or "Capacity mismatch" error, without touching it. Update every process that uses the region
+  first, then turn the option on, and remove regions that exist from before with `MemoryRegion.Remove`.
+- The list is a check and a diagnostic, not access control: a process that can write the region can change it.
+
 ## Shared arrays
 
 ```csharp

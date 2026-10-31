@@ -6,6 +6,26 @@ Migrating from 3.0.0 or 2.x: see [MIGRATION.md](MIGRATION.md).
 `Process.StartTime`, which differs between observers, so it takes the write lock away from every live owner,
 including one that runs a later version. Update all processes that use a region together.
 
+## 4.2.0 (not released yet)
+
+### Added
+
+- `StructuredMemoryOptions.StoreSchemaDescriptor`, passed to the new `StructuredMemory<TSchema>.CreateOrOpen`
+  overloads that take `StructuredMemoryOptions`, stores the list of fields (name, type, size and offset of each,
+  and the type of struct fields) behind the field data of a region that the call creates.
+  `StructuredMemory<TSchema>.HasStoredDescriptor` tells whether a region has one. The option is off by default
+  and has no effect on a region that already exists. The schema hash does not change, and a region created without
+  the option is byte for byte what 4.1 creates. Reading the list back without the schema follows in a later version.
+
+### Compatibility
+
+- A region that stores its descriptor is larger than the schema needs. 4.0 and 4.1 compare the size exactly, so
+  they refuse to open it (`OpenExisting`: "Structured-memory size mismatch"; `CreateOrOpen`: "Capacity mismatch")
+  and leave it untouched. Update every process that uses the region before turning the option on.
+  Version 4.2 opens a region with or without the descriptor, whatever the opener asks for.
+- `CreateOrOpen` of `StructuredMemory<TSchema>` still requires the exact size of the schema (plus the descriptor,
+  if the region has one) and reports anything else as before.
+
 ## 4.1.0 (not released yet)
 
 ### Added
