@@ -1,3 +1,459 @@
 # InterprocessMemory
 
-Typed queues, messages, arrays, structured data, and raw memory shared between .NET processes.
+`InterprocessMemory` lets separate .NET processes exchange raw bytes, typed values, messages,
+arrays, and structured records through named shared memory.
+
+- Windows: named `MemoryMappedFile`
+- Linux: named files in `/dev/shm`
+- .NET 8 or later (the package contains builds for `net8.0` and `net10.0`)
+- Process-wide reader/writer synchronization with orphan-lock recovery
+- Allocation-free `Span<T>` and `unmanaged` typed-queue hot paths
+
+## Install
+
+The package has not been published to NuGet.org. Create it in a local feed from this repository:
+
+```shell
+dotnet pack InterprocessMemory/InterprocessMemory.csproj --configuration Release --output artifacts/nuget
+```
+
+and add it to a project from that folder:
+
+```shell
+dotnet add package InterprocessMemory --version 0.1.0 --source <path-to-repository>/artifacts/nuget
+```
+
+```csharp
+using InterprocessMemory;
+```
+
+## Raw memory shared by two processes
+
+The process that knows the required size creates or opens the region:
+
+```csharp
+using var memory = MemoryRegion.CreateOrOpen(
+    name: "telemetry",
+    capacityBytes: 1024 * 1024);
+
+memory.Write(new byte[] { 1, 2, 3, 4 }, offset: 0);
+```
+
+Other processes only need the name. `OpenExisting` reads the capacity from the version 3
+header:
+
+```csharp
+using var memory = MemoryRegion.OpenExisting("telemetry");
+
+Span<byte> value = stackalloc byte[4];
+memory.Read(value, offset: 0);
+```
+
+`Read` and `Write` do not automatically lock the region. Use the shared reader/writer lock
+when multiple bytes or fields must be observed atomically:
+
+```csharp
+if (memory.TryAcquireWriteLock(TimeSpan.FromSeconds(1)))
+{
+    try
+    {
+        memory.Write(payload, 0);
+    }
+    finally
+    {
+        memory.ReleaseWriteLock();
+    }
+}
+```
+
+Lock ownership includes the process ID, managed thread ID, and process start time. A process
+waiting for a write lock or a read lock keeps checking whether the writer that holds the lock is
+still alive (also when it waits with `Timeout.InfiniteTimeSpan`) and recovers a lock left behind by a
+terminated process. A process killed exactly while it takes or releases the lock can leave it held
+with no owner recorded; a waiter clears such a lock once it has looked like that for two seconds.
+
+A process id only means something inside its own PID namespace. On Linux the owner records its namespace
+in the region header, and a waiter in a different one (two containers sharing `/dev/shm`) never decides
+from the pid alone that the owner is gone; only the opt-in `OrphanLockTimeout` can take such a lock over.
+
+Recovery is based on the owner process being gone. A write lock held by a process that is still
+alive is never taken over unless you opt in with `MemoryRegionOptions.OrphanLockTimeout`, which
+trades mutual exclusion for liveness when a critical section may run longer than the timeout.
+
+The write lock belongs to the thread that acquired it. Release it on that same thread; releasing
+from another thread throws `SynchronizationLockException` and leaves the lock held. In particular,
+do not `await` between acquiring and releasing a lock, because the continuation may resume on a
+different thread. Disposing a region while another thread is waiting for one of its locks releases
+that thread with an `ObjectDisposedException`.
+
+A lock is remembered by the instance that took it: it is reentrant through that instance only. Open a
+region once per process and share the instance. If one thread does use two instances of a region, then while
+it holds the **write** lock through one of them the other throws `InvalidOperationException` at once instead of
+waiting for its timeout. A thread that holds a **read** lock through one instance and asks for the write lock
+through the other cannot be recognised (read locks have no owner) and still waits for the timeout.
+
+On Windows a name without a prefix lives in the namespace of the session of the process that creates it, so
+a service (session 0) and a process of a logged-on user do not see each other's regions. A name that starts
+with `Global\` is visible to every session; `Local\` says "this session" explicitly. What follows the prefix
+must be a flat identifier. Creating a section in the `Global\` namespace needs the `SeCreateGlobalPrivilege`
+(services and elevated processes have it; an ordinary user session can open one but not create one), and
+the section gets the default access control of its creator, so processes under other accounts may be refused
+access: run both sides under the same account for now. Linux has no sessions: the prefix is dropped there, and
+`Global\x`, `Local\x` and `x` are one region, so the same name works on both platforms.
+
+On Linux and macOS a new backing file gets the platform default permissions (usually 0644: readable by every
+user, writable by the owner). Set `MemoryRegionOptions.UnixCreateMode` to restrict it (for example to owner
+read/write) or to open it to a group.
+
+## Choosing a data structure
+
+| Type | Use it for |
+|---|---|
+| `MemoryRegion` | Offset-addressed raw bytes |
+| `StructuredMemory<TSchema>` | Named, typed fields with schema versioning |
+| `SharedArray<T>` | A fixed-length shared array of `unmanaged` elements |
+| `SingleProducerQueue<T>` | Fixed-size items with exactly one producer and one consumer |
+| `ConcurrentQueue<T>` | Fixed-size items with multiple producers and consumers |
+| `SingleProducerByteStream` | SPSC bytes where write boundaries are not messages |
+| `ConcurrentMessageQueue` | Variable-length messages with preserved boundaries |
+
+All types use `CreateOrOpen(...)` for the process that supplies sizing metadata and
+`OpenExisting(...)` for processes that discover it from the shared header.
+
+The `name` must be the same non-empty flat identifier in every process. Path separators,
+control characters, NUL, and UTF-8 names longer than 255 bytes are rejected consistently on
+Windows and Linux.
+
+On Linux a region lives in `/dev/shm`, which Docker limits to 64 MB by default. Creating a region that
+does not fit throws `IOException` (raise the limit with `--shm-size`, or a larger memory-backed
+`emptyDir` in Kubernetes) instead of killing the process with `SIGBUS` on a later write.
+
+## Typed queues
+
+Typed queues accept only fixed-size `unmanaged` values. They copy the value directly to a slot;
+there is no serializer or managed allocation.
+
+```csharp
+public struct SensorSample
+{
+    public long Timestamp;
+    public double Value;
+}
+
+using var producer =
+    SingleProducerQueue<SensorSample>.CreateOrOpen(
+        "sensor.samples",
+        capacity: 1000);
+
+var sample = new SensorSample
+{
+    Timestamp = DateTime.UtcNow.Ticks,
+    Value = 23.5
+};
+
+producer.TryEnqueue(sample);
+```
+
+```csharp
+using var consumer =
+    SingleProducerQueue<SensorSample>.OpenExisting("sensor.samples");
+
+if (consumer.TryDequeue(out SensorSample sample))
+{
+    Console.WriteLine(sample.Value);
+}
+```
+
+Queue capacity is an item count, not bytes, and is rounded up to the next power of two. The two
+multi-producer queues need at least two slots, so a requested capacity of 1 becomes 2.
+`Capacity` reports the resulting number of slots.
+
+The shared header records `sizeof(T)` and a deterministic fingerprint of the type name,
+assembly name, struct layout, field types, sizes, and offsets. Opening the queue with a
+different or modified `T` throws `InvalidDataException`. Producer and consumer applications
+should reference the same DTO assembly.
+
+Use `ConcurrentQueue<T>` when more than one producer or consumer may access the queue:
+
+```csharp
+using var queue =
+    InterprocessMemory.ConcurrentQueue<SensorSample>.CreateOrOpen(
+        "sensor.concurrent",
+        capacity: 4096,
+        options: new ConcurrentQueueOptions
+        {
+            MaxSpins = 100,
+            EnableStatistics = false
+        });
+```
+
+Both typed queues provide immediate and timeout/cancellation overloads of `TryEnqueue` and
+`TryDequeue`.
+
+## Byte stream and variable-length messages
+
+`SingleProducerByteStream` is a continuous SPSC ring. A six-byte write may be returned as a
+two-byte read followed by a four-byte read:
+
+```csharp
+using var stream =
+    SingleProducerByteStream.CreateOrOpen("camera.bytes", 64 * 1024);
+
+stream.TryWrite(bytes);
+```
+
+Use `ConcurrentMessageQueue` when each write must remain one message:
+
+```csharp
+using var messages = ConcurrentMessageQueue.CreateOrOpen(
+    name: "commands",
+    capacity: 1024,
+    maxMessageSize: 4096);
+
+messages.TryEnqueue(encodedCommand);
+
+Span<byte> destination = stackalloc byte[messages.MaxMessageSize];
+if (messages.TryDequeue(destination, out int length))
+{
+    ReadOnlySpan<byte> message = destination[..length];
+}
+```
+
+Empty messages are rejected. If the destination is too small, dequeue throws without consuming
+the message. Serialization is intentionally outside the core library; encode managed objects
+before enqueueing them.
+
+## Structured memory
+
+```csharp
+public struct SensorSchema : IMemorySchema
+{
+    public IEnumerable<FieldDefinition> GetFields()
+    {
+        yield return FieldDefinition.Scalar<int>("Sequence");
+        yield return FieldDefinition.Scalar<double>("Temperature");
+        yield return FieldDefinition.String("Status", 32);
+    }
+}
+
+using var memory =
+    StructuredMemory<SensorSchema>.CreateOrOpen(
+        "sensor.state",
+        new SensorSchema());
+
+using (memory.AcquireWriteLock())
+{
+    memory.Write("Sequence", 42);
+    memory.Write("Temperature", 23.5);
+    memory.WriteString("Status", "Ready");
+}
+```
+
+`StructuredMemory<TSchema>` automatically locks values wider than eight bytes, strings, blobs,
+UTF-8 strings, and arrays to prevent torn reads and writes. Use an explicit lock when several
+fields form one transaction.
+
+The lock guards returned by `AcquireWriteLock()` and `AcquireReadLock()` are `ref struct`s, because a
+lock belongs to one thread and must never be held across an `await`: the compiler rejects a guard that is
+a local or a `using` resource of an `async` method, captures it in a lambda or boxes it. Do the locked work
+in a small synchronous method and call that. Disposing a *copy* of a guard after the original, or
+releasing the guards in another order than last-taken-first-released, throws
+`SynchronizationLockException`: the lock state is left untouched and the guard stays valid, so it can
+still be released properly. Disposing the instance while one of its guards is open on the calling thread
+releases that lock.
+
+### Schema versions
+
+`StructuredMemory<TSchema>.OpenExisting(name, schema, compatibility)` accepts a region of another schema
+version according to `SchemaCompatibility`: `Strict` needs the same version, `Forward` also accepts a region
+written by a newer version (it may be larger: the older schema uses its first fields, so a newer version must
+only append fields), `Backward` a region written by an older version, `Full` both. A region is never smaller
+than the schema that opens it. The library does not compare the field layout of two different versions; a schema
+that changes more than appended fields has to say so in `IVersionedSchema.IsCompatibleWith`.
+
+### Storing the field list in the region
+
+A region holds the field values and a hash of the schema, so every process that opens it needs the schema in
+its code. The process that creates a region can also store the list of fields (name, type, size and offset of
+each) behind the field data. A process that does not have the schema opens the region by that list:
+
+```csharp
+// The creator
+using var memory = StructuredMemory<SensorSchema>.CreateOrOpen(
+    "sensor.state",
+    new SensorSchema(),
+    new StructuredMemoryOptions { StoreSchemaDescriptor = true });
+
+Console.WriteLine(memory.HasStoredDescriptor);   // true: this process created the region
+```
+
+```csharp
+// Any other process, without SensorSchema
+using var stored = StructuredMemory.OpenStored("sensor.state");
+
+foreach (StoredField field in stored.Schema.Fields)
+    Console.WriteLine($"{field.Name}: {field.TypeCode} x{field.ArrayLength} at {field.Offset}");
+
+using (stored.AcquireReadLock())
+{
+    int sequence = stored.Read<int>("Sequence");        // the accessors are the ones of the schema version
+    string status = stored.ReadString("Status");
+}
+```
+
+- `StructuredMemory.OpenStored(name)` returns a `StructuredMemory<StoredSchema>`: the fields are in
+  `Schema.Fields` (type code, element size, array length, alignment and offset, and for struct fields the type
+  name and a layout fingerprint), and they are read and written with the ordinary accessors by name, with the type
+  the list gives. It throws `InvalidOperationException` when the region stores no list, and `InvalidDataException`
+  when the stored list is damaged or does not describe the region (its checksum, the version and hash in the
+  schema header and the offsets are checked). `ReadStoredFields()` of any instance returns the same list, or
+  `null` when there is none.
+- The option is off by default. Only the creator can store the list, because the size of an existing region
+  cannot change; for a region that already exists the option does nothing, and `HasStoredDescriptor` says whether
+  the region has one.
+- Processes that have the schema are not affected. Every way of opening a region accepts it, whether the
+  opener asks for the option or not, and the schema hash is the same with and without it. When the schema in the
+  code does not match a region that stores its list, the exception names the fields that differ
+  (`field 'Temperature': stored Double at offset 8, schema Int64 at offset 8`) instead of only saying that the hash
+  differs. The layout of the stored list is described in `SchemaDescriptor.cs`.
+- The region is larger than the fields need (a few hundred bytes for a small schema; names and the struct type
+  names are limited to 1024 UTF-8 bytes and the list to 1 MiB). **The builds from before the stored list (numbered 4.0 and 4.1) refuse such a region** with a
+  "size mismatch" or "Capacity mismatch" error, without touching it. Update every process that uses the region
+  first, then turn the option on, and remove regions that exist from before with `MemoryRegion.Remove`.
+- The list is a check and a diagnostic, not access control: a process that can write the region can change it.
+  A struct field is an opaque block of bytes to a process without the type: the list gives its size, type name and
+  fingerprint, not its members.
+
+## Shared arrays
+
+```csharp
+using var owner = SharedArray<long>.CreateOrOpen("samples", 10_000);
+owner[0] = 42;
+
+using var reader = SharedArray<long>.OpenExisting("samples");
+Console.WriteLine(reader.Length);
+Console.WriteLine(reader[0]);
+```
+
+The array header validates the element type fingerprint and restores its length for openers.
+
+An element that is 1, 2, 4 or 8 bytes wide is read and written with one aligned load or store, so
+another process never sees half of one, and no lock is taken. A range of several elements (`CopyTo`,
+`CopyFrom`, `Fill`) is a plain memory copy; take a lock when it must be a consistent snapshot.
+
+Every other element size (a `Guid`, a `Vector3`, a 64-byte struct, ...) could be read torn while
+another process writes it, so `SharedArray<T>` takes the shared region lock for those types in the
+indexer, `CopyTo`, `CopyFrom` and `Fill` (the whole range of a `Fill` under one lock). That is correct
+but slower per access; for many elements take the lock once yourself.
+
+Use the explicit locks when several elements must be read or changed together. This applies to
+any element type, because two atomic elements can still be seen from different updates:
+
+```csharp
+using (array.AcquireWriteLock())
+{
+    array[0] = x;
+    array[1] = y;      // other processes see both changes or neither
+}
+
+using (reader.AcquireReadLock())
+{
+    long first = reader[0];
+    long second = reader[1];   // a consistent pair
+}
+```
+
+The locks are shared by every process and thread that uses a lock, reentrant for the calling thread
+(the indexer inside a lock does not take it again), and time out with `TimeoutException`. Taking the
+write lock while the thread holds only a read lock throws `InvalidOperationException`. The guards are
+`ref struct`s, like those of `StructuredMemory<TSchema>`: the compiler rejects a guard that is a local or a
+`using` resource of an `async` method (errors CS4012 and CS9104), so do the locked work in a small
+synchronous method and call that. `array.ForceResetLocks()` clears a lock state left
+behind by a crash (see below). Processes still running a version without
+this locking do not take part in it.
+
+## Region format
+
+Every region has a version 3 magic value, format version, and data-structure kind. Opening a
+queue as raw memory, using a different element type, or opening a region of an older format
+(written by the builds numbered 2.x) is rejected without modifying the existing bytes.
+
+Regions of the older format are not migrated. Stop every process that uses one, remove the
+named or file-backed region, and let `CreateOrOpen` create it again.
+
+The format number is not the package version. The builds numbered 3.0.0 to 4.1.0 that came before
+version 0.1.0 write the same format, so this version opens their regions.
+
+Do not run the build numbered 3.0.0 and any later build in processes that share a region on Linux.
+The 3.0.0 build compares the owner's `Process.StartTime`, which differs between observers, so it takes
+the write lock away from every live owner (including one of a later build, whose recorded start tick it
+can never match). Update all processes that use a region together. See [CHANGELOG.md](CHANGELOG.md).
+
+## Disposing while other threads are running
+
+Stop and join every thread that uses an instance before you dispose it. The lock-free members
+(`Read`, `Write`, the typed queues, `SharedArray`) read and write through a raw pointer and do no
+per-call bookkeeping, because tracking calls costs every one of them two interlocked operations
+(roughly 9 times slower for a queue round trip, and about 17 times slower for two threads
+exchanging items). A call that is still running when the memory is unmapped terminates the process
+with an `AccessViolationException`, which cannot be caught.
+
+What the library does to reduce the risk:
+
+- Calls made after `Dispose()` started fail with `ObjectDisposedException`.
+- Threads waiting for a lock are released with `ObjectDisposedException`, and `Dispose()` waits for
+  them before it unmaps anything.
+- `Dispose()` keeps the memory mapped for `MemoryRegion.DisposeGracePeriod` (10 ms by default,
+  process-wide, `TimeSpan.Zero` disables it) so that calls already in flight can finish. This is
+  best effort: a thread that is descheduled for longer than that at exactly the wrong moment still
+  hits unmapped memory.
+
+## Recovering after a crash
+
+Windows named sections disappear when their last handle closes. On Linux a region is a file in
+`/dev/shm` that outlives its users, so a crash can leave state behind:
+
+- A process that dies while holding a **read lock** leaves the shared reader count above zero and
+  every writer times out. Read locks have no owner, so this cannot be detected automatically.
+  `GetLockOwnerInfo().ReaderCount` shows the stale count; once no process is inside a critical
+  section, call `MemoryRegion.ForceResetLocks()` (or the same method on `StructuredMemory<T>` or `SharedArray<T>`).
+- A process that dies **inside** `TryEnqueue` or `TryDequeue` of `ConcurrentQueue<T>` or
+  `ConcurrentMessageQueue`, after it has claimed a slot and before it has published or released it, leaves
+  that slot claimed for good. Consumers then see an empty queue (or, after a full turn of the ring, producers
+  see a full one) although the other slots hold data, and nothing can tell the slot is stale. The window is a
+  few nanoseconds wide, but there is no automatic recovery: stop all users and call
+  `MemoryRegion.Remove(name)`, which discards the queued items. `SingleProducerQueue<T>` and
+  `SingleProducerByteStream` publish with one store and are not affected: a restarted producer or consumer
+  simply carries on.
+- A creator that dies during initialization makes every opener time out. A region with a different
+  capacity or element type than the one you now want is rejected as well. In both cases stop all
+  users and call `MemoryRegion.Remove(name)` (pass the same `MemoryRegionOptions` for file-backed
+  regions); the next `CreateOrOpen` starts from scratch. It works for every data structure because
+  they are all addressed by the same name.
+
+## Build and test
+
+```shell
+dotnet restore InterprocessMemory.sln
+dotnet build InterprocessMemory.sln --configuration Release
+dotnet test InterprocessMemory.sln --configuration Release
+```
+
+The library and its tests target `net8.0` and `net10.0`, so building needs a .NET 10 SDK and running every
+test needs both runtimes (the cross-process tests start a `net8.0` worker). Add `--framework net8.0` or
+`--framework net10.0` to `dotnet test` to run one of them.
+
+The test suite includes real child-process transfer, multi-process typed MPMC delivery,
+cross-process lock exclusion, and orphan-lock recovery.
+
+[GitHub Actions](.github/workflows/ci.yml) builds and tests on Linux and Windows for every pull
+request and every push to `main`. Two groups of tests are kept out of the blocking test step (use
+`--filter` to select or exclude them locally):
+
+- `Category=TimingSensitive`: tests that depend on the core count and thread scheduling, such as the one
+  that races `Dispose` against busy-polling threads in a child process. CI runs them in a separate,
+  non-blocking step and shows a failure as a warning on the run.
+- `Category=LongRunning`: the `[Explicit]` soak tests, which NUnit never runs unless asked to. CI does
+  not run them.
+
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
