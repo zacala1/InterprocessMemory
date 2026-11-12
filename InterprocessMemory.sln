@@ -7,6 +7,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "InterprocessMemory", "Inter
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "InterprocessMemory.Tests", "InterprocessMemory.Tests\InterprocessMemory.Tests.csproj", "{D968837D-A645-409B-95A7-2E2666E39371}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "InterprocessMemory.Benchmarks", "InterprocessMemory.Benchmarks\InterprocessMemory.Benchmarks.csproj", "{B1234567-89AB-CDEF-0123-456789ABCDEF}"
+EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "Tests", "Tests", "{CD2D9702-D72B-4207-AA6A-72D3B44F1B0E}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "InterprocessMemory.TestWorker", "InterprocessMemory.TestWorker\InterprocessMemory.TestWorker.csproj", "{04723574-6E90-42DB-9766-240BE777D00A}"
@@ -45,6 +47,18 @@ Global
 		{D968837D-A645-409B-95A7-2E2666E39371}.Release|x64.Build.0 = Release|Any CPU
 		{D968837D-A645-409B-95A7-2E2666E39371}.Release|x86.ActiveCfg = Release|Any CPU
 		{D968837D-A645-409B-95A7-2E2666E39371}.Release|x86.Build.0 = Release|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Debug|x64.Build.0 = Debug|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Debug|x86.Build.0 = Debug|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Release|x64.ActiveCfg = Release|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Release|x64.Build.0 = Release|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Release|x86.ActiveCfg = Release|Any CPU
+		{B1234567-89AB-CDEF-0123-456789ABCDEF}.Release|x86.Build.0 = Release|Any CPU
 		{04723574-6E90-42DB-9766-240BE777D00A}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{04723574-6E90-42DB-9766-240BE777D00A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{04723574-6E90-42DB-9766-240BE777D00A}.Debug|x64.ActiveCfg = Debug|Any CPU
