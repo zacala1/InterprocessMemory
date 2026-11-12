@@ -1,0 +1,37 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.5.33414.496
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "InterprocessMemory", "InterprocessMemory\InterprocessMemory.csproj", "{49EEAE24-99C6-48F9-8784-4C9196BD1958}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Debug|x64 = Debug|x64
+		Debug|x86 = Debug|x86
+		Release|Any CPU = Release|Any CPU
+		Release|x64 = Release|x64
+		Release|x86 = Release|x86
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Debug|x64.Build.0 = Debug|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Debug|x86.Build.0 = Debug|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Release|Any CPU.Build.0 = Release|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Release|x64.ActiveCfg = Release|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Release|x64.Build.0 = Release|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Release|x86.ActiveCfg = Release|Any CPU
+		{49EEAE24-99C6-48F9-8784-4C9196BD1958}.Release|x86.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {DD0E1614-8CF6-460D-95BD-8E178CA17132}
+	EndGlobalSection
+EndGlobal

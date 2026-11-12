@@ -1,0 +1,225 @@
+using System;
+using System.Buffers;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace InterprocessMemory
+{
+    /// <summary>
+    /// Delegate for memory-region events.
+    /// </summary>
+    public delegate void MemoryRegionEventHandler(object sender, MemoryRegionEventArgs e);
+
+    /// <summary>
+    /// Event arguments containing details about memory-region operations.
+    /// </summary>
+    public class MemoryRegionEventArgs : EventArgs
+    {
+        /// <summary>
+        /// Gets the type of event that occurred
+        /// </summary>
+        public MemoryRegionEventType EventType { get; init; }
+
+        /// <summary>
+        /// Gets the number of bytes affected by the operation
+        /// </summary>
+        public long BytesAffected { get; init; }
+
+        /// <summary>
+        /// Gets the offset in the buffer where the operation occurred
+        /// </summary>
+        public long Offset { get; init; }
+    }
+
+    /// <summary>
+    /// Memory-region event types.
+    /// </summary>
+    public enum MemoryRegionEventType
+    {
+        /// <summary>Data was written to the buffer</summary>
+        DataWritten,
+        /// <summary>Data was read from the buffer</summary>
+        DataRead,
+        /// <summary>A lock was acquired on the buffer</summary>
+        LockAcquired,
+        /// <summary>A lock was released on the buffer</summary>
+        LockReleased,
+        /// <summary>The buffer is full and cannot accept more data</summary>
+        RegionFull,
+        /// <summary>An orphaned lock was detected (owner process died)</summary>
+        OrphanLockDetected
+    }
+
+    /// <summary>
+    /// Lock ownership information for orphan detection
+    /// </summary>
+    public readonly struct LockOwnerInfo
+    {
+        /// <summary>
+        /// Gets the process ID of the lock owner
+        /// </summary>
+        public int ProcessId { get; init; }
+
+        /// <summary>
+        /// Gets the thread ID of the lock owner
+        /// </summary>
+        public long ThreadId { get; init; }
+
+        /// <summary>
+        /// Gets the timestamp when the lock was acquired
+        /// </summary>
+        public long AcquiredTimestamp { get; init; }
+
+        /// <summary>
+        /// Gets whether the write lock is orphaned: its owner process has exited (or its PID was reused
+        /// by another process), or, when <see cref="MemoryRegionOptions.OrphanLockTimeout"/> is enabled,
+        /// it has been held for longer than that limit
+        /// </summary>
+        public bool IsOrphan { get; init; }
+
+        /// <summary>
+        /// Gets the number of read locks currently held across all processes. Read locks are not
+        /// attributed to an owner, so a process that dies while holding one leaves this count
+        /// permanently above zero (writers then time out); see <see cref="MemoryRegion.ForceResetLocks"/>.
+        /// </summary>
+        public int ReaderCount { get; init; }
+    }
+
+    /// <summary>
+    /// Offset-addressable interprocess memory region.
+    /// </summary>
+    public interface IMemoryRegion : IDisposable
+    {
+        /// <summary>
+        /// Gets the name of this shared memory region
+        /// </summary>
+        string Name { get; }
+
+        /// <summary>
+        /// Gets the total capacity in bytes
+        /// </summary>
+        long Capacity { get; }
+
+        /// <summary>
+        /// Gets whether this instance owns the underlying memory (creator vs consumer)
+        /// </summary>
+        bool IsOwner { get; }
+
+        /// <summary>
+        /// Writes data from a span to the buffer at the specified offset.
+        /// Zero-allocation. Spans of at least one vector are copied with vector instructions (see
+        /// <see cref="MemoryRegionOptions.EnableSimd"/>); alignment does not matter.
+        /// <para>
+        /// The copy is <b>not atomic</b>: another process that reads the same bytes while they are written can
+        /// see a mixture of old and new, whatever the length (a two byte copy is two stores). Hold the write
+        /// lock for values that are read concurrently, or use <see cref="SharedArray{T}"/> or
+        /// <see cref="StructuredMemory{TSchema}"/>, which do.
+        /// </para>
+        /// </summary>
+        int Write(ReadOnlySpan<byte> source, long offset);
+
+        /// <summary>
+        /// Reads data from the buffer into a span at the specified offset.
+        /// Zero-allocation. Spans of at least one vector are copied with vector instructions; alignment does
+        /// not matter. Like <see cref="Write"/>, the copy is not atomic with respect to a concurrent writer.
+        /// </summary>
+        int Read(Span<byte> destination, long offset);
+
+        /// <summary>
+        /// Writes data with cancellation support.
+        /// Note: This executes synchronously — memory-mapped I/O is inherently synchronous.
+        /// The async signature exists for API compatibility with async pipelines.
+        /// </summary>
+        ValueTask<int> WriteAsync(ReadOnlyMemory<byte> source, long offset, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Reads data with cancellation support.
+        /// Note: This executes synchronously — memory-mapped I/O is inherently synchronous.
+        /// The async signature exists for API compatibility with async pipelines.
+        /// </summary>
+        ValueTask<int> ReadAsync(Memory<byte> destination, long offset, CancellationToken cancellationToken = default);
+
+        /// <summary>
+        /// Gets a memory view of the buffer region for zero-copy access.
+        /// WARNING: The returned Memory is backed by an unmanaged pointer. The caller must ensure:
+        /// (1) The buffer is not disposed while the Memory is in use.
+        /// (2) Thread safety for concurrent access to the same region.
+        /// </summary>
+        Memory<byte> GetMemory(long offset, int length);
+
+        /// <summary>
+        /// Tries to acquire an exclusive write lock with timeout.
+        /// The wait is released with <see cref="ObjectDisposedException"/> if the region is disposed
+        /// by another thread while waiting.
+        /// </summary>
+        bool TryAcquireWriteLock(TimeSpan timeout);
+
+        /// <summary>
+        /// Releases the write lock. The lock is owned by the acquiring thread of the acquiring
+        /// process, so it must be released on that same thread: do not <c>await</c> between
+        /// acquiring and releasing it.
+        /// </summary>
+        /// <exception cref="SynchronizationLockException">
+        /// The calling thread does not own the write lock, or the lock was taken over (for example by
+        /// orphan-lock recovery) before it was released.
+        /// </exception>
+        void ReleaseWriteLock();
+
+        /// <summary>
+        /// Tries to acquire a shared read lock with timeout.
+        /// The wait is released with <see cref="ObjectDisposedException"/> if the region is disposed
+        /// by another thread while waiting.
+        /// </summary>
+        bool TryAcquireReadLock(TimeSpan timeout);
+
+        /// <summary>
+        /// Releases the read lock. Read locks are counted, not owned: a process that exits while
+        /// holding one leaves the shared count raised, which cannot be detected automatically
+        /// (see <see cref="MemoryRegion.ForceResetLocks"/>).
+        /// </summary>
+        void ReleaseReadLock();
+
+        /// <summary>
+        /// Checks if the current write lock is orphaned: its owner process has exited or its PID was
+        /// reused, or the opt-in <see cref="MemoryRegionOptions.OrphanLockTimeout"/> has elapsed
+        /// </summary>
+        bool IsWriteLockOrphaned();
+
+        /// <summary>
+        /// Forces release of an orphaned write lock. Waiting lock acquisitions perform this
+        /// recovery themselves; call it directly only to clear the lock without waiting for it.
+        /// </summary>
+        /// <returns>True if lock was orphaned and released</returns>
+        bool TryForceReleaseWriteLock();
+
+        /// <summary>
+        /// Gets information about the current lock owner
+        /// </summary>
+        LockOwnerInfo GetLockOwnerInfo();
+
+        /// <summary>
+        /// Calculates checksum for data integrity verification
+        /// </summary>
+        uint CalculateChecksum(long offset, int length);
+
+        /// <summary>
+        /// Verifies data integrity using stored checksum
+        /// </summary>
+        bool VerifyIntegrity();
+
+        /// <summary>
+        /// Updates the stored checksum for a data region.
+        /// </summary>
+        void UpdateChecksum(long offset, int length);
+
+        /// <summary>
+        /// Event raised when data is written
+        /// </summary>
+        event MemoryRegionEventHandler? OnDataWritten;
+
+        /// <summary>
+        /// Event raised when orphan lock is detected
+        /// </summary>
+        event MemoryRegionEventHandler? OnOrphanLockDetected;
+    }
+}

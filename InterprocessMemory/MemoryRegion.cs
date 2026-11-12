@@ -1,0 +1,1982 @@
+using System;
+using System.Buffers;
+using System.Diagnostics;
+using System.IO;
+using System.IO.MemoryMappedFiles;
+using System.Numerics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace InterprocessMemory
+{
+    /// <summary>
+    /// An offset-addressable memory region shared by separate processes.
+    ///
+    /// <para>Cross-platform: on Windows uses named MemoryMappedFile; on Linux uses a file in
+    /// <c>/dev/shm</c> (tmpfs) wrapped by <c>MemoryMappedFile.CreateFromFile</c>. Both paths
+    /// yield the same raw pointer after construction, so the hot path (Read/Write/locks/SIMD)
+    /// is byte-for-byte identical and there is no per-call OS dispatch.</para>
+    ///
+    /// <para><c>Read</c> and <c>Write</c> are lock-free and do not take the region lock; use
+    /// <see cref="TryAcquireWriteLock"/> / <see cref="TryAcquireReadLock"/> when several bytes must be
+    /// observed atomically. The write lock belongs to the acquiring thread and must be released on it.
+    /// A waiter recovers a write lock whose owner process has exited; recovery of read locks left by a
+    /// dead process is manual (<see cref="ForceResetLocks"/>, <see cref="Remove"/>).</para>
+    ///
+    /// <para>Stop and join every thread that uses an instance before disposing it; see
+    /// <see cref="Dispose"/> and <see cref="DisposeGracePeriod"/>.</para>
+    /// </summary>
+    public sealed unsafe class MemoryRegion : IMemoryRegion
+    {
+        private readonly string _name;
+        private long _capacity;
+        // Set by the structured-memory constructor only (see CreateOrOpen with minAcceptedCapacityBytes): an
+        // existing region of any capacity from _minCapacity up is accepted and its declared capacity is
+        // adopted. The caller then checks the exact size itself.
+        private readonly bool _flexibleCapacity;
+        private readonly long _minCapacity;
+        private readonly bool _isOwner;
+        private readonly MemoryRegionOptions _options;
+        private readonly ILogger? _logger;
+        private readonly bool _createOrOpen;
+        private readonly RegionKind _regionKind;
+
+        // Captured from options at construction so the hot path doesn't dereference _options.
+        // readonly + JIT inlining means each Read/Write checks a single field load (often
+        // constant-folded if the JIT proves the value); when false, all Interlocked stats
+        // updates are skipped entirely.
+        private readonly bool _statsEnabled;
+
+        private MemoryMappedFile? _mmf;
+        private MemoryMappedViewAccessor? _accessor;
+        // On Linux, we may also hold a FileStream backing the /dev/shm file. The MMF takes
+        // ownership when leaveOpen=false (default), so we only track it for diagnostic purposes
+        // and to clean up the path on the owner's dispose if no other openers remain.
+        private FileStream? _backingFile;
+        private string? _backingFilePath;
+        // Set true if we freshly created (or were the first to set the size of) the /dev/shm
+        // file on Linux. Lets Cleanup unlink the file when construction fails partway through —
+        // otherwise a half-sized file would persist in tmpfs and corrupt the next open.
+        private bool _createdBackingFile;
+        private bool _initializedSuccessfully;
+        private byte* _basePtr;
+
+        // Performance counters
+        private long _totalReads;
+        private long _totalWrites;
+        private long _totalBytesRead;
+        private long _totalBytesWritten;
+
+        private volatile int _disposed;
+
+        // Threads currently spinning inside TryAcquireWriteLock/TryAcquireReadLock. Those waits can be
+        // unbounded, so they are the one place where another thread can realistically call Dispose()
+        // while the shared header is being touched; Dispose() waits for this count to drain before it
+        // unmaps the view. Read/Write are not tracked: they are short, and two interlocked operations
+        // per call would cost more than they protect.
+        private int _activeWaiters;
+
+        // How often a lock waiter re-probes whether the owning process is still alive.
+        private const long OrphanCheckIntervalMs = 250;
+
+        // OpenExisting (and a creator that lost the race to create the file) can arrive between the creator
+        // making the backing file and its first header write. The file is created empty, sized right after, and
+        // its header is written right after that: a few microseconds apart, so a short wait is enough, and a
+        // file that is still empty after it has no live creator.
+        private const int OpenerWaitMs = 2000;
+
+        // A held write lock with no owner recorded is normal for a few nanoseconds: the owner sets
+        // WriterLockState first and writes its identity right after, and clears the identity before it
+        // clears the state. A process killed in one of those two windows leaves the lock held with nobody
+        // to attribute it to, which the owner checks cannot see. Waiters clear such a lock after it has
+        // looked like this at every probe for this long.
+        private const long OwnerlessLockGraceMs = 2000;
+
+        // Upper bound on how long Dispose() waits for lock waiters to notice the disposed flag.
+        private static readonly TimeSpan s_waiterDrainTimeout = TimeSpan.FromSeconds(5);
+
+        // Ticks. See DisposeGracePeriod.
+        private static long s_disposeGraceTicks = TimeSpan.FromMilliseconds(10).Ticks;
+        private static readonly TimeSpan MaxDisposeGracePeriod = TimeSpan.FromMilliseconds(int.MaxValue);
+
+        /// <summary>
+        /// How long <see cref="Dispose"/> keeps the memory mapped after the region has been marked
+        /// disposed, so that operations on other threads that are already past their disposed check can
+        /// finish before the view is unmapped (default: 10 ms; <see cref="TimeSpan.Zero"/> disables it).
+        /// This is a process-wide setting.
+        /// <para>
+        /// It is a best-effort mitigation, not a guarantee. The lock-free members (<c>Read</c>,
+        /// <c>Write</c>, the typed queues, <c>SharedArray</c>) deliberately do no per-call bookkeeping, so
+        /// <see cref="Dispose"/> cannot know whether another thread is still inside one. A thread that is
+        /// descheduled for longer than this period at exactly that moment would touch unmapped memory,
+        /// which terminates the process with an <see cref="AccessViolationException"/>. The only complete
+        /// protection is to stop and join every thread that uses an instance before disposing it.
+        /// </para>
+        /// </summary>
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// The value is negative or longer than <see cref="int.MaxValue"/> milliseconds (about 24.8 days), which is
+        /// the longest a thread can sleep.
+        /// </exception>
+        public static TimeSpan DisposeGracePeriod
+        {
+            get => TimeSpan.FromTicks(Interlocked.Read(ref s_disposeGraceTicks));
+            set
+            {
+                if (value < TimeSpan.Zero)
+                    throw new ArgumentOutOfRangeException(nameof(value), "DisposeGracePeriod must not be negative.");
+                if (value > MaxDisposeGracePeriod)
+                    throw new ArgumentOutOfRangeException(
+                        nameof(value), "DisposeGracePeriod must not be longer than int.MaxValue milliseconds.");
+
+                Interlocked.Exchange(ref s_disposeGraceTicks, value.Ticks);
+            }
+        }
+
+        // Cached once per process: stamped into the header at lock acquire so an orphan check
+        // can distinguish "same PID, same process" from "same PID, recycled by the OS for an
+        // unrelated process". The start time can be unreadable under restricted permissions
+        // (Linux containers without /proc, certain Windows ACLs) — in that case we store 0 and
+        // the orphan check silently falls back to PID-only matching.
+        //
+        // Windows: Process.StartTime.ToBinary() (the kernel creation time, identical for every observer).
+        // Linux: the kernel start tick count from /proc/<pid>/stat. Process.StartTime must NOT be used
+        // there: every process derives it from its own wall-clock boot-time snapshot, so the value the
+        // owner records and the value another process computes for the same owner differ by
+        // milliseconds and would make every live owner look like an impostor.
+        private static readonly long s_processStartTimeBinary = TryCaptureProcessStartTime();
+
+        private static readonly long s_pidNamespace = TryReadLinuxPidNamespace();
+
+        /// <summary>Identifier of this process's PID namespace, 0 when it cannot be determined (not Linux).</summary>
+        internal static long CurrentPidNamespace => s_pidNamespace;
+
+        // /proc/self/ns/pid is a symlink whose target looks like "pid:[4026531836]".
+        private static long TryReadLinuxPidNamespace()
+        {
+            if (!OperatingSystem.IsLinux())
+                return 0;
+
+            try
+            {
+                string? target = new FileInfo("/proc/self/ns/pid").LinkTarget;
+                int open = target?.IndexOf('[') ?? -1;
+                int close = target?.IndexOf(']') ?? -1;
+                if (target != null && open >= 0 && close > open &&
+                    long.TryParse(target.AsSpan(open + 1, close - open - 1), out long id))
+                    return id;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException)
+            {
+                // No /proc, or a restricted one: leave it unknown and keep the pid-only behaviour.
+            }
+
+            return 0;
+        }
+
+        private static bool IsOtherPidNamespace(long ownerNamespace) =>
+            ownerNamespace != 0 && s_pidNamespace != 0 && ownerNamespace != s_pidNamespace;
+
+        private static long TryCaptureProcessStartTime()
+        {
+            if (OperatingSystem.IsLinux())
+                return TryReadLinuxStartTicks(Environment.ProcessId);
+
+            try
+            {
+                using var p = Process.GetCurrentProcess();
+                return p.StartTime.ToBinary();
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// Reads field 22 (starttime, clock ticks since boot) of <c>/proc/&lt;pid&gt;/stat</c>.
+        /// Returns 0 when it cannot be read.
+        /// </summary>
+        private static long TryReadLinuxStartTicks(int pid)
+        {
+            try
+            {
+                string stat = File.ReadAllText("/proc/" + pid + "/stat");
+
+                // The command name (field 2) is parenthesised and may itself contain spaces or
+                // parentheses, so split only what follows the LAST ')'. The first token after it
+                // is field 3, which makes field 22 index 19.
+                int commEnd = stat.LastIndexOf(')');
+                if (commEnd < 0)
+                    return 0;
+
+                string[] fields = stat.Substring(commEnd + 2).Split(' ');
+                return fields.Length > 19 && long.TryParse(fields[19], out long ticks) ? ticks : 0;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        /// <summary>
+        /// True when <c>/proc/&lt;pid&gt;/stat</c> reports the process as a zombie (<c>Z</c>) or dead (<c>X</c>).
+        /// </summary>
+        private static bool IsLinuxZombie(int pid)
+        {
+            try
+            {
+                string stat = File.ReadAllText("/proc/" + pid + "/stat");
+
+                // The state is the first field after the parenthesised command name (see TryReadLinuxStartTicks).
+                int commEnd = stat.LastIndexOf(')');
+                return commEnd >= 0 && commEnd + 2 < stat.Length && stat[commEnd + 2] is 'Z' or 'X';
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// True when the process currently using <paramref name="ownerPid"/> is provably not the one
+        /// that recorded <paramref name="storedStartTime"/> (PID reuse).
+        /// </summary>
+        private static bool IsOwnerStartTimeMismatch(Process process, int ownerPid, long storedStartTime)
+        {
+            if (OperatingSystem.IsLinux())
+            {
+                // 3.0.0 recorded Process.StartTime.ToBinary() here, which is negative for a local
+                // DateTime and not comparable across processes. Tick counts are positive. Treat the
+                // legacy format as "unknown" and keep the PID-only decision.
+                if (storedStartTime < 0)
+                    return false;
+
+                long currentTicks = TryReadLinuxStartTicks(ownerPid);
+                return currentTicks != 0 && currentTicks != storedStartTime;
+            }
+
+            return process.StartTime.ToBinary() != storedStartTime;
+        }
+
+        /// <summary>
+        /// Extended header structure with orphan lock detection support.
+        /// WriterLockState and ReaderCount are placed in separate 64-byte cache lines
+        /// to prevent false sharing when multiple processes or threads contend concurrently.
+        /// </summary>
+        [StructLayout(LayoutKind.Explicit, Size = 128)]
+        internal struct SharedHeader
+        {
+            public const uint MagicNumber = 0x524D5049; // "IPMR"
+            // Intermediate value written by the winner of the init CAS before it has finished writing
+            // the rest of the header. Losers spin-wait until they see MagicNumber (not this value)
+            // before reading Capacity etc., preventing a torn read of half-initialized state.
+            public const uint MagicInitializing = 0x494D5049; // "IPMI"
+            public const uint FormatVersion = 3;
+            public const int Size = 128;
+
+            // Cache line 0 (offsets 0–63): writer-side fields
+            [FieldOffset(0)] public uint Magic;
+            [FieldOffset(4)] public uint Version;
+            [FieldOffset(8)] public long Capacity;
+            [FieldOffset(16)] public long CreationTimestamp;
+            [FieldOffset(24)] public int WriterLockState;       // 0 = free, 1 = locked (Interlocked/Volatile)
+            [FieldOffset(28)] public int LockOwnerProcessId;
+            [FieldOffset(32)] public long LockOwnerThreadId;
+            [FieldOffset(40)] public long LockAcquiredTimestamp;
+            // PID reuse defense: if a lock-holding process dies and the OS recycles its PID for an
+            // unrelated process, GetProcessById would find the new process alive and skip orphan
+            // recovery — leaving the lock permanently held. The owner records its process start time
+            // at acquire and the orphan check compares it, which exposes the impostor. The encoding is
+            // platform specific (see s_processStartTimeBinary): Windows stores Process.StartTime.ToBinary(),
+            // Linux stores the /proc/<pid>/stat start tick count. Value 0 means "not recorded" (the start
+            // time was unreadable, e.g. no /proc or an ACL denial); a negative value is the 3.0.0 Linux
+            // encoding, which cannot be compared across processes. In both cases the orphan check
+            // falls back to PID-only matching.
+            [FieldOffset(48)] public long LockOwnerProcessStartTime;
+            // bytes 56–63: implicit padding
+
+            // Cache line 1 (offsets 64–127): reader-side fields and checksum metadata
+            [FieldOffset(64)] public int ReaderCount;           // accessed via Interlocked/Volatile
+            [FieldOffset(68)] public uint DataChecksum;
+            [FieldOffset(72)] public long ChecksumOffset;
+            [FieldOffset(80)] public int ChecksumLength;
+            [FieldOffset(84)] public int RegionKind;
+            // PID namespace (inode of /proc/self/ns/pid) of the process that holds the write lock, 0 when
+            // unknown. A pid only identifies a process inside its own namespace, so waiters in another
+            // namespace (two containers sharing /dev/shm) must not use LockOwnerProcessId to decide that
+            // the owner is gone. It is written before the pid and cleared with the other owner fields.
+            [FieldOffset(88)] public long LockOwnerPidNamespace;
+            // bytes 96–127: reserved
+        }
+
+        private const long HeaderSize = SharedHeader.Size;
+
+        /// <inheritdoc/>
+        public string Name => _name;
+
+        /// <inheritdoc/>
+        public long Capacity => _capacity;
+
+        /// <inheritdoc/>
+        public bool IsOwner => _isOwner;
+
+        /// <inheritdoc/>
+        public event MemoryRegionEventHandler? OnDataWritten;
+
+        /// <inheritdoc/>
+        public event MemoryRegionEventHandler? OnOrphanLockDetected;
+
+        /// <summary>
+        /// Gets performance statistics for the buffer
+        /// </summary>
+        /// <returns>Tuple containing read/write counts and bytes transferred</returns>
+        public (long Reads, long Writes, long BytesRead, long BytesWritten) GetStatistics() =>
+            (Volatile.Read(ref _totalReads), Volatile.Read(ref _totalWrites),
+             Volatile.Read(ref _totalBytesRead), Volatile.Read(ref _totalBytesWritten));
+
+        /// <summary>
+        /// Creates or opens a raw interprocess memory region.
+        /// </summary>
+        public static MemoryRegion CreateOrOpen(
+            string name,
+            long capacityBytes,
+            MemoryRegionOptions? options = null) =>
+            new(name, capacityBytes, options, createOrOpen: true, RegionKind.RawMemory);
+
+        /// <summary>
+        /// Opens an existing raw interprocess memory region and discovers its capacity from its header.
+        /// </summary>
+        public static MemoryRegion OpenExisting(
+            string name,
+            MemoryRegionOptions? options = null) =>
+            new(name, capacityBytes: null, options, createOrOpen: false, RegionKind.RawMemory);
+
+        internal static MemoryRegion CreateOrOpen(
+            string name,
+            long capacityBytes,
+            MemoryRegionOptions? options,
+            RegionKind regionKind) =>
+            new(name, capacityBytes, options, createOrOpen: true, regionKind);
+
+        /// <summary>
+        /// Like <see cref="CreateOrOpen(string, long, MemoryRegionOptions?, RegionKind)"/>, but an existing region
+        /// is accepted when it declares at least <paramref name="minAcceptedCapacityBytes"/> bytes; the region
+        /// then reports the capacity it declares. A new region is created with <paramref name="capacityBytes"/>.
+        /// The caller has to validate the capacity it adopted.
+        /// </summary>
+        internal static MemoryRegion CreateOrOpen(
+            string name,
+            long capacityBytes,
+            long minAcceptedCapacityBytes,
+            MemoryRegionOptions? options,
+            RegionKind regionKind)
+        {
+            if (minAcceptedCapacityBytes <= 0 || minAcceptedCapacityBytes > capacityBytes)
+                throw new ArgumentOutOfRangeException(
+                    nameof(minAcceptedCapacityBytes), "The minimum capacity must be positive and at most the capacity");
+            return new(name, capacityBytes, options, createOrOpen: true, regionKind, minAcceptedCapacityBytes);
+        }
+
+        internal static MemoryRegion OpenExisting(
+            string name,
+            MemoryRegionOptions? options,
+            RegionKind regionKind) =>
+            new(name, capacityBytes: null, options, createOrOpen: false, regionKind);
+
+        /// <summary>
+        /// Deletes the backing storage of a named region so that the next
+        /// <see cref="CreateOrOpen(string, long, MemoryRegionOptions?)"/> starts from scratch.
+        /// Use it to get rid of a region that a crash left unusable, for example one whose creator died
+        /// during initialization, or to change the capacity or element type of an existing region.
+        /// <para>
+        /// Linux keeps the region as a file in <c>/dev/shm</c> that outlives its users, so it has to be
+        /// removed explicitly. Windows named sections are reference counted by the kernel and vanish when
+        /// the last handle closes; for them (without <see cref="MemoryRegionOptions.FilePath"/>) this
+        /// returns <c>false</c>.
+        /// </para>
+        /// <para>
+        /// Stop every process that uses the region first. Processes that still have it mapped keep
+        /// working on the removed storage, while later openers get a new, independent region.
+        /// This applies to every region kind (typed queues, arrays, structured memory), all of which are
+        /// addressed by the same name.
+        /// </para>
+        /// </summary>
+        /// <param name="name">The region name that was passed to <c>CreateOrOpen</c>.</param>
+        /// <param name="options">
+        /// Pass the same options (in particular <see cref="MemoryRegionOptions.FilePath"/>) that the region
+        /// was created with when it is file backed.
+        /// </param>
+        /// <returns><c>true</c> when backing storage was deleted; <c>false</c> when there was nothing to delete.</returns>
+        public static bool Remove(string name, MemoryRegionOptions? options = null)
+        {
+            ValidateFlatName(name);
+
+            string? path = options?.FilePath;
+            if (string.IsNullOrEmpty(path))
+            {
+                if (OperatingSystem.IsWindows())
+                    return false;
+
+                if (!OperatingSystem.IsLinux())
+                    throw new PlatformNotSupportedException(
+                        "MemoryRegion requires Windows or Linux unless MemoryRegionOptions.FilePath is used.");
+
+                path = "/dev/shm/" + FileNameOf(name);
+            }
+
+            if (!File.Exists(path))
+                return false;
+
+            File.Delete(path);
+            return true;
+        }
+
+        internal MemoryRegion(string name, MemoryRegionOptions? options = null)
+            : this(
+                name,
+                (options ?? new MemoryRegionOptions()).CreateOrOpen
+                    ? (options ?? new MemoryRegionOptions()).Capacity
+                    : null,
+                options,
+                (options ?? new MemoryRegionOptions()).CreateOrOpen,
+                RegionKind.RawMemory)
+        {
+        }
+
+        private MemoryRegion(
+            string name,
+            long? capacityBytes,
+            MemoryRegionOptions? options,
+            bool createOrOpen,
+            RegionKind regionKind,
+            long? minAcceptedCapacityBytes = null)
+        {
+            _name = ValidateFlatName(name);
+            if (capacityBytes is <= 0)
+                throw new ArgumentOutOfRangeException(nameof(capacityBytes), "Capacity must be positive");
+            if (capacityBytes > int.MaxValue && !Environment.Is64BitProcess)
+                throw new ArgumentOutOfRangeException(nameof(capacityBytes), "Cannot allocate more than 2 GB in a 32-bit process");
+
+            _options = options ?? new MemoryRegionOptions();
+            _options.Validate();
+            _logger = _options.Logger;
+            _statsEnabled = _options.EnableStatistics;
+            _createOrOpen = createOrOpen;
+            _regionKind = regionKind;
+
+            _capacity = capacityBytes ?? 0;
+            _flexibleCapacity = createOrOpen && minAcceptedCapacityBytes.HasValue;
+            _minCapacity = minAcceptedCapacityBytes ?? _capacity;
+
+            _logger?.LogDebug("Creating shared buffer '{Name}' with capacity {Capacity}", name, _capacity);
+
+            Initialize();
+            try
+            {
+                // InitializeOrOpen can throw (capacity mismatch, invalid magic, init timeout).
+                // Initialize() has its own try/catch+Cleanup, but once it returns successfully
+                // the MMF/accessor/pointer (and on Linux, the /dev/shm file) are live and would
+                // leak until finalization if we let the constructor throw uncaught. Mirror the
+                // Initialize() catch here so the failure mode is deterministic.
+                _isOwner = InitializeOrOpen();
+                _initializedSuccessfully = true;
+                if (!_isOwner)
+                    _createdBackingFile = false;
+            }
+            catch
+            {
+                Cleanup();
+                throw;
+            }
+
+            _logger?.LogInformation("Shared buffer '{Name}' initialized. IsOwner: {IsOwner}", name, _isOwner);
+        }
+
+        private void Initialize()
+        {
+            long totalSize = _createOrOpen ? checked(HeaderSize + _capacity) : 0;
+
+            try
+            {
+                // Pick the backing primitive once at construction. Each branch sets _mmf (and
+                // on Linux, _backingFilePath/_createdBackingFile). The accessor + pointer
+                // acquisition is identical across platforms and lives below the dispatch.
+                if (!string.IsNullOrEmpty(_options.FilePath))
+                    CreateMmfFromExplicitFilePath(totalSize);
+                else if (OperatingSystem.IsWindows())
+                    CreateMmfFromWindowsNamedRegion(totalSize);
+                else if (OperatingSystem.IsLinux())
+                    CreateMmfFromLinuxDevShm(totalSize);
+                else
+                    throw new PlatformNotSupportedException(
+                        "MemoryRegion requires Windows or Linux. " +
+                        "macOS/other POSIX is not currently supported in the anonymous-named mode; " +
+                        "set MemoryRegionOptions.FilePath to use file-backed mode instead.");
+
+                // A flexible region maps whatever the section holds: an existing one may be larger than totalSize.
+                _accessor = _mmf!.CreateViewAccessor(
+                    0,
+                    _createOrOpen && !_flexibleCapacity ? totalSize : 0,
+                    MemoryMappedFileAccess.ReadWrite);
+                _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _basePtr);
+
+                if (_basePtr == null)
+                    throw new InvalidOperationException("Failed to acquire pointer to shared memory");
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogError(ex, "Failed to initialize shared buffer '{Name}'", _name);
+                Cleanup();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Explicit on-disk file backing. Cross-platform: Windows uses the kernel-namespace
+        /// alias <c>mapName</c> for shared-by-name access; Linux ignores it (mmap binds to the
+        /// inode), so we pass null there.
+        /// </summary>
+        private void CreateMmfFromExplicitFilePath(long totalSize)
+        {
+            string fullPath = Path.GetFullPath(_options.FilePath!);
+            string? mapName = OperatingSystem.IsWindows() ? _name : null;
+
+            // The file is opened here, with sharing, instead of by MemoryMappedFile.CreateFromFile(path, ...):
+            // that overload grows an existing file to the requested capacity before anything has checked that
+            // it is the region the caller meant, which left a file of the wrong size permanently resized, and
+            // it does not share the file with a second process on Windows.
+            var fileOptions = new FileStreamOptions
+            {
+                Mode = _createOrOpen ? FileMode.OpenOrCreate : FileMode.Open,
+                Access = FileAccess.ReadWrite,
+                Share = FileShare.ReadWrite
+            };
+            if (_createOrOpen)
+                ApplyCreateMode(fileOptions);
+            var file = new FileStream(fullPath, fileOptions);
+            try
+            {
+                if (_createOrOpen)
+                {
+                    long length = file.Length;
+                    if (length == 0)
+                    {
+                        EnsureFreeSpace(Path.GetDirectoryName(fullPath) ?? fullPath, totalSize, _name);
+                        file.SetLength(totalSize);
+                    }
+                    else if (!ExistingSizeIsAcceptable(length, totalSize))
+                    {
+                        ThrowForExistingFileOfAnotherSize(file, fullPath, length, totalSize);
+                    }
+                }
+
+                _mmf = MemoryMappedFile.CreateFromFile(
+                    file,
+                    mapName,
+                    _createOrOpen && !_flexibleCapacity ? totalSize : 0,
+                    MemoryMappedFileAccess.ReadWrite,
+                    HandleInheritability.None,
+                    leaveOpen: false);          // the MMF takes ownership of the FileStream
+            }
+            catch
+            {
+                file.Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// An existing file of another size is not this region. A file that clearly is not a version 3 region
+        /// (an older format, or something else entirely) is reported as that, as opening it without a
+        /// requested capacity does; otherwise it is a region with another capacity. The file is not modified.
+        /// </summary>
+        private void ThrowForExistingFileOfAnotherSize(FileStream file, string path, long actualLength, long totalSize)
+        {
+            if (actualLength >= sizeof(uint))
+            {
+                Span<byte> magic = stackalloc byte[sizeof(uint)];
+                file.Position = 0;
+                if (file.Read(magic) == magic.Length)
+                {
+                    uint observed = BitConverter.ToUInt32(magic);
+                    if (observed != 0 &&
+                        observed != SharedHeader.MagicNumber &&
+                        observed != SharedHeader.MagicInitializing)
+                        ThrowForUnexpectedMagic(observed);
+                }
+            }
+
+            throw new InvalidOperationException(
+                $"Existing shared memory '{path}' has size {actualLength} but {totalSize} was requested. " +
+                "Either match the existing size or remove the file.");
+        }
+
+        /// <summary>
+        /// Windows named global shared memory — the kernel manages the namespace and reclaims
+        /// the section when the last handle closes, so we don't need to track any backing file.
+        /// </summary>
+        /// <remarks>
+        /// Attributed Windows-only because the underlying API is Windows-only. The caller in
+        /// <see cref="Initialize"/> already gates on <see cref="OperatingSystem.IsWindows"/>;
+        /// this attribute just tells CA1416 not to flag the call site.
+        /// </remarks>
+        [SupportedOSPlatform("windows")]
+        private void CreateMmfFromWindowsNamedRegion(long totalSize)
+        {
+            _mmf = _createOrOpen
+                ? MemoryMappedFile.CreateOrOpen(
+                    _name,
+                    totalSize,
+                    MemoryMappedFileAccess.ReadWrite,
+                    MemoryMappedFileOptions.None,
+                    HandleInheritability.None)
+                : MemoryMappedFile.OpenExisting(
+                    _name,
+                    MemoryMappedFileRights.ReadWrite,
+                    HandleInheritability.None);
+        }
+
+        /// <summary>
+        /// Linux: emulate Windows named MMF via a file under /dev/shm (tmpfs). POSIX shm_open(3)
+        /// internally creates the file in this same tmpfs, so the resulting mapping is
+        /// functionally and performance-wise identical, while letting us reuse the cross-platform
+        /// <see cref="MemoryMappedFile.CreateFromFile(FileStream, string?, long, MemoryMappedFileAccess, HandleInheritability, bool)"/>
+        /// API (no P/Invoke, no glibc version assumptions, no arch-specific O_ flag values).
+        /// </summary>
+        private void CreateMmfFromLinuxDevShm(long totalSize)
+        {
+            _backingFilePath = "/dev/shm/" + FileNameOf(_name);
+
+            // FileMode.CreateNew lets the kernel decide who creates the file. Two processes that both saw an
+            // empty file used to take the creator's role, and the one that then failed (another capacity,
+            // another region kind) deleted the file the other was already using, which split one name into
+            // two independent regions. Only the process that created the file may size it, and only it
+            // unlinks the file when construction fails.
+            for (int attempt = 0; _backingFile == null; attempt++)
+            {
+                if (_createOrOpen)
+                {
+                    try
+                    {
+                        _backingFile = new FileStream(_backingFilePath, CreateNewFileOptions());
+                        _createdBackingFile = true;
+                        break;
+                    }
+                    catch (IOException) when (File.Exists(_backingFilePath))
+                    {
+                        // Somebody else created it first: open it below.
+                    }
+                }
+
+                try
+                {
+                    _backingFile = new FileStream(_backingFilePath,
+                        FileMode.Open, FileAccess.ReadWrite, FileShare.ReadWrite);
+                }
+                catch (FileNotFoundException) when (_createOrOpen && attempt < 3)
+                {
+                    // Removed between the two attempts: try to create it again.
+                }
+            }
+
+            if (_createdBackingFile)
+            {
+                // SetLength only reserves address space in tmpfs. If the filesystem cannot hold the region,
+                // the first write past what fits kills the process with SIGBUS, which cannot be caught.
+                EnsureFreeSpace("/dev/shm", totalSize, _name);
+                _backingFile.SetLength(totalSize);
+            }
+            else
+            {
+                // The creator makes the file empty and sizes it a moment later; wait for that.
+                WaitForLength(_backingFile, OpenerWaitMs);
+
+                long actualLen = _backingFile.Length;
+                if (actualLen == 0)
+                {
+                    _backingFile.Dispose();
+                    _backingFile = null;
+                    throw new InvalidDataException(
+                        $"Existing shared memory '{_backingFilePath}' is empty and has not been initialized. " +
+                        "If its creator crashed, stop every user of the region and call MemoryRegion.Remove(name).");
+                }
+
+                if (_createOrOpen && !ExistingSizeIsAcceptable(actualLen, totalSize))
+                {
+                    // Mirror the Windows behavior where capacity mismatch on open throws.
+                    _backingFile.Dispose();
+                    _backingFile = null;
+                    throw new InvalidOperationException(
+                        $"Existing shared memory '{_backingFilePath}' has size {actualLen} but {totalSize} was requested. " +
+                        $"Either match the existing size or remove the file.");
+                }
+            }
+
+            _mmf = MemoryMappedFile.CreateFromFile(
+                _backingFile,
+                mapName: null,                  // Linux ignores/rejects non-null mapName
+                _createOrOpen && !_flexibleCapacity ? totalSize : 0,
+                MemoryMappedFileAccess.ReadWrite,
+                HandleInheritability.None,
+                leaveOpen: false);              // MMF takes ownership of the FileStream
+            _backingFile = null;                // ownership transferred — don't double-dispose
+        }
+
+        /// <summary>
+        /// Whether an existing backing file of <paramref name="actualLength"/> bytes may be opened by a caller that
+        /// asked for <paramref name="totalSize"/> bytes: the same size, or, for a flexible region, at least the
+        /// minimum.
+        /// </summary>
+        private bool ExistingSizeIsAcceptable(long actualLength, long totalSize) =>
+            _flexibleCapacity
+                ? actualLength >= checked(HeaderSize + _minCapacity)
+                : actualLength == totalSize;
+
+        private FileStreamOptions CreateNewFileOptions()
+        {
+            var options = new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.ReadWrite,
+                Share = FileShare.ReadWrite
+            };
+            ApplyCreateMode(options);
+            return options;
+        }
+
+        /// <summary>
+        /// Gives a file that is about to be created the permissions asked for in
+        /// <see cref="MemoryRegionOptions.UnixCreateMode"/>; without a request it keeps the platform default
+        /// (0666 less the umask, so usually 0644). The property is only touched when there is something to
+        /// set: on Windows its setter throws <see cref="PlatformNotSupportedException"/> even for null.
+        /// </summary>
+        private void ApplyCreateMode(FileStreamOptions options)
+        {
+            if (!OperatingSystem.IsWindows() && _options.UnixCreateMode.HasValue)
+                options.UnixCreateMode = _options.UnixCreateMode;
+        }
+
+        private static void WaitForLength(FileStream file, int timeoutMs)
+        {
+            var sw = Stopwatch.StartNew();
+            while (file.Length == 0 && sw.ElapsedMilliseconds < timeoutMs)
+                Thread.Sleep(1);
+        }
+
+        /// <summary>
+        /// Throws the exception for a header whose magic number is neither the version 3 one nor the marker of a
+        /// header that is still being written.
+        /// </summary>
+        private void ThrowForUnexpectedMagic(uint observed)
+        {
+            if (observed == 0x48504D53)
+            {
+                throw new InvalidDataException(
+                    $"Memory region '{_name}' uses the 2.x format. Stop all 2.x processes, " +
+                    "remove the old region, and recreate it with InterprocessMemory 3.0.");
+            }
+
+            throw new InvalidDataException(
+                $"Memory region '{_name}' has an invalid version 3 header (magic=0x{observed:X8}).");
+        }
+
+        /// <summary>
+        /// Throws <see cref="IOException"/> when the filesystem that will hold a new region has fewer than
+        /// <paramref name="requiredBytes"/> bytes available. Best effort: a filesystem that cannot report
+        /// its free space is not blocked, and another process can still fill it between this check and the
+        /// first write.
+        /// </summary>
+        internal static void EnsureFreeSpace(string directory, long requiredBytes, string regionName)
+        {
+            long free;
+            try
+            {
+                free = new DriveInfo(directory).AvailableFreeSpace;
+            }
+            catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException
+                                           or NotSupportedException)
+            {
+                return;
+            }
+
+            if (free < requiredBytes)
+                throw new IOException(
+                    $"Not enough space for shared memory '{regionName}': it needs {requiredBytes} bytes but " +
+                    $"'{directory}' has {free} available. In a container, raise the limit of /dev/shm " +
+                    "(docker run --shm-size, or a larger memory-backed emptyDir in Kubernetes).");
+        }
+
+        private const string GlobalPrefix = "Global\\";
+        private const string LocalPrefix = "Local\\";
+
+        /// <summary>
+        /// The length of the Windows kernel namespace prefix (<c>Global\</c> or <c>Local\</c>, in any case) at the
+        /// start of <paramref name="name"/>, or 0 when there is none.
+        /// </summary>
+        private static int NamespacePrefixLength(string name) =>
+            name.StartsWith(GlobalPrefix, StringComparison.OrdinalIgnoreCase) ? GlobalPrefix.Length
+            : name.StartsWith(LocalPrefix, StringComparison.OrdinalIgnoreCase) ? LocalPrefix.Length
+            : 0;
+
+        /// <summary>
+        /// The name of the backing file of a region on Linux: the name without its namespace prefix. Linux has
+        /// no sessions, so <c>Global\x</c>, <c>Local\x</c> and <c>x</c> are one region there.
+        /// </summary>
+        private static string FileNameOf(string name) => name.Substring(NamespacePrefixLength(name));
+
+        /// <summary>
+        /// Validates the cross-platform flat identifier used for the named region. A name may start with
+        /// <c>Global\</c> or <c>Local\</c>, which Windows reads as the namespace of the kernel object (all sessions
+        /// or the session of the process); what follows must be flat.
+        /// </summary>
+        private static string ValidateFlatName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name))
+                throw new ArgumentException("Name cannot be empty.", nameof(name));
+
+            string flat = FileNameOf(name);
+            if (string.IsNullOrWhiteSpace(flat))
+                throw new ArgumentException(
+                    $"Name '{name}' has nothing after its namespace prefix.", nameof(name));
+
+            if (flat.Contains('/') || flat.Contains('\\') || flat == "." || flat == "..")
+                throw new ArgumentException(
+                    $"Name '{name}' contains path separators or traversal fragments; " +
+                    $"use a flat identifier for cross-platform compatibility (a leading Global\\ or Local\\ is allowed).",
+                    nameof(name));
+
+            if (name.Contains('\0'))
+                throw new ArgumentException(
+                    $"Name '{name}' contains a NUL character.",
+                    nameof(name));
+
+            foreach (char c in name)
+            {
+                if (char.IsControl(c))
+                    throw new ArgumentException(
+                        $"Name '{name}' contains a control character (U+{(int)c:X4}); use printable ASCII.",
+                        nameof(name));
+            }
+
+            const int NameMax = 255;
+            int utf8Len = System.Text.Encoding.UTF8.GetByteCount(name);
+            if (utf8Len > NameMax)
+                throw new ArgumentException(
+                    $"Name '{name}' is {utf8Len} bytes in UTF-8; the maximum is {NameMax}.",
+                    nameof(name));
+
+            return name;
+        }
+
+        private bool InitializeOrOpen()
+        {
+            var header = (SharedHeader*)_basePtr;
+
+            // Two-phase init to make cross-process concurrent open race-safe:
+            //   Phase 1: CAS Magic 0 → Initializing. Winner gets exclusive init rights.
+            //   Phase 2: Winner writes all header fields, then promotes Magic to MagicNumber
+            //            via a release-store. Losers spin until they observe MagicNumber and
+            //            only then read the rest of the header, guaranteeing they never see
+            //            partially-initialized state (e.g. Magic=MagicNumber but Capacity=0,
+            //            which would falsely report a capacity mismatch).
+            //
+            // A flexible region (see CreateOrOpen with a minimum capacity) accepts a mapping of another size than the
+            // one it asked for. Only a process whose request fits the mapping may initialize it: the capacity it
+            // writes into the header must be the capacity of the mapping, or the creator of the mapping, which asked
+            // for a different size, and every later opener would disagree with the header, and this process could
+            // write past the end of the mapping. Any other process waits for the process that created the mapping.
+            bool mayInitialize = _createOrOpen && (!_flexibleCapacity || MappingIsValidFor(_capacity));
+
+            uint prev = mayInitialize
+                ? Interlocked.CompareExchange(ref header->Magic, SharedHeader.MagicInitializing, 0)
+                : Volatile.Read(ref header->Magic);
+
+            if (mayInitialize && prev == 0)
+            {
+                header->Version = SharedHeader.FormatVersion;
+                header->Capacity = _capacity;
+                header->CreationTimestamp = Stopwatch.GetTimestamp();
+                header->WriterLockState = 0;
+                header->ReaderCount = 0;
+                header->LockOwnerProcessId = 0;
+                header->LockOwnerThreadId = 0;
+                header->LockOwnerProcessStartTime = 0;
+                header->LockOwnerPidNamespace = 0;
+                header->LockAcquiredTimestamp = 0;
+                header->DataChecksum = 0;
+                header->ChecksumOffset = 0;
+                header->ChecksumLength = 0;
+                header->RegionKind = (int)_regionKind;
+
+                Thread.MemoryBarrier();
+
+                // Release-store: makes all prior header writes visible before any reader sees MagicNumber.
+                Volatile.Write(ref header->Magic, SharedHeader.MagicNumber);
+                return true;
+            }
+
+            // Loser path: wait for winner to publish the final magic value. Bounded spin —
+            // initialization is normally microseconds, so even a generous timeout is fine.
+            var sw = Stopwatch.StartNew();
+            uint observed;
+            while (true)
+            {
+                observed = Volatile.Read(ref header->Magic);
+                if (observed == SharedHeader.MagicNumber)
+                    break;
+                if (observed != SharedHeader.MagicInitializing)
+                {
+                    // OpenExisting can arrive after the creator made the file but before its first header
+                    // write. That is not a corrupt header: wait for the creator.
+                    if (observed == 0 && !mayInitialize && sw.ElapsedMilliseconds < OpenerWaitMs)
+                    {
+                        Thread.Sleep(1);
+                        continue;
+                    }
+
+                    ThrowForUnexpectedMagic(observed);
+                }
+                if (sw.Elapsed > TimeSpan.FromSeconds(5))
+                    throw new TimeoutException(
+                        "Timed out waiting for shared memory to be initialized by another process. " +
+                        "If that process crashed during initialization, stop every user of the region " +
+                        "and call MemoryRegion.Remove(name).");
+                Thread.SpinWait(100);
+            }
+
+            if (header->Version != SharedHeader.FormatVersion)
+                throw new InvalidDataException(
+                    $"Memory region '{_name}' uses format version {header->Version}; version 3 is required. " +
+                    "Stop all 2.x processes, remove the old region, and recreate it.");
+
+            if (header->RegionKind != (int)_regionKind)
+                throw new InvalidDataException(
+                    $"Memory region '{_name}' contains region kind {(RegionKind)header->RegionKind}, " +
+                    $"not the requested {_regionKind}.");
+
+            long declaredCapacity = header->Capacity;
+            if (declaredCapacity <= 0)
+                throw new InvalidDataException(
+                    $"Memory region '{_name}' declares invalid capacity {declaredCapacity}.");
+
+            try
+            {
+                _ = checked(HeaderSize + declaredCapacity);
+            }
+            catch (OverflowException ex)
+            {
+                throw new InvalidDataException(
+                    $"Memory region '{_name}' declares a capacity that exceeds the supported range.",
+                    ex);
+            }
+
+            if (!MappingIsValidFor(declaredCapacity))
+                throw new InvalidDataException(
+                    $"Memory region '{_name}' declares {declaredCapacity} payload bytes, but its " +
+                    $"mapping contains {_accessor!.Capacity - HeaderSize} payload bytes.");
+
+            if (!_createOrOpen)
+            {
+                _capacity = declaredCapacity;
+            }
+            else if (_flexibleCapacity)
+            {
+                if (declaredCapacity < _minCapacity)
+                    throw new InvalidOperationException(
+                        $"Capacity mismatch: expected at least {_minCapacity}, found {declaredCapacity}");
+                _capacity = declaredCapacity;
+            }
+            else if (declaredCapacity != _capacity)
+            {
+                throw new InvalidOperationException(
+                    $"Capacity mismatch: expected {_capacity}, found {declaredCapacity}");
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Whether the mapping can hold a region that declares <paramref name="payloadCapacity"/> bytes: it has
+        /// exactly that size, or, for a Windows named section, whose view is rounded up to whole pages, at least
+        /// that size.
+        /// </summary>
+        private bool MappingIsValidFor(long payloadCapacity)
+        {
+            long expectedMappingSize;
+            try
+            {
+                expectedMappingSize = checked(HeaderSize + payloadCapacity);
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
+
+            long mappedCapacity = _accessor!.Capacity;
+            bool isWindowsNamedRegion =
+                OperatingSystem.IsWindows() && string.IsNullOrEmpty(_options.FilePath);
+            return isWindowsNamedRegion
+                ? mappedCapacity >= expectedMappingSize
+                : mappedCapacity == expectedMappingSize;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private byte* GetDataPtr() => _basePtr + HeaderSize;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ValidateOffset(long offset, int length)
+        {
+            // Explicit negative checks are required before the ulong cast:
+            // (ulong)(-1) + (ulong)10 wraps around to 9 in unchecked arithmetic,
+            // so a single ulong comparison would silently pass a negative offset.
+            if (offset < 0 || length < 0 || (ulong)offset + (ulong)length > (ulong)_capacity)
+                throw new ArgumentOutOfRangeException(nameof(offset),
+                    $"Access at offset {offset} with length {length} exceeds capacity {_capacity}");
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public int Write(ReadOnlySpan<byte> source, long offset)
+        {
+            ThrowIfDisposed();
+            ValidateOffset(offset, source.Length);
+
+            byte* destPtr = GetDataPtr() + offset;
+
+            // Use SIMD when length is at least one vector. On modern x86-64, unaligned SIMD
+            // via ReadUnaligned/WriteUnaligned has essentially no penalty, so the copy is not gated
+            // on alignment (that would only force small writes onto the scalar fallback).
+            if (_options.EnableSimd && source.Length >= Vector<byte>.Count)
+            {
+                WriteSimd(source, destPtr);
+            }
+            else
+            {
+                source.CopyTo(new Span<byte>(destPtr, source.Length));
+            }
+
+            // Stats are opt-in: under heavy concurrent access the LOCK-prefixed atomics here
+            // become a cache-line contention point even though each call is "only" ~10ns.
+            // Read-heavy workloads with stats disabled see 20-40% throughput gain. Default-on
+            // preserves backward compatibility for callers that consume GetStatistics().
+            if (_statsEnabled)
+            {
+                Interlocked.Increment(ref _totalWrites);
+                Interlocked.Add(ref _totalBytesWritten, source.Length);
+            }
+
+            if (_options.EnableEvents)
+            {
+                try
+                {
+                    OnDataWritten?.Invoke(this, new MemoryRegionEventArgs
+                    {
+                        EventType = MemoryRegionEventType.DataWritten,
+                        BytesAffected = source.Length,
+                        Offset = offset
+                    });
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "Event handler threw an exception during OnDataWritten");
+                }
+            }
+
+            return source.Length;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void WriteSimd(ReadOnlySpan<byte> source, byte* destPtr)
+        {
+            int vectorSize = Vector<byte>.Count;
+            int vectorCount = source.Length / vectorSize;
+            int remainder = source.Length % vectorSize;
+
+            ref byte sourceRef = ref MemoryMarshal.GetReference(source);
+
+            for (int i = 0; i < vectorCount; i++)
+            {
+                var vector = Unsafe.ReadUnaligned<Vector<byte>>(
+                    ref Unsafe.Add(ref sourceRef, i * vectorSize));
+                Unsafe.WriteUnaligned(destPtr + i * vectorSize, vector);
+            }
+
+            if (remainder > 0)
+            {
+                source.Slice(vectorCount * vectorSize).CopyTo(
+                    new Span<byte>(destPtr + vectorCount * vectorSize, remainder));
+            }
+        }
+
+        /// <inheritdoc/>
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        public int Read(Span<byte> destination, long offset)
+        {
+            ThrowIfDisposed();
+            ValidateOffset(offset, destination.Length);
+
+            byte* srcPtr = GetDataPtr() + offset;
+
+            // Same rationale as Write: no alignment gating, because modern hardware handles
+            // unaligned SIMD natively.
+            if (_options.EnableSimd && destination.Length >= Vector<byte>.Count)
+            {
+                ReadSimd(destination, srcPtr);
+            }
+            else
+            {
+                new ReadOnlySpan<byte>(srcPtr, destination.Length).CopyTo(destination);
+            }
+
+            // Stats opt-in (same rationale as Write — see EnableStatistics doc on
+            // MemoryRegionOptions). Reader-heavy code paths benefit most from disabling.
+            if (_statsEnabled)
+            {
+                Interlocked.Increment(ref _totalReads);
+                Interlocked.Add(ref _totalBytesRead, destination.Length);
+            }
+
+            return destination.Length;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        private static void ReadSimd(Span<byte> destination, byte* srcPtr)
+        {
+            int vectorSize = Vector<byte>.Count;
+            int vectorCount = destination.Length / vectorSize;
+            int remainder = destination.Length % vectorSize;
+
+            ref byte destRef = ref MemoryMarshal.GetReference(destination);
+
+            for (int i = 0; i < vectorCount; i++)
+            {
+                var vector = Unsafe.ReadUnaligned<Vector<byte>>(srcPtr + i * vectorSize);
+                Unsafe.WriteUnaligned(
+                    ref Unsafe.Add(ref destRef, i * vectorSize), vector);
+            }
+
+            if (remainder > 0)
+            {
+                new ReadOnlySpan<byte>(srcPtr + vectorCount * vectorSize, remainder).CopyTo(
+                    destination.Slice(vectorCount * vectorSize));
+            }
+        }
+
+        // SIMD is used unconditionally for length >= Vector<byte>.Count. _options.Alignment is
+        // validated as a power of 2 but does not influence the copy; it exists for consumers that
+        // want to align their own offsets.
+
+        /// <inheritdoc/>
+        public ValueTask<int> WriteAsync(ReadOnlyMemory<byte> source, long offset,
+            CancellationToken cancellationToken = default)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return ValueTask.FromCanceled<int>(cancellationToken);
+
+            try
+            {
+                int written = Write(source.Span, offset);
+                return ValueTask.FromResult(written);
+            }
+            catch (Exception ex)
+            {
+                return ValueTask.FromException<int>(ex);
+            }
+        }
+
+        /// <inheritdoc/>
+        public ValueTask<int> ReadAsync(Memory<byte> destination, long offset,
+            CancellationToken cancellationToken = default)
+        {
+            if (cancellationToken.IsCancellationRequested)
+                return ValueTask.FromCanceled<int>(cancellationToken);
+
+            try
+            {
+                int read = Read(destination.Span, offset);
+                return ValueTask.FromResult(read);
+            }
+            catch (Exception ex)
+            {
+                return ValueTask.FromException<int>(ex);
+            }
+        }
+
+        /// <inheritdoc/>
+        public Memory<byte> GetMemory(long offset, int length)
+        {
+            ThrowIfDisposed();
+            ValidateOffset(offset, length);
+
+            byte* ptr = GetDataPtr() + offset;
+            return new UnmanagedMemoryManager<byte>(ptr, length, owner: this).Memory;
+        }
+
+        /// <inheritdoc/>
+        public bool TryAcquireWriteLock(TimeSpan timeout)
+        {
+            ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
+
+            EnterWait();
+            try
+            {
+                return TryAcquireWriteLockCore(timeout);
+            }
+            finally
+            {
+                ExitWait();
+            }
+        }
+
+        private bool TryAcquireWriteLockCore(TimeSpan timeout)
+        {
+            var header = (SharedHeader*)_basePtr;
+            long start = Stopwatch.GetTimestamp(); // not a Stopwatch instance: that would allocate on every lock
+            var spinner = new SpinWait();
+            long nextOrphanCheckMs = 0;
+            long ownerlessSinceMs = -1;
+
+            while (true)
+            {
+                // Dispose() unmaps the header while we may still be spinning on it. It waits for
+                // registered waiters (EnterWait) to leave, and we leave as soon as we see the flag.
+                ThrowIfDisposed();
+
+                if (Interlocked.CompareExchange(ref header->WriterLockState, 1, 0) == 0)
+                {
+                    bool success = false;
+                    try
+                    {
+                        // Record lock ownership for orphan detection. StartTime defeats PID-reuse
+                        // attacks on the orphan check (see IsWriteLockOrphaned).
+                        header->LockOwnerPidNamespace = s_pidNamespace;
+                        Volatile.Write(ref header->LockOwnerProcessId, Environment.ProcessId);
+                        header->LockOwnerThreadId = Environment.CurrentManagedThreadId;
+                        header->LockOwnerProcessStartTime = s_processStartTimeBinary;
+                        header->LockAcquiredTimestamp = Stopwatch.GetTimestamp();
+                        Thread.MemoryBarrier();
+
+                        var readerSpinner = new SpinWait();
+                        while (Volatile.Read(ref header->ReaderCount) > 0)
+                        {
+                            ThrowIfDisposed();
+
+                            if (TimeoutHelper.HasExpired(start, timeout))
+                            {
+                                return false; // Will release lock in finally
+                            }
+
+                            readerSpinner.SpinOnce();
+                        }
+
+                        _logger?.LogTrace("Write lock acquired by process {ProcessId}", Environment.ProcessId);
+                        success = true;
+                        return true;
+                    }
+                    finally
+                    {
+                        if (!success)
+                        {
+                            // Clear ownership and release on failure
+                            header->LockOwnerProcessId = 0;
+                            header->LockOwnerThreadId = 0;
+                            header->LockOwnerProcessStartTime = 0;
+                            header->LockOwnerPidNamespace = 0;
+                            header->LockAcquiredTimestamp = 0;
+                            Interlocked.Exchange(ref header->WriterLockState, 0);
+                        }
+                    }
+                }
+
+                if (TimeoutHelper.HasExpired(start, timeout))
+                    return false;
+
+                // Check on the first CAS failure and then periodically. The owner may die at any point
+                // while we wait, and a wait with Timeout.InfiniteTimeSpan has no deadline to key a
+                // one-off re-check on. The probe costs a process lookup, hence the interval.
+                if (TryRecoverStaleWriteLock(start, ref nextOrphanCheckMs, ref ownerlessSinceMs))
+                    continue;
+
+                spinner.SpinOnce();
+            }
+        }
+
+        /// <inheritdoc/>
+        public void ReleaseWriteLock()
+        {
+            ThrowIfDisposed();
+
+            var header = (SharedHeader*)_basePtr;
+
+            int currentPid = Environment.ProcessId;
+            long currentThreadId = Environment.CurrentManagedThreadId;
+            int ownerPid = Volatile.Read(ref header->LockOwnerProcessId);
+            long ownerThreadId = Volatile.Read(ref header->LockOwnerThreadId);
+            // Releasing a lock this thread does not own must be loud. Silently ignoring it would turn
+            // `await` inside a lock scope — the continuation resumes on another thread — into a write
+            // lock that no process could ever release again.
+            if (ownerPid != currentPid || ownerThreadId != currentThreadId)
+            {
+                _logger?.LogWarning(
+                    "ReleaseWriteLock called from PID {Pid}/thread {ThreadId} but lock owner is PID {OwnerPid}/thread {OwnerThreadId}",
+                    currentPid, currentThreadId, ownerPid, ownerThreadId);
+                throw new SynchronizationLockException(
+                    $"The write lock must be released by the thread that acquired it " +
+                    $"(caller PID {currentPid}/thread {currentThreadId}, lock owner PID {ownerPid}/thread {ownerThreadId}). " +
+                    "Do not await inside a lock scope.");
+            }
+
+            int prev = Interlocked.CompareExchange(ref header->LockOwnerProcessId, 0, currentPid);
+            if (prev != currentPid)
+            {
+                _logger?.LogWarning(
+                    "ReleaseWriteLock called from PID {Pid} but lock owner is {OwnerPid}",
+                    currentPid, prev);
+                throw new SynchronizationLockException(
+                    "The write lock was taken over (for example by orphan-lock recovery) before it was released.");
+            }
+
+            header->LockOwnerThreadId = 0;
+            header->LockOwnerProcessStartTime = 0;
+            header->LockOwnerPidNamespace = 0;
+            header->LockAcquiredTimestamp = 0;
+
+            Thread.MemoryBarrier();
+            Volatile.Write(ref header->WriterLockState, 0);
+
+            _logger?.LogTrace("Write lock released");
+        }
+
+        /// <inheritdoc/>
+        public bool TryAcquireReadLock(TimeSpan timeout)
+        {
+            ThrowIfDisposed();
+            TimeoutHelper.Validate(timeout, nameof(timeout));
+
+            EnterWait();
+            try
+            {
+                return TryAcquireReadLockCore(timeout);
+            }
+            finally
+            {
+                ExitWait();
+            }
+        }
+
+        private bool TryAcquireReadLockCore(TimeSpan timeout)
+        {
+            var header = (SharedHeader*)_basePtr;
+            long start = Stopwatch.GetTimestamp();
+            var spinner = new SpinWait();
+            // A reader usually waits for a live writer for microseconds, so the first probe comes after a
+            // full interval instead of at once. A writer that died is still noticed within it.
+            long nextOrphanCheckMs = OrphanCheckIntervalMs;
+            long ownerlessSinceMs = -1;
+
+            while (true)
+            {
+                // See TryAcquireWriteLockCore: leave promptly once Dispose() has started.
+                ThrowIfDisposed();
+
+                // Fast path: peek the writer flag without any atomic. If a writer is active,
+                // wait — touching ReaderCount unnecessarily would create cache-line traffic on
+                // the reader-side line and prolong the writer's release-then-drain phase.
+                int writerState = Volatile.Read(ref header->WriterLockState);
+                if (writerState != 0)
+                {
+                    if (TimeoutHelper.HasExpired(start, timeout))
+                        return false;
+
+                    // A reader must not wait out its whole timeout behind a writer that no longer exists.
+                    if (TryRecoverStaleWriteLock(start, ref nextOrphanCheckMs, ref ownerlessSinceMs))
+                        continue;
+
+                    spinner.SpinOnce();
+                    continue;
+                }
+
+                // Optimistic claim: an unconditional Interlocked.Increment, then re-check the writer.
+                // There is no CAS retry loop when N readers race — every one of them succeeds on
+                // the first atomic (`lock inc` is a single µop on x86 vs cmpxchg). The only window is
+                // between the claim and the writer re-check, handled by the rollback below.
+                Interlocked.Increment(ref header->ReaderCount);
+                if (Volatile.Read(ref header->WriterLockState) == 0)
+                    return true;
+
+                // A writer acquired between our reader check and our increment. Roll back.
+                // The writer's drain loop will briefly see ReaderCount > 0 and spin once or
+                // twice extra.
+                RollBackReaderIncrement(header);
+
+                if (TimeoutHelper.HasExpired(start, timeout))
+                    return false;
+
+                spinner.SpinOnce();
+            }
+        }
+
+        /// <summary>
+        /// Takes back a reader increment that did not become a lock because a writer got in. A plain decrement
+        /// would drive the count to -1 if <see cref="ForceResetLocks"/> cleared it in between, and a negative
+        /// count is never corrected by anyone.
+        /// </summary>
+        internal static void RollBackReaderIncrement(SharedHeader* header)
+        {
+            while (true)
+            {
+                int current = Volatile.Read(ref header->ReaderCount);
+                if (current <= 0)
+                    return;
+                if (Interlocked.CompareExchange(ref header->ReaderCount, current - 1, current) == current)
+                    return;
+            }
+        }
+
+        /// <inheritdoc/>
+        public void ReleaseReadLock()
+        {
+            ThrowIfDisposed();
+
+            var header = (SharedHeader*)_basePtr;
+            while (true)
+            {
+                int current = Volatile.Read(ref header->ReaderCount);
+                if (current <= 0)
+                {
+                    _logger?.LogWarning(
+                        "ReleaseReadLock called when reader count is {ReaderCount} — ignored",
+                        current);
+                    return;
+                }
+
+                if (Interlocked.CompareExchange(ref header->ReaderCount, current - 1, current) == current)
+                    return;
+            }
+        }
+
+        /// <inheritdoc/>
+        public bool IsWriteLockOrphaned()
+        {
+            ThrowIfDisposed();
+
+            var header = (SharedHeader*)_basePtr;
+
+            if (Volatile.Read(ref header->WriterLockState) == 0)
+                return false;
+
+            // The owner fields are separate words and are not written atomically. Read them as one snapshot:
+            // a pid taken from one owner combined with the start time of the next one (the lock changed hands
+            // between the reads) would look like a recycled pid and report a healthy owner as gone.
+            int ownerPid = Volatile.Read(ref header->LockOwnerProcessId);
+            if (ownerPid == 0)
+                return false;
+
+            long storedStartTime = Volatile.Read(ref header->LockOwnerProcessStartTime);
+            long ownerNamespace = Volatile.Read(ref header->LockOwnerPidNamespace);
+            Thread.MemoryBarrier();
+            if (Volatile.Read(ref header->LockOwnerProcessId) != ownerPid)
+                return false;   // the lock changed hands while it was looked at
+
+            // A pid recorded in another PID namespace says nothing about whether the owner is alive here.
+            if (!IsOtherPidNamespace(ownerNamespace) && OwnerProcessIsGone(ownerPid, storedStartTime))
+                return true;
+
+            // The owner process is alive. Only the opt-in time limit (OrphanLockTimeout, disabled
+            // by default) may still declare the lock orphaned.
+            if (_options.OrphanLockTimeout > TimeSpan.Zero)
+            {
+                long acquiredTimestamp = header->LockAcquiredTimestamp;
+                if (acquiredTimestamp > 0)
+                {
+                    long elapsed = Stopwatch.GetTimestamp() - acquiredTimestamp;
+                    double elapsedMs = elapsed * 1000.0 / Stopwatch.Frequency;
+
+                    if (elapsedMs > _options.OrphanLockTimeout.TotalMilliseconds)
+                    {
+                        _logger?.LogWarning("Lock held for {Elapsed}ms exceeds timeout {Timeout}ms",
+                            elapsedMs, _options.OrphanLockTimeout.TotalMilliseconds);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// True when the process that recorded itself as the lock owner no longer exists: it has exited, or
+        /// its pid now belongs to a process that started later (pid reuse).
+        /// </summary>
+        private bool OwnerProcessIsGone(int ownerPid, long storedStartTime)
+        {
+            try
+            {
+                using var process = Process.GetProcessById(ownerPid);
+                if (process.HasExited)
+                    return true;
+
+                // A process that was killed but not yet reaped by its parent (a container whose init does not
+                // reap, a supervisor that is busy) still exists for GetProcessById and HasExited, but it holds
+                // nothing any more.
+                if (OperatingSystem.IsLinux() && IsLinuxZombie(ownerPid))
+                    return true;
+
+                // PID-reuse defense: even when a process with this PID exists, it might be an
+                // unrelated process that the OS recycled the PID for after the real owner died.
+                // Compare the captured start time; mismatch ⇒ impostor ⇒ orphan.
+                if (storedStartTime != 0)
+                {
+                    try
+                    {
+                        if (IsOwnerStartTimeMismatch(process, ownerPid, storedStartTime))
+                        {
+                            _logger?.LogWarning(
+                                "Lock owner PID {Pid} still exists but its StartTime differs (orphan from PID reuse)",
+                                ownerPid);
+                            return true;
+                        }
+                    }
+                    catch
+                    {
+                        // The start time can be unreadable under restricted permissions (e.g., Linux
+                        // container without /proc, Windows ACL). Fall back to the PID-only decision
+                        // (and the optional OrphanLockTimeout check below).
+                    }
+                }
+            }
+            catch (ArgumentException)
+            {
+                // Process not found - it's dead
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                // Process has exited
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Called by a waiter that finds the write lock held. Every <see cref="OrphanCheckIntervalMs"/>
+        /// it releases the lock when its owner process is gone, or when the lock is held with no owner at
+        /// all (see <see cref="OwnerlessLockGraceMs"/>). Returns true when it released the lock, so that
+        /// the caller retries at once.
+        /// </summary>
+        private bool TryRecoverStaleWriteLock(long start, ref long nextCheckMs, ref long ownerlessSinceMs)
+        {
+            if (!_options.EnableOrphanLockDetection)
+                return false;
+
+            long nowMs = ElapsedMilliseconds(start);
+            if (nowMs < nextCheckMs)
+                return false;
+
+            nextCheckMs = nowMs + OrphanCheckIntervalMs;
+
+            if (IsWriteLockOrphaned())
+            {
+                _logger?.LogWarning("Detected orphan write lock, attempting recovery");
+                TryForceReleaseWriteLock();
+                return true;
+            }
+
+            return TryReleaseOwnerlessWriteLock(nowMs, ref ownerlessSinceMs);
+        }
+
+        private bool TryReleaseOwnerlessWriteLock(long nowMs, ref long ownerlessSinceMs)
+        {
+            var header = (SharedHeader*)_basePtr;
+
+            if (Volatile.Read(ref header->WriterLockState) == 0 ||
+                Volatile.Read(ref header->LockOwnerProcessId) != 0)
+            {
+                ownerlessSinceMs = -1;
+                return false;
+            }
+
+            if (ownerlessSinceMs < 0)
+            {
+                ownerlessSinceMs = nowMs;
+                return false;
+            }
+
+            if (nowMs - ownerlessSinceMs < OwnerlessLockGraceMs)
+                return false;
+
+            // Only the exact state that was observed is cleared: a lock that was released and taken again
+            // meanwhile has an owner recorded within nanoseconds of its CAS and is left alone.
+            if (Volatile.Read(ref header->LockOwnerProcessId) != 0 ||
+                Interlocked.CompareExchange(ref header->WriterLockState, 0, 1) != 1)
+            {
+                ownerlessSinceMs = -1;
+                return false;
+            }
+
+            header->LockOwnerThreadId = 0;
+            header->LockOwnerProcessStartTime = 0;
+            header->LockOwnerPidNamespace = 0;
+            header->LockAcquiredTimestamp = 0;
+            ownerlessSinceMs = -1;
+
+            _logger?.LogWarning(
+                "Released a write lock that was held with no owner recorded for {Grace} ms " +
+                "(its owner was killed while taking or releasing it)", OwnerlessLockGraceMs);
+            RaiseOrphanLockDetected();
+            return true;
+        }
+
+        private void RaiseOrphanLockDetected()
+        {
+            if (!_options.EnableEvents)
+                return;
+
+            try
+            {
+                OnOrphanLockDetected?.Invoke(this, new MemoryRegionEventArgs
+                {
+                    EventType = MemoryRegionEventType.OrphanLockDetected
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Event handler threw an exception during OnOrphanLockDetected");
+            }
+        }
+
+        /// <inheritdoc/>
+        public bool TryForceReleaseWriteLock()
+        {
+            ThrowIfDisposed();
+
+            var header = (SharedHeader*)_basePtr;
+
+            // Snapshot the owner PID before orphan check to prevent TOCTOU race
+            int orphanPid = Volatile.Read(ref header->LockOwnerProcessId);
+            if (orphanPid == 0)
+                return false;
+
+            if (!IsWriteLockOrphaned())
+                return false;
+
+            // Verify the same process still holds the lock (prevent releasing a valid lock
+            // that was acquired by a different process between our check and this point)
+            if (Interlocked.CompareExchange(ref header->LockOwnerProcessId, 0, orphanPid) != orphanPid)
+                return false; // Lock owner changed, another process took it — do not release
+
+            _logger?.LogWarning("Force releasing orphan lock from process {ProcessId}", orphanPid);
+
+            header->LockOwnerThreadId = 0;
+            header->LockOwnerProcessStartTime = 0;
+            header->LockOwnerPidNamespace = 0;
+            header->LockAcquiredTimestamp = 0;
+            Thread.MemoryBarrier();
+            Volatile.Write(ref header->WriterLockState, 0);
+
+            RaiseOrphanLockDetected();
+            return true;
+        }
+
+        /// <summary>
+        /// Unconditionally clears the shared write lock and the read-lock count.
+        /// <para>
+        /// This is the recovery tool for a lock state that cannot be recovered automatically. Read
+        /// locks are not attributed to an owner, so when a process dies while holding one the
+        /// shared reader count stays above zero forever (see <see cref="LockOwnerInfo.ReaderCount"/>)
+        /// and every writer times out, including after the region is reopened on Linux, where the
+        /// backing file outlives its users.
+        /// </para>
+        /// <para>
+        /// Call it only when no process is inside a critical section of this region; resetting locks
+        /// that are legitimately held lets a writer run concurrently with them. A thread that held
+        /// a lock when it was reset gets <see cref="SynchronizationLockException"/> from its release.
+        /// </para>
+        /// </summary>
+        public void ForceResetLocks()
+        {
+            ThrowIfDisposed();
+
+            var header = (SharedHeader*)_basePtr;
+
+            _logger?.LogWarning(
+                "Force resetting locks of '{Name}' (writer state {WriterState}, readers {Readers})",
+                _name, Volatile.Read(ref header->WriterLockState), Volatile.Read(ref header->ReaderCount));
+
+            Volatile.Write(ref header->LockOwnerProcessId, 0);
+            header->LockOwnerThreadId = 0;
+            header->LockOwnerProcessStartTime = 0;
+            header->LockOwnerPidNamespace = 0;
+            header->LockAcquiredTimestamp = 0;
+            Thread.MemoryBarrier();
+            Volatile.Write(ref header->WriterLockState, 0);
+            Interlocked.Exchange(ref header->ReaderCount, 0);
+        }
+
+        /// <inheritdoc/>
+        public LockOwnerInfo GetLockOwnerInfo()
+        {
+            ThrowIfDisposed();
+
+            var header = (SharedHeader*)_basePtr;
+
+            return new LockOwnerInfo
+            {
+                ProcessId = header->LockOwnerProcessId,
+                ThreadId = header->LockOwnerThreadId,
+                AcquiredTimestamp = header->LockAcquiredTimestamp,
+                IsOrphan = IsWriteLockOrphaned(),
+                ReaderCount = Volatile.Read(ref header->ReaderCount)
+            };
+        }
+
+        /// <summary>
+        /// True when the calling thread of this process holds the write lock of the region, whichever instance
+        /// took it. The lock records its owner by process and thread, so a second instance of the same region
+        /// in one process can tell that the lock it is about to wait for belongs to its own thread, which it
+        /// would never get (locks are reentrant only through the instance that took them).
+        /// </summary>
+        internal bool IsWriteLockHeldByCurrentThread()
+        {
+            var header = (SharedHeader*)_basePtr;
+            if (_basePtr == null || Volatile.Read(ref header->WriterLockState) == 0)
+                return false;
+
+            return Volatile.Read(ref header->LockOwnerProcessId) == Environment.ProcessId
+                && Volatile.Read(ref header->LockOwnerThreadId) == Environment.CurrentManagedThreadId
+                && !IsOtherPidNamespace(Volatile.Read(ref header->LockOwnerPidNamespace));
+        }
+
+        /// <summary>
+        /// Called by a container before it waits for the region lock. Waiting for a write lock that the calling
+        /// thread itself holds through another instance of the region cannot succeed; this reports it at once
+        /// instead of after the whole timeout (which is for ever with <see cref="Timeout.InfiniteTimeSpan"/>).
+        /// A read lock held through another instance cannot be recognised: read locks have no owner.
+        /// </summary>
+        internal static void ThrowIfWriteLockHeldByCurrentThread(IMemoryRegion region, string container)
+        {
+            if (region is MemoryRegion memoryRegion && memoryRegion.IsWriteLockHeldByCurrentThread())
+                throw new InvalidOperationException(
+                    $"This thread already holds the write lock of the region through another instance of {container}. " +
+                    "A lock is reentrant only through the instance that took it, so waiting for it here would never " +
+                    "end. Share one instance per region in a process, or release the lock first.");
+        }
+
+        /// <inheritdoc/>
+        public uint CalculateChecksum(long offset, int length)
+        {
+            ThrowIfDisposed();
+            ValidateOffset(offset, length);
+
+            byte* ptr = GetDataPtr() + offset;
+            return ComputeCrc32(ptr, length);
+        }
+
+        /// <inheritdoc/>
+        public bool VerifyIntegrity()
+        {
+            ThrowIfDisposed();
+
+            var header = (SharedHeader*)_basePtr;
+
+            if (header->ChecksumLength == 0)
+                return !_options.EnableChecksumVerification;
+
+            uint stored = header->DataChecksum;
+            uint calculated = CalculateChecksum(header->ChecksumOffset, header->ChecksumLength);
+
+            bool valid = stored == calculated;
+            if (!valid)
+            {
+                _logger?.LogError("Integrity check failed: stored={Stored:X8}, calculated={Calculated:X8}",
+                    stored, calculated);
+            }
+
+            return valid;
+        }
+
+        /// <inheritdoc/>
+        public void UpdateChecksum(long offset, int length)
+        {
+            ThrowIfDisposed();
+            ValidateOffset(offset, length);
+
+            var header = (SharedHeader*)_basePtr;
+            header->ChecksumOffset = offset;
+            header->ChecksumLength = length;
+            header->DataChecksum = CalculateChecksum(offset, length);
+            Thread.MemoryBarrier();
+        }
+
+        /// <summary>
+        /// Computes CRC32 checksum using hardware acceleration when available
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static uint ComputeCrc32(byte* data, int length)
+        {
+            // Use .NET's hardware-accelerated CRC32 implementation
+            return System.IO.Hashing.Crc32.HashToUInt32(new ReadOnlySpan<byte>(data, length));
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void ThrowIfDisposed()
+        {
+            if (_disposed != 0)
+                throw new ObjectDisposedException(nameof(MemoryRegion));
+        }
+
+        /// <summary>
+        /// Registers the calling thread as a lock waiter. Increment first, then check the flag: with
+        /// the full fences of the two interlocked operations, either this thread sees the disposed
+        /// flag or <see cref="Dispose"/> sees this thread in <see cref="_activeWaiters"/>.
+        /// </summary>
+        private void EnterWait()
+        {
+            Interlocked.Increment(ref _activeWaiters);
+            if (_disposed != 0)
+            {
+                Interlocked.Decrement(ref _activeWaiters);
+                throw new ObjectDisposedException(nameof(MemoryRegion));
+            }
+        }
+
+        private void ExitWait() => Interlocked.Decrement(ref _activeWaiters);
+
+        private static long ElapsedMilliseconds(long startTimestamp) =>
+            (long)Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
+
+        /// <summary>
+        /// Releases all resources used by this buffer. Threads blocked in
+        /// <see cref="TryAcquireWriteLock"/> or <see cref="TryAcquireReadLock"/> are released with an
+        /// <see cref="ObjectDisposedException"/> before the memory is unmapped.
+        /// <para>
+        /// Stop and join every thread that uses this instance before disposing it. Other members check
+        /// the disposed flag but are not tracked, so a thread that is inside one of them while the
+        /// memory is unmapped crashes the process; <see cref="DisposeGracePeriod"/> narrows that window
+        /// but does not close it.
+        /// </para>
+        /// </summary>
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+                return;
+
+            _logger?.LogDebug("Disposing shared buffer '{Name}'", _name);
+
+            // Waiters observe _disposed on every spin iteration and leave within a few milliseconds.
+            // Never unmap underneath a thread that is still dereferencing the header: that is an
+            // AccessViolationException, which terminates the process and cannot be caught.
+            var drain = Stopwatch.StartNew();
+            var drainSpinner = new SpinWait();
+            while (Volatile.Read(ref _activeWaiters) > 0 && drain.Elapsed < s_waiterDrainTimeout)
+                drainSpinner.SpinOnce();
+
+            // Calls that passed their disposed check just before the flag was set are still running
+            // against the mapping and are not tracked (that would cost every call two interlocked
+            // operations; measured at roughly 9x on a queue round trip). New calls fail fast with
+            // ObjectDisposedException, so a short pause lets those in-flight calls complete.
+            long graceTicks = Interlocked.Read(ref s_disposeGraceTicks);
+            if (graceTicks > 0)
+                Thread.Sleep(TimeSpan.FromTicks(graceTicks));
+
+            Cleanup(disposing: true);
+            GC.SuppressFinalize(this);
+        }
+
+        private void Cleanup(bool disposing = true)
+        {
+            // We always release the unmanaged pointer and dispose the OS handles, regardless of
+            // disposing — those are unmanaged resources and that's exactly what a finalizer must
+            // reclaim. What we skip from the finalizer is anything touching managed state with
+            // unpredictable lifetime: the logger (may itself be finalized), File.Delete (heavy
+            // syscall path during shutdown), and any code that allocates.
+            try
+            {
+                if (_basePtr != null && _accessor != null)
+                {
+                    _accessor.SafeMemoryMappedViewHandle.ReleasePointer();
+                    _basePtr = null;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (disposing)
+                    _logger?.LogWarning(ex, "Failed to release memory pointer during cleanup");
+            }
+
+            try
+            {
+                _accessor?.Dispose();
+                _accessor = null;
+            }
+            catch (Exception ex)
+            {
+                if (disposing)
+                    _logger?.LogWarning(ex, "Failed to dispose accessor during cleanup");
+            }
+
+            try
+            {
+                _mmf?.Dispose();
+                _mmf = null;
+            }
+            catch (Exception ex)
+            {
+                if (disposing)
+                    _logger?.LogWarning(ex, "Failed to dispose memory-mapped file during cleanup");
+            }
+
+            try
+            {
+                // Only set if the MMF didn't take ownership (i.e., construction aborted partway).
+                _backingFile?.Dispose();
+                _backingFile = null;
+            }
+            catch (Exception ex)
+            {
+                if (disposing)
+                    _logger?.LogWarning(ex, "Failed to dispose backing file during cleanup");
+            }
+
+            // Do not unlink a successfully initialized /dev/shm region on normal Dispose:
+            // existing mappings would keep working while later openers get a brand-new file,
+            // splitting one logical name into two independent regions. Only remove files that
+            // this instance sized but failed to initialize.
+            if (disposing)
+            {
+                bool constructionFailed = !_initializedSuccessfully;
+                bool shouldUnlink = _backingFilePath != null && constructionFailed && _createdBackingFile;
+                if (shouldUnlink)
+                {
+                    try
+                    {
+                        if (File.Exists(_backingFilePath!))
+                            File.Delete(_backingFilePath!);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogDebug(ex, "Could not unlink /dev/shm file '{Path}' during cleanup", _backingFilePath);
+                    }
+                }
+                if (constructionFailed)
+                    _backingFilePath = null;
+                _createdBackingFile = false;
+            }
+        }
+
+        /// <summary>
+        /// Releases unmanaged resources if Dispose was not called. Touches only unmanaged
+        /// state — see <see cref="Cleanup"/> for the disposing-flag rationale.
+        /// </summary>
+        ~MemoryRegion()
+        {
+            Cleanup(disposing: false);
+        }
+    }
+}
