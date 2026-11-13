@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 (not released yet)
+## 0.1.0 - 2026-11-13
 
 First version of the package. It is built from this repository and has not been published to NuGet.org.
 The version numbers 2.x to 4.1.0 that were used before belong to builds that were not published either.
