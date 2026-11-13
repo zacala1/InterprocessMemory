@@ -5,7 +5,7 @@ using InterprocessMemory;
 namespace InterprocessMemory.Benchmarks;
 
 /// <summary>
-/// SPSC vs MPMC 순환 버퍼 비교
+/// Compares the SPSC ring buffer with the MPMC ring buffer.
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(RuntimeMoniker.Net80)]
@@ -64,7 +64,7 @@ public class SpscVsMpmcBenchmark
 }
 
 /// <summary>
-/// Lock 오버헤드 측정
+/// Measures the overhead of the lock.
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(RuntimeMoniker.Net80)]
@@ -142,7 +142,7 @@ public class LockOverheadBenchmark
 }
 
 /// <summary>
-/// 데이터 크기별 처리량 (GB/s)
+/// Measures the throughput for different data sizes (GB/s).
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(RuntimeMoniker.Net80)]
@@ -189,7 +189,7 @@ public class ThroughputByDataSizeBenchmark
 }
 
 /// <summary>
-/// SIMD 활성화 vs 비활성화
+/// Compares copying with SIMD enabled and with SIMD disabled.
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(RuntimeMoniker.Net80)]
@@ -257,7 +257,7 @@ public class SimdComparisonBenchmark
 }
 
 /// <summary>
-/// CRC32 체크섬 오버헤드
+/// Measures the overhead of the CRC32 checksum.
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(RuntimeMoniker.Net80)]
@@ -316,7 +316,7 @@ public class ChecksumOverheadBenchmark
 }
 
 /// <summary>
-/// 멀티스레드 경쟁 상황 (Contention)
+/// Measures contention between several threads.
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(RuntimeMoniker.Net80)]

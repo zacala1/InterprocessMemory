@@ -9,7 +9,8 @@ namespace InterprocessMemory
     /// </summary>
     public sealed class MemoryRegionOptions
     {
-        // Internal migration hooks used only by the repository's 2.x regression suite.
+        // Internal settings that the tests and the benchmarks reach through InternalsVisibleTo. They are not
+        // part of the public API.
         internal long Capacity { get; set; } = 64L * 1024 * 1024;
 
         internal bool CreateOrOpen { get; set; } = true;
