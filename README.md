@@ -456,4 +456,5 @@ request and every push to `main`. Two groups of tests are kept out of the blocki
 - `Category=LongRunning`: the `[Explicit]` soak tests, which NUnit never runs unless asked to. CI does
   not run them.
 
-Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+Changes are listed in [CHANGELOG.md](CHANGELOG.md). The rules for contributions (commit messages, author,
+pull requests, releases) are in [CONTRIBUTING.md](CONTRIBUTING.md).
