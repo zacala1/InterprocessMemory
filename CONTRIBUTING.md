@@ -59,7 +59,7 @@ a `BREAKING CHANGE:` paragraph mark a change that breaks the API or the region f
 - One pull request is one change. A user-visible change is added to the section of the next version in
   `CHANGELOG.md` in the same pull request.
 - `main` has a linear history, and the head branch is deleted when the pull request is merged. Do not force-push
-  `main`, and do not move or delete the tag of a release.
+  `main`, and do not move or delete the tag of a published release.
 
 Run the checks of a pull request before you open it:
 
@@ -97,11 +97,11 @@ To release a version:
 
 ## Automation
 
-| Workflow    | When                          | What it does                                                          |
-| ----------- | ----------------------------- | --------------------------------------------------------------------- |
-| CI          | pull request, push to `main`  | builds, tests both frameworks on Linux and Windows, packs once        |
-| Conventions | pull request                  | title, branch name, description, and author and message of each commit |
-| Release     | tag `vX.Y.Z`                  | see Versions and releases                                             |
+| Workflow    | When                         | What it does                                                                                   |
+| ----------- | ---------------------------- | ---------------------------------------------------------------------------------------------- |
+| CI          | pull request, push to `main` | builds, tests both frameworks on Linux and Windows, packs once                                 |
+| Conventions | pull request                 | title, branch name, the two sections of the description, and author and message of each commit |
+| Release     | tag `vX.Y.Z`                 | see Versions and releases                                                                      |
 
 The repository settings that go with these rules: only squash merging (the title and the description of the pull
 request become the commit message), head branches are deleted after the merge, and a ruleset on `main` that

@@ -55,6 +55,20 @@ check_attribution() {
   fi
 }
 
+# The description has the two sections of .github/pull_request_template.md, each with some text under it.
+check_sections() {
+  local label=$1 text=${2//$'\r'/} section
+  for section in Summary Verification; do
+    if ! awk -v s="$section" '
+      $0 ~ "^##[ \t]+" s "[ \t]*$" { in_section = 1; next }
+      /^##[ \t]/ { in_section = 0 }
+      in_section && /[^ \t]/ { found = 1 }
+      END { exit !found }' <<<"$text"; then
+      fail "$label: needs a '## $section' section with text under it (see .github/pull_request_template.md)"
+    fi
+  done
+}
+
 check_branch() {
   local name=$1
   local re="^(${TYPES})/[a-z0-9][a-z0-9._-]*\$"
@@ -110,6 +124,7 @@ case "$mode" in
     ;;
   body)
     [ $# -le 1 ] || usage
+    check_sections "pull request description" "${1:-}"
     check_attribution "pull request description" "${1:-}"
     ;;
   commits)
