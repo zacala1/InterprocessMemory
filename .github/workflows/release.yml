@@ -1,0 +1,196 @@
+name: Release
+
+# A version tag on main releases that version: v0.2.0, or v0.2.0-alpha.1 for a prerelease. The steps are in
+# CONTRIBUTING.md (Versions and releases). A tag that does not match the project, or a CHANGELOG.md that has no
+# dated section for the version, stops the release before anything is built.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  package:
+    name: Build, test and pack
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check that the tag is on main
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main. Tag a commit that is part of main."
+            exit 1
+          fi
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      # The tag, <Version>, the assembly and file versions and the CHANGELOG.md must tell the same version.
+      # The notes of the GitHub release are the CHANGELOG.md section of that version.
+      - name: Check the version
+        id: version
+        run: |
+          set -euo pipefail
+          project=InterprocessMemory/InterprocessMemory.csproj
+          version=$(dotnet msbuild "$project" -getProperty:Version -nologo | tr -d '\r')
+          assembly=$(dotnet msbuild "$project" -getProperty:AssemblyVersion -nologo | tr -d '\r')
+          file=$(dotnet msbuild "$project" -getProperty:FileVersion -nologo | tr -d '\r')
+          expected="${version%%-*}.0"
+
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::The tag $GITHUB_REF_NAME does not match <Version> $version in $project."
+            exit 1
+          fi
+          if [ "$assembly" != "$expected" ] || [ "$file" != "$expected" ]; then
+            echo "::error::AssemblyVersion ($assembly) and FileVersion ($file) in $project must be $expected."
+            exit 1
+          fi
+
+          escaped=${version//./\\.}
+          if ! grep -Eq "^## ${escaped} - [0-9]{4}-[0-9]{2}-[0-9]{2}\$" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no section '## $version - YYYY-MM-DD'. Date it in the release pull request."
+            exit 1
+          fi
+          mkdir -p artifacts
+          awk -v heading="## ${version} - " 'index($0, heading) == 1 { found = 1; next } /^## / { found = 0 } found' CHANGELOG.md |
+            sed -e '/./,$!d' > artifacts/release-notes.md
+          if [ ! -s artifacts/release-notes.md ]; then
+            echo "::error::The CHANGELOG.md section of $version is empty."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Restore
+        run: dotnet restore InterprocessMemory.sln
+
+      - name: Build
+        run: dotnet build InterprocessMemory.sln --configuration Release --no-restore -p:GeneratePackageOnBuild=false
+
+      # The same tests as the blocking test steps of CI. Both runtimes are needed: the tests of each framework
+      # start the net8.0 test worker as a child process.
+      - name: Test (net8.0)
+        run: >
+          dotnet test InterprocessMemory.Tests/InterprocessMemory.Tests.csproj
+          --configuration Release --no-build --framework net8.0
+          --filter "Category!=TimingSensitive&Category!=LongRunning"
+          --blame-hang-timeout 10m --blame-hang-dump-type none
+
+      # A region outlives its creator on Linux (a file in /dev/shm) and a number of tests use fixed names.
+      - name: Remove the regions left by the net8.0 tests
+        if: ${{ !cancelled() }}
+        run: find /dev/shm -maxdepth 1 -type f -user "$(id -u)" -delete
+
+      - name: Test (net10.0)
+        run: >
+          dotnet test InterprocessMemory.Tests/InterprocessMemory.Tests.csproj
+          --configuration Release --no-build --framework net10.0
+          --filter "Category!=TimingSensitive&Category!=LongRunning"
+          --blame-hang-timeout 10m --blame-hang-dump-type none
+
+      - name: Pack
+        run: dotnet pack InterprocessMemory/InterprocessMemory.csproj --configuration Release --no-build --no-restore --output artifacts/packages
+
+      - name: Check the package files
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for file in "InterprocessMemory.$VERSION.nupkg" "InterprocessMemory.$VERSION.snupkg"; do
+            if [ ! -f "artifacts/packages/$file" ]; then
+              echo "::error::$file was not created."
+              exit 1
+            fi
+          done
+
+      - name: Upload the release files
+        uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: |
+            artifacts/packages
+            artifacts/release-notes.md
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub release
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the release files
+        uses: actions/download-artifact@v7
+        with:
+          name: release
+          path: artifacts
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          flags=()
+          case "$GITHUB_REF_NAME" in
+            *-*) flags+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" artifacts/packages/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "$GITHUB_REF_NAME" --notes-file artifacts/release-notes.md \
+            "${flags[@]}"
+
+  nuget:
+    name: Publish to NuGet.org
+    needs: package
+    # Off until the repository variable NUGET_PUBLISH is "true" and the secret NUGET_API_KEY is stored in the
+    # "nuget" environment.
+    if: ${{ vars.NUGET_PUBLISH == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: nuget
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download the release files
+        uses: actions/download-artifact@v7
+        with:
+          name: release
+          path: artifacts
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      # The symbols package next to the package is pushed with it.
+      - name: Push the package
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: >
+          dotnet nuget push "artifacts/packages/*.nupkg"
+          --api-key "$NUGET_API_KEY"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
