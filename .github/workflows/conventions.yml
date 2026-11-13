@@ -1,0 +1,54 @@
+name: Conventions
+
+# The rules are written down in CONTRIBUTING.md. This workflow checks the ones a machine can check, for every
+# pull request: the title, the branch name, the description, and the author and message of every commit.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: conventions-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  conventions:
+    name: Conventions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          # The commits of the pull request are listed against its base.
+          fetch-depth: 0
+
+      # The pull request is squash-merged, so its title becomes the commit message on main. Every value of the
+      # pull request goes through an environment variable, never into the script text.
+      - name: Pull request title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: bash .github/scripts/check-conventions.sh title "$TITLE"
+
+      # Each check below runs even when an earlier one failed, so that one run reports every broken rule.
+      - name: Branch name
+        if: ${{ !cancelled() }}
+        env:
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: bash .github/scripts/check-conventions.sh branch "$BRANCH"
+
+      - name: Pull request description
+        if: ${{ !cancelled() }}
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: bash .github/scripts/check-conventions.sh body "$BODY"
+
+      - name: Commits (author and message)
+        if: ${{ !cancelled() }}
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: bash .github/scripts/check-conventions.sh commits "$BASE" "$HEAD"
