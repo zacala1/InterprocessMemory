@@ -34,7 +34,7 @@
     <PublishRepositoryUrl>true</PublishRepositoryUrl>
     <EmbedUntrackedSources>true</EmbedUntrackedSources>
     <ContinuousIntegrationBuild Condition="'$(CI)' == 'true'">true</ContinuousIntegrationBuild>
-    <PackageReleaseNotes>First release. Raw shared memory regions with a process-wide reader/writer lock, structured memory with schema versioning, shared arrays, single-producer byte streams and typed queues, and concurrent queues and message queues, for net8.0 and net10.0 on Windows and Linux. The region format is version 3. See CHANGELOG.md.</PackageReleaseNotes>
+    <PackageReleaseNotes>First release. Raw shared memory regions with a process-wide reader/writer lock, structured memory with schema versioning, shared arrays, single-producer byte streams and typed queues, and concurrent queues and message queues, for net8.0 and net10.0 on Windows and Linux. The region format is version 3. Compatibility with earlier builds is described in the Region format section of the README.</PackageReleaseNotes>
     <IncludeSymbols>true</IncludeSymbols>
     <SymbolPackageFormat>snupkg</SymbolPackageFormat>
   </PropertyGroup>
