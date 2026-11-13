@@ -381,13 +381,13 @@ queue as raw memory, using a different element type, or opening a region of an o
 Regions of the older format are not migrated. Stop every process that uses one, remove the
 named or file-backed region, and let `CreateOrOpen` create it again.
 
-The format number is not the package version. The builds numbered 3.0.0 to 4.1.0 that came before
-version 0.1.0 write the same format, so this version opens their regions.
+The format number is not the package version. The builds numbered 3.0.0 to 4.1.0 came before version 0.1.0 and
+were never published; they write the same format, so this version opens their regions.
 
 Do not run the build numbered 3.0.0 and any later build in processes that share a region on Linux.
 The 3.0.0 build compares the owner's `Process.StartTime`, which differs between observers, so it takes
 the write lock away from every live owner (including one of a later build, whose recorded start tick it
-can never match). Update all processes that use a region together. See [CHANGELOG.md](CHANGELOG.md).
+can never match). Update all processes that use a region together.
 
 ## Disposing while other threads are running
 
@@ -456,5 +456,6 @@ request and every push to `main`. Two groups of tests are kept out of the blocki
 - `Category=LongRunning`: the `[Explicit]` soak tests, which NUnit never runs unless asked to. CI does
   not run them.
 
-Changes are listed in [CHANGELOG.md](CHANGELOG.md). The rules for contributions (commit messages, author,
-pull requests, releases) are in [CONTRIBUTING.md](CONTRIBUTING.md).
+The changes of each version are described in its
+[GitHub release](https://github.com/zacala1/InterprocessMemory/releases). The rules for contributions (commit
+messages, author, pull requests, releases) are in [CONTRIBUTING.md](CONTRIBUTING.md).
