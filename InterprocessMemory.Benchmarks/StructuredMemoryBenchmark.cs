@@ -21,15 +21,15 @@ public struct BenchmarkSchema : IMemorySchema
 }
 
 /// <summary>
-/// 16바이트 타입 (auto-lock 적용) 벤치마크
-/// ThreadLocal 리팩토링 효과 측정용
+/// Schema with 16-byte fields, which StructuredMemory locks automatically (auto-lock), and an 8-byte field,
+/// which it does not lock.
 /// </summary>
 public struct LargeTypeSchema : IMemorySchema
 {
     public const string GuidField = "GuidValue";
     public const string DecimalField = "DecimalValue";
     public const string DateTimeOffsetField = "DateTimeOffsetValue";
-    public const string LongField = "LongValue"; // 8바이트 - auto-lock 안 함 (비교용)
+    public const string LongField = "LongValue"; // 8 bytes: no auto-lock (for comparison)
 
     public IEnumerable<FieldDefinition> GetFields()
     {
@@ -130,8 +130,8 @@ public class StructuredMemoryBenchmark
 }
 
 /// <summary>
-/// 16바이트 타입 auto-lock 오버헤드 측정
-/// long(8B)은 auto-lock 없음, Guid/decimal/DateTimeOffset(16B)은 auto-lock 적용
+/// Measures the overhead of auto-lock for 16-byte types.
+/// A long (8 bytes) is not auto-locked; a Guid, a decimal and a DateTimeOffset (16 bytes) are.
 /// </summary>
 [MemoryDiagnoser]
 [SimpleJob(RuntimeMoniker.Net80)]
@@ -158,7 +158,7 @@ public class AutoLockOverheadBenchmark
         _memory?.Dispose();
     }
 
-    // === 8바이트 (auto-lock 없음) - Baseline ===
+    // === 8 bytes (no auto-lock) - Baseline ===
 
     [Benchmark(Description = "Write long (8B, no auto-lock)", Baseline = true)]
     public void WriteLong()
@@ -172,7 +172,7 @@ public class AutoLockOverheadBenchmark
         return _memory.Read<long>(LargeTypeSchema.LongField);
     }
 
-    // === 16바이트 (auto-lock 적용) ===
+    // === 16 bytes (auto-lock) ===
 
     [Benchmark(Description = "Write Guid (16B, auto-lock)")]
     public void WriteGuid()
@@ -210,7 +210,7 @@ public class AutoLockOverheadBenchmark
         return _memory.Read<DateTimeOffset>(LargeTypeSchema.DateTimeOffsetField);
     }
 
-    // === 16바이트 + 명시적 락 (auto-lock 스킵) ===
+    // === 16 bytes + explicit lock (auto-lock skipped) ===
 
     [Benchmark(Description = "Write Guid (16B, explicit lock)")]
     public void WriteGuidWithLock()
