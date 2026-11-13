@@ -11,8 +11,8 @@
   `feat`, `fix`, `perf`, `refactor`, `docs`, `test`, `build`, `ci`, `chore`, `revert`.
 - **Branches and pull requests.** Work on `<type>/<topic>` (for example `fix/lock-owner`), never on `main`. Open a
   pull request with a Conventional Commit title and a Summary and a Verification section. It is squash-merged.
-- **History.** Do not force-push `main`, and do not move or delete the tag of a release. Do not rewrite history
-  that is already published.
+- **History.** Do not force-push `main`, and do not move or delete the tag of a published release. Do not rewrite
+  history that is already published.
 - **Version.** Change `<Version>` and the assembly and file versions only in a release pull request
   (`chore: release X.Y.Z`).
 - **Local files.** `.claude/settings.local.json`, `CLAUDE.local.md` and `.omo/` are per-machine state and are
