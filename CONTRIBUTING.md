@@ -37,7 +37,7 @@ A commit is one logical change that builds. Its message is a Conventional Commit
 | `fix`      | a bug fix                                                          |
 | `perf`     | a change that makes something faster or smaller                    |
 | `refactor` | a change that alters neither behavior nor API                      |
-| `docs`     | README, CHANGELOG, comments, and this file                         |
+| `docs`     | README, comments, and this file                                    |
 | `test`     | tests only                                                         |
 | `build`    | the projects, packaging, dependencies                              |
 | `ci`       | workflows and the scripts they run                                 |
@@ -56,8 +56,8 @@ a `BREAKING CHANGE:` paragraph mark a change that breaks the API or the region f
   squash-merged and the title becomes the commit message on `main` (GitHub adds the number:
   `feat: add ack queues (#12)`). Its description has two sections: Summary (what changed and why) and Verification
   (how it was checked, and what was not).
-- One pull request is one change. A user-visible change is added to the section of the next version in
-  `CHANGELOG.md` in the same pull request.
+- One pull request is one change. There is no changelog file: the title of the pull request is the line that
+  GitHub lists in the notes of the release, so write it for a reader of those notes.
 - `main` has a linear history, and the head branch is deleted when the pull request is merged. Do not force-push
   `main`, and do not move or delete the tag of a release.
 
@@ -79,7 +79,8 @@ together and only in a release pull request. The region format number (version 3
 To release a version:
 
 1. Open a pull request `chore: release X.Y.Z`. It sets the three version fields and `PackageReleaseNotes` in the
-   project file, and turns `## X.Y.Z (not released yet)` in `CHANGELOG.md` into `## X.Y.Z - YYYY-MM-DD`.
+   project file. `PackageReleaseNotes` is the text at the top of the release notes (what the version is about, and
+   any warning about compatibility), and it is also the release notes of the NuGet package.
 2. After it is merged, tag the merge commit on `main` and push the tag:
 
    ```shell
@@ -87,10 +88,11 @@ To release a version:
    git push origin vX.Y.Z
    ```
 
-   The [Release](.github/workflows/release.yml) workflow checks that the tag, the project and the changelog agree,
-   builds, runs the tests of both frameworks, packs the library, and creates a GitHub release with the packages and
-   the changelog section as its notes. When a check fails nothing is released: delete the tag, fix the cause in a
-   pull request, and tag again.
+   The [Release](.github/workflows/release.yml) workflow checks that the tag and the project agree and that
+   `PackageReleaseNotes` was rewritten since the previous release, builds, runs the tests of both frameworks, packs
+   the library, and creates a GitHub release with the packages. Its notes are `PackageReleaseNotes` followed by the
+   list of the pull requests merged since the previous release, which GitHub generates from their titles. When a
+   check fails nothing is released: delete the tag, fix the cause in a pull request, and tag again.
 3. Publishing to NuGet.org is off. To turn it on, set the repository variable `NUGET_PUBLISH` to `true` and store
    the API key as the secret `NUGET_API_KEY` of the `nuget` environment. The Release workflow then pushes the
    package as well.
