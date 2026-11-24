@@ -64,6 +64,10 @@ public class CrossProcessTests
             RedirectStandardOutput = true,
             RedirectStandardError  = true,
             RedirectStandardInput  = redirectInput,
+            // The worker writes UTF-8 (see its Program.cs). Without this the output is decoded with the code page of
+            // the machine, and a character that the code page does not have arrives as a different one.
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding  = Encoding.UTF8,
             UseShellExecute        = false,
             CreateNoWindow         = true
         };
