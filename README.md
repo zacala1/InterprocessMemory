@@ -96,10 +96,11 @@ On Windows a name without a prefix lives in the namespace of the session of the 
 a service (session 0) and a process of a logged-on user do not see each other's regions. A name that starts
 with `Global\` is visible to every session; `Local\` says "this session" explicitly. What follows the prefix
 must be a flat identifier. Creating a section in the `Global\` namespace needs the `SeCreateGlobalPrivilege`
-(services and elevated processes have it; an ordinary user session can open one but not create one), and
-the section gets the default access control of its creator, so processes under other accounts may be refused
-access: run both sides under the same account for now. Linux has no sessions: the prefix is dropped there, and
-`Global\x`, `Local\x` and `x` are one region, so the same name works on both platforms.
+(services and elevated processes have it; an ordinary user session can open one but not create one). Without the
+privilege, `CreateOrOpen` opens a `Global\` region that exists and throws `UnauthorizedAccessException` at once for
+one that does not. The section gets the default access control of its creator, so processes under other accounts
+may be refused access: run both sides under the same account for now. Linux has no sessions: the prefix is dropped
+there, and `Global\x`, `Local\x` and `x` are one region, so the same name works on both platforms.
 
 On Linux and macOS a new backing file gets the platform default permissions (usually 0644: readable by every
 user, writable by the owner). Set `MemoryRegionOptions.UnixCreateMode` to restrict it (for example to owner

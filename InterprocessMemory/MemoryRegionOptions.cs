@@ -15,6 +15,10 @@ namespace InterprocessMemory
 
         internal bool CreateOrOpen { get; set; } = true;
 
+        // Whether this process may create a region in the Global namespace of Windows: null asks the token of the
+        // process for SeCreateGlobalPrivilege, and the tests set false to act as a process without it.
+        internal bool? CanCreateGlobal { get; set; }
+
         /// <summary>
         /// Default lock timeout: 5 seconds
         /// </summary>

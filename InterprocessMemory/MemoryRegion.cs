@@ -341,6 +341,10 @@ namespace InterprocessMemory
         /// <summary>
         /// Creates or opens a raw interprocess memory region.
         /// </summary>
+        /// <exception cref="UnauthorizedAccessException">
+        /// On Windows: <paramref name="name"/> starts with <c>Global\</c>, no such region exists, and this process does
+        /// not have the SeCreateGlobalPrivilege that creating it needs (services and elevated processes have it).
+        /// </exception>
         public static MemoryRegion CreateOrOpen(
             string name,
             long capacityBytes,
@@ -627,6 +631,14 @@ namespace InterprocessMemory
         [SupportedOSPlatform("windows")]
         private void CreateMmfFromWindowsNamedRegion(long totalSize)
         {
+            if (_createOrOpen &&
+                _name.StartsWith(GlobalPrefix, StringComparison.OrdinalIgnoreCase) &&
+                !(_options.CanCreateGlobal ?? WindowsPrivileges.IsEnabled(WindowsPrivileges.CreateGlobal)))
+            {
+                _mmf = OpenGlobalSectionWithoutThePrivilege();
+                return;
+            }
+
             _mmf = _createOrOpen
                 ? MemoryMappedFile.CreateOrOpen(
                     _name,
@@ -638,6 +650,31 @@ namespace InterprocessMemory
                     _name,
                     MemoryMappedFileRights.ReadWrite,
                     HandleInheritability.None);
+        }
+
+        /// <summary>
+        /// Opens a section in the <c>Global\</c> namespace for a process that may not create one there.
+        /// <see cref="MemoryMappedFile.CreateOrOpen(string, long)"/> does not fail at once in that case: it retries for
+        /// about 80 seconds and then throws an <see cref="InvalidOperationException"/>. Opening needs no privilege,
+        /// so a section that exists is opened, and a missing one is reported at once.
+        /// </summary>
+        /// <exception cref="UnauthorizedAccessException">The section does not exist.</exception>
+        [SupportedOSPlatform("windows")]
+        private MemoryMappedFile OpenGlobalSectionWithoutThePrivilege()
+        {
+            try
+            {
+                return MemoryMappedFile.OpenExisting(_name, MemoryMappedFileRights.ReadWrite, HandleInheritability.None);
+            }
+            catch (FileNotFoundException ex)
+            {
+                throw new UnauthorizedAccessException(
+                    $"Cannot create the shared memory region '{_name}': it does not exist, and creating a region in " +
+                    $"the Global namespace needs {WindowsPrivileges.CreateGlobal}, which this process does not have " +
+                    "(services and elevated processes have it). A process without the privilege can open the " +
+                    "region once a process with it has created it.",
+                    ex);
+            }
         }
 
         /// <summary>
