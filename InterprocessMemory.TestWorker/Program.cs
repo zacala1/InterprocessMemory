@@ -1,6 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Text;
 using InterprocessMemory;
+
+// The parent reads our output as UTF-8. Without this the console code page of the machine is used, and a character
+// that the code page does not have ("ü" on a Korean Windows) is written as a similar one ("u").
+Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true });
+Console.SetError(new StreamWriter(Console.OpenStandardError(), new UTF8Encoding(false)) { AutoFlush = true });
 
 /// <summary>
 /// Lightweight child-process helper for cross-process integration tests.
